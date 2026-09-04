@@ -149,10 +149,15 @@ fn prepare_inner(
     let upstream_path = route.rewrite_path(&groups).unwrap_or_else(|| inbound.path.clone());
 
     // ⑦ registry resolve + SWRR weighted order over the per-route-group shared state.
-    let ordered = swrr_select::order(ctx.config, route);
+    // The group key / candidates come precomputed from the (cached) route table
+    // and the registry index is read from the SAME table (M7 / M8) — the route
+    // match, the candidates, and the registry targets all come from one atomic
+    // snapshot read (no cross-snapshot drift window).
+    let ordered = swrr_select::order_route(ctx.config, ctx.table, matched.index);
+    let registry_index = ctx.table.registry_index();
     let mut candidates = Vec::with_capacity(ordered.len());
     for d in &ordered {
-        candidates.push(registry_resolve::resolve_destination(ctx.data, d)?);
+        candidates.push(registry_resolve::resolve_index(registry_index, d)?);
     }
     if candidates.is_empty() {
         return Err(GatewayError::AllCandidatesFailed(route.key.clone()));

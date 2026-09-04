@@ -10,7 +10,9 @@
 //! [`HeaderMap`] is the header abstraction: keys are stored
 //! lowercased (case-insensitive lookups), values are multi-valued.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +20,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Pseudo-headers (e.g. `:path`) are stored under the same map, keyed by
 /// their lowercase form (`":path"`).
+///
+/// The map is **copy-on-write** ([`Arc`]): [`HeaderMap::clone`] is O(1), so
+/// the pipeline's clone-then-mutate (inbound strip, per-candidate outbound
+/// build, provider forward) never copies header payload bytes until an actual
+/// mutation. Lookups use an allocation-free fast path when the name is already
+/// ASCII-lowercase (the common case for HTTP header names).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeaderMap {
-    map: HashMap<String, Vec<String>>,
+    map: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl HeaderMap {
@@ -28,18 +36,40 @@ impl HeaderMap {
         Self::default()
     }
 
+    /// A mutable, uniquely-owned view of the inner map (deep-clones the map
+    /// only when other clones still share it).
+    fn make_mut(&mut self) -> &mut HashMap<String, Vec<String>> {
+        Arc::make_mut(&mut self.map)
+    }
+
+    /// The owned lowercased key for `name` (allocates only when `name` is not
+    /// already ASCII-lowercase).
     fn key(name: &str) -> String {
-        name.to_ascii_lowercase()
+        if is_ascii_lowercase(name) {
+            name.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        }
+    }
+
+    /// The borrowable lookup form for `name`: `&str` when already lowercase
+    /// (allocation-free read), an owned lowered `String` otherwise.
+    fn lookup<'a>(name: &'a str) -> Cow<'a, str> {
+        if is_ascii_lowercase(name) {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(name.to_ascii_lowercase())
+        }
     }
 
     /// Replace all values of `name` with a single `value`.
     pub fn insert(&mut self, name: &str, value: impl Into<String>) {
-        self.map.insert(Self::key(name), vec![value.into()]);
+        self.make_mut().insert(Self::key(name), vec![value.into()]);
     }
 
     /// Append a value (multi-value semantics).
     pub fn append(&mut self, name: &str, value: impl Into<String>) {
-        self.map
+        self.make_mut()
             .entry(Self::key(name))
             .or_default()
             .push(value.into());
@@ -48,37 +78,46 @@ impl HeaderMap {
     /// First value of `name`, if any.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.map
-            .get(&Self::key(name))
+            .get(Self::lookup(name).as_ref())
             .and_then(|v| v.first())
-            .map(|s| s.as_str())
+            .map(String::as_str)
     }
 
     /// All values of `name` (empty slice when absent).
     pub fn get_all(&self, name: &str) -> &[String] {
         self.map
-            .get(&Self::key(name))
+            .get(Self::lookup(name).as_ref())
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
     /// Number of values of `name`.
     pub fn count(&self, name: &str) -> usize {
-        self.map.get(&Self::key(name)).map(|v| v.len()).unwrap_or(0)
+        self.map
+            .get(Self::lookup(name).as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.map.contains_key(&Self::key(name))
+        self.map.contains_key(Self::lookup(name).as_ref())
     }
 
     /// Remove all values of `name`.
     pub fn remove(&mut self, name: &str) {
-        self.map.remove(&Self::key(name));
+        self.make_mut().remove(Self::lookup(name).as_ref());
     }
 
     /// All header names present (lowercase form).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(|k| k.as_str())
     }
+}
+
+/// `true` when `name` contains no ASCII uppercase byte (the allocation-free
+/// guard for the lookup fast path).
+fn is_ascii_lowercase(name: &str) -> bool {
+    !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 impl<'a> FromIterator<(&'a str, String)> for HeaderMap {

@@ -15,6 +15,8 @@
 //! - `tunnel`  → WebSocket relay addressing (L2+, design D10) — the address
 //!   is resolved the same way as proxy; the variant marks the transport.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::destination::{parse_service_with_port, ServiceType};
@@ -143,6 +145,82 @@ pub enum ResolvedTarget {
     },
     /// WebSocket relay (L2+); `address` is the relay endpoint.
     Tunnel { address: String },
+}
+
+/// Precomputed registry resolution for one `name.type` (design §6.3 / M8),
+/// derived once per snapshot at [`crate::config::SharedConfig`] store time so
+/// the per-request path does not rescan `registries`, rebuild a scheme-stripped
+/// shadow, or re-`resolve` to reach a connect target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreResolvedRegistry {
+    /// `true` when the registry domain carries an `https://` scheme (D8).
+    pub https: bool,
+    /// Connect address `host:port`.
+    pub address: String,
+    /// Whether the upstream is reached directly or through an outbound proxy.
+    pub proxied: bool,
+    /// Outbound forward-proxy address (`host:port`) when `proxied` (D8).
+    pub proxy: Option<String>,
+}
+
+/// Precompute the registry-resolution index for a whole snapshot:
+/// `name.type` (registry id) → the resolved connect target, or the resolve
+/// error. The scheme is split off once here; an unresolvable registry is
+/// recorded so the request path reports the identical error without retrying
+/// the resolution.
+///
+/// Duplicate registry ids keep the **first** entry (`entry().or_insert`),
+/// matching `resolve_destination`'s first-match `find` — a malformed snapshot
+/// with duplicate ids resolves identically to the direct resolver.
+pub fn precompute_registries(
+    registries: &[Registry],
+    proxies: &[OutboundProxy],
+) -> HashMap<String, Result<PreResolvedRegistry, String>> {
+    let mut out = HashMap::with_capacity(registries.len());
+    for reg in registries {
+        let (https, bare) = split_scheme_is_https(&reg.domain);
+        let shadow = Registry {
+            domain: bare.to_string(),
+            ..reg.clone()
+        };
+        let entry = match shadow.resolve(proxies) {
+            Ok(ResolvedTarget::Direct { address }) => Ok(PreResolvedRegistry {
+                https,
+                address,
+                proxied: false,
+                proxy: None,
+            }),
+            Ok(ResolvedTarget::Proxied { address, proxy, .. }) => Ok(PreResolvedRegistry {
+                https,
+                address,
+                proxied: true,
+                proxy: Some(proxy.address()),
+            }),
+            Ok(ResolvedTarget::Tunnel { address }) => Ok(PreResolvedRegistry {
+                https,
+                address,
+                proxied: false,
+                proxy: None,
+            }),
+            Err(e) => Err(e.to_string()),
+        };
+        out.entry(reg.id.clone()).or_insert(entry);
+    }
+    out
+}
+
+/// Split an optional `scheme://` prefix off a registry domain, reporting only
+/// whether the scheme is `https` (D8). The bare `host[:port]` is returned
+/// verbatim when the domain carries no scheme.
+fn split_scheme_is_https(domain: &str) -> (bool, &str) {
+    match domain.find("://") {
+        Some(i) => {
+            let scheme = &domain[..i];
+            let https = scheme.eq_ignore_ascii_case("https");
+            (https, &domain[i + "://".len()..])
+        }
+        None => (false, domain),
+    }
 }
 
 /// One `McpBridge.spec.proxies[]` entry (provider egress).

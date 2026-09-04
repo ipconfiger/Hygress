@@ -14,6 +14,10 @@ use hygress_core::prelude::ModelMapping;
 ///
 /// Returns `true` when the body was actually rewritten. `service_name` is the
 /// selected candidate's `name.type` (e.g. `model-1-10.static`).
+///
+/// The JSON path uses the bounded top-level byte-splice rewrite (H4) — no
+/// `serde_json::Value` DOM round-trip per candidate, so failover candidates
+/// pay a small splice instead of a full parse + re-serialization.
 pub fn apply(
     mapping: &ModelMapping,
     service_name: &str,
@@ -24,17 +28,12 @@ pub fn apply(
         return false;
     }
     if crate::body::is_json(Some(content_type)) {
-        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        let Some(model) = mapping.lookup(service_name) else {
             return false;
         };
-        if mapping.apply_json(service_name, &mut v) {
-            return match serde_json::to_vec(&v) {
-                Ok(b) => {
-                    *body = Bytes::from(b);
-                    true
-                }
-                Err(_) => false,
-            };
+        if let Some(nb) = crate::body::rewrite_json_model(body, "model", model) {
+            *body = nb;
+            return true;
         }
         return false;
     }

@@ -51,8 +51,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 use hygress_core::prelude::{
-    GuardAction, GuardrailFailMode, LlmGuardSpec, LlmGuardMode, LlmOnError, MatchKind,
-    QuotaDecision, RouteTable, StaticRuleSet, StaticRuleSpec, TokenBucketSpec, UsageSchema,
+    GuardAction, GuardrailFailMode, GuardrailSpec, LlmGuardSpec, LlmGuardMode, LlmOnError,
+    MatchKind, QuotaDecision, RouteTable, StaticRuleSet, TokenBucketSpec, UsageSchema,
 };
 use hygress_core::usage::{FlushFields, UsageSnapshot};
 use hygress_core::transform::HeaderMap;
@@ -72,7 +72,7 @@ use crate::context::{
 use crate::error::GatewayError;
 use crate::pipeline;
 use crate::pipeline::PipelineCtx;
-use crate::policy_loader::{MergedPolicy, bare_ingress_name, merge_policy};
+use crate::policy_loader::{MergedEntry, MergedPolicy, bare_ingress_name};
 use crate::quota::QuotaReservation;
 use crate::response_pipeline::ResponsePipeline;
 
@@ -218,17 +218,27 @@ impl ProxyHttp for HygressProxy {
         state.metrics.active_requests_inc();
         let _active_guard = ActiveGuard(state.metrics.clone());
 
-        // A consistent config snapshot + runtime index (built from the same
-        // snapshot so the route match and the registry lookups never drift).
+        // A consistent snapshot + derived runtime state, read together in ONE
+        // atomic read from the cached `SharedConfig` snapshot: the sanitized
+        // data, the compiled route table (with its precomputed registry index),
+        // and the derived model-router config — swapped as one unit, so the
+        // route match, the registry / mapping lookups, and the model-router
+        // set-up never drift (and never read a stale cache) — and the
+        // per-request route-table rebuild (H2) is gone (an `Arc` load instead
+        // of rebuilding the BTreeMap indexes + recompiling every path
+        // predicate).
         //
         // B2: the stage-② model-router settings come from the **current
         // snapshot** (`ConfigData.model_router`, hot-reloadable — contract-pin
-        // §2.3). The `ArcSwap` load is cheap and per-request, so a
-        // `defaultConfig` update (enableOnPathSuffix / aliasNameMapping /
+        // §2.3). The config is a lock-free `ArcSwap` load; the derived
+        // [`ModelRouterConfig`] is built once per snapshot at store time (H2),
+        // so a `defaultConfig` update (enableOnPathSuffix / aliasNameMapping /
         // maxBodyBytes / prefix / targetHeader) takes effect on the next
-        // request with no restart and no per-request DB read.
-        let data = state.config.load();
-        let router = crate::context::ModelRouterConfig::from_settings(&data.model_router);
+        // request with no restart and no per-request DB read or re-derivation.
+        let snapshot = state.config.snapshot();
+        let data: &hygress_core::ConfigData = &snapshot.data;
+        let table: &RouteTable = &snapshot.table;
+        let router: &crate::context::ModelRouterConfig = &snapshot.router;
 
         // ⑥ inbound header phase (phase 1 of the body read; design §4.1): the
         // headers come first so `rate_limit_pre` can short-circuit **before**
@@ -269,18 +279,11 @@ impl ProxyHttp for HygressProxy {
             host: head.host,
         };
 
-        let table = match RouteTable::rebuild(&data) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "route table rebuild failed");
-                return short_circuit(session, 503, "config_invalid").await;
-            }
-        };
         let pctx = PipelineCtx {
-            data: &data,
-            table: &table,
+            data,
+            table,
             config: &state.config,
-            router: &router,
+            router,
         };
 
         // B1 (design §4.2 / D-11 / D-13): quota `reserve` — initial dispatch
@@ -315,17 +318,20 @@ impl ProxyHttp for HygressProxy {
 
             // The effective policy for this hop (route key known after
             // `route_match`; design §3 / D-12). `None` when no policy is loaded
-            // (all pass-through, design §7).
-            let merged: Option<MergedPolicy> = state.policy.as_ref().map(|h| {
-                let cfg = h.shared();
-                merge_policy(&cfg, bare_ingress_name(&prepared.route.ingress_name))
-            });
+            // (all pass-through, design §7). The merged spec + its compiled
+            // static rules were precomputed at load/reload (H3) — per hop this
+            // is one `Arc` load (`PolicyHandle::merged_for`).
+            let merged: Option<std::sync::Arc<MergedEntry>> =
+                state
+                    .policy
+                    .as_ref()
+                    .map(|h| h.merged_for(bare_ingress_name(&prepared.route.ingress_name)));
 
             // ④' routing-policy override layer (design §4.3 / D-2 / D-3):
             // decorate the matched **Main** route only, initial dispatch only
             // (`redirect_count == 0`); Fallback / mirror never apply.
             if redirect_count == 0 && prepared.route.matched_by == MatchKind::HeaderExact {
-                if let Some(actions) = merged.as_ref().and_then(|m| m.actions.as_ref()) {
+                if let Some(actions) = merged.as_ref().and_then(|e| e.policy.actions.as_ref()) {
                     let applied = pipeline::routing_policy::apply(&mut prepared, actions);
                     if applied.override_miss {
                         warn!(
@@ -377,7 +383,8 @@ impl ProxyHttp for HygressProxy {
             // only (D-3). `none` / absent consumer skips (D-10).
             if redirect_count == 0 {
                 let consumer = auth_writeback.get(hdr::MSE_CONSUMER).unwrap_or("").to_string();
-                if let Some(extra) = self.rate_limit_post(&state, merged.as_ref(), &consumer) {
+                let rate_policy = merged.as_ref().map(|e| &e.policy);
+                if let Some(extra) = self.rate_limit_post(&state, rate_policy, &consumer) {
                     return short_circuit_typed(
                         session,
                         429,
@@ -396,9 +403,9 @@ impl ProxyHttp for HygressProxy {
             // the loop (BLOCK-1): it survives across fallback hops so the
             // true terminal commits/releases exactly once.
             if redirect_count == 0 {
-                if let (Some(merged), Some(ut)) = (merged.as_ref(), prepared.usage.as_ref()) {
+                if let (Some(entry), Some(ut)) = (merged.as_ref(), prepared.usage.as_ref()) {
                     if let Some(spec) =
-                        merged.quota.as_ref().and_then(|q| q.by_model_tokens.as_ref())
+                        entry.policy.quota.as_ref().and_then(|q| q.by_model_tokens.as_ref())
                     {
                         let est = est_tokens(prepared.body.len(), state.quota_k);
                         let now = now_millis();
@@ -446,10 +453,18 @@ impl ProxyHttp for HygressProxy {
             // candidate loop, initial dispatch only. A hit short-circuits 403
             // `guardrail_blocked`; the quota guard releases on drop (D-11) and
             // a `completed=false` usage row is reported (the terminal matrix).
+            // The static rules are the precompiled set from the merged policy
+            // (H3) — no per-request regex compilation.
             if redirect_count == 0 {
-                if let Some(merged) = merged.as_ref() {
-                    if let Some(reason) =
-                        self.guardrail_in(&state, merged, &prepared.body).await
+                if let Some(entry) = merged.as_ref() {
+                    if let Some(reason) = self
+                        .guardrail_in(
+                            &state,
+                            entry.policy.guardrail.as_ref(),
+                            entry.static_set.as_deref(),
+                            &prepared.body,
+                        )
+                        .await
                     {
                         state.metrics.record_guardrail_blocked("in");
                         self.report_incomplete_usage(&prepared, &prepared.selected_service)
@@ -492,7 +507,9 @@ impl ProxyHttp for HygressProxy {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         if (200..=299).contains(&status) {
-                            // ⑪/⑫/⑬ success: stream back + usage + metrics.
+                            // ⑪/⑫/⑬ success: stream back + usage + metrics. The
+                            // outbound static rules come precompiled from the
+                            // merged policy (H3).
                             if let Err(e) = self
                                 .stream_back(
                                     session,
@@ -503,15 +520,18 @@ impl ProxyHttp for HygressProxy {
                                     kind,
                                     started,
                                     &mut quota,
-                                    static_rules_of(&merged),
+                                    merged.as_ref().and_then(|m| m.static_set.as_ref()),
                                 )
                                 .await
                             {
                                 // A downstream write (or an upstream mid-stream read
                                 // failure) after the 2xx header was already sent —
                                 // the client may have partial bytes. Failover is
-                                // impossible here; close the connection.
+                                // impossible here; close the connection (H1: the
+                                // stream is broken mid-flight, so keep-alive is
+                                // disabled only here, not on the normal end).
                                 warn!(error = %e, "downstream stream write failed; closing");
+                                session.as_downstream_mut().set_keepalive(None);
                                 // D-11: downstream write-fail abort → release the
                                 // quota (the guard drops at the return) + report a
                                 // `completed=false` usage row (previously: no usage
@@ -869,28 +889,23 @@ impl HygressProxy {
     async fn guardrail_in(
         &self,
         state: &GatewayState,
-        merged: &MergedPolicy,
+        guardrail: Option<&GuardrailSpec>,
+        static_set: Option<&StaticRuleSet>,
         body: &[u8],
     ) -> Option<String> {
-        let Some(g) = merged.guardrail.as_ref() else {
+        let Some(g) = guardrail else {
             return None; // not configured → pass-through (D-14)
         };
         let text = String::from_utf8_lossy(body);
 
-        // B4a: static rules (the effective `global ++ route` set).
-        if !g.static_rules.is_empty() {
-            match StaticRuleSet::new(&g.static_rules) {
-                Ok(set) => {
-                    if let Some(hit) = set.evaluate(&text) {
-                        if hit.action == GuardAction::Block {
-                            return Some(format!("static rule '{}'", hit.hit_name));
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Fail-safe: an uncompilable rule must not block every
-                    // request (design §7) — skip the static set.
-                    warn!(error = %e, "guardrail static rule compile failed; static rules skipped");
+        // B4a: static rules (the effective `global ++ route` set), compiled
+        // once into the merged policy at load/reload (H3). `None` = no rules
+        // or an uncompilable rule → the static scan is skipped (fail-safe,
+        // design §7).
+        if let Some(set) = static_set {
+            if let Some(hit) = set.evaluate(&text) {
+                if hit.action == GuardAction::Block {
+                    return Some(format!("static rule '{}'", hit.hit_name));
                 }
             }
         }
@@ -990,18 +1005,6 @@ impl HygressProxy {
             .value()
             .clone()
     }
-}
-
-/// The effective **output-side** static rules (B4c / design §2.2 §4.4): the
-/// merged `guardrail.static_rules` for the hop (`global ++ route`), or the
-/// empty set (the observe pass-through state).
-fn static_rules_of(merged: &Option<MergedPolicy>) -> &[StaticRuleSpec] {
-    static EMPTY: &[StaticRuleSpec] = &[];
-    merged
-        .as_ref()
-        .and_then(|m| m.guardrail.as_ref())
-        .map(|g| g.static_rules.as_slice())
-        .unwrap_or(EMPTY)
 }
 
 /// The D-13 quota estimate: `ceil(request_content_bytes / K)` (`K` ≥ 1).
@@ -1242,8 +1245,9 @@ impl HygressProxy {
     ///
     /// The **response-side skeleton** (design §2.2 / D-1 / B4c) runs between
     /// `usage.feed(chunk)` and `write_response_body(chunk)`:
-    /// `out_rules` build the per-response [`ResponsePipeline`] (observe
-    /// pass-through when empty; per-chunk judgment otherwise). A hit **stops
+    /// the precompiled static-rule set builds the per-response
+    /// [`ResponsePipeline`] (observe pass-through when `None`; per-chunk
+    /// judgment otherwise). A hit **stops
     /// writing and cuts the downstream** (the 2xx header is already sent — it
     /// cannot be changed), then takes the terminal path: the quota reservation
     /// is released (D-11) and a `completed=false` usage row is reported.
@@ -1263,7 +1267,7 @@ impl HygressProxy {
         kind: &str,
         started: Instant,
         quota: &mut Option<QuotaReservation>,
-        out_rules: &[StaticRuleSpec],
+        compiled_static: Option<&std::sync::Arc<StaticRuleSet>>,
     ) -> PingoraResult<()> {
         const SKIP: &[&str] = &[
             "server",
@@ -1292,16 +1296,19 @@ impl HygressProxy {
         for (name, value) in forwarded {
             let _ = resp_header.append_header(name, value);
         }
-        // LLM / SSE responses are long-lived — do not reuse the downstream conn.
-        session.as_downstream_mut().set_keepalive(None);
+        // H1: the normal 2xx stream-end keeps the downstream connection alive
+        // (the connection is only cut on a mid-stream break — the B4c guardrail
+        // hit below or a downstream write failure in the caller).
         session
             .write_response_header(Box::new(resp_header), false)
             .await?;
 
         // ⑪ stream body; count SSE usage + TTFT (first chunk); B4c per-chunk
-        // guardrail between `usage.feed` and `write_response_body`.
+        // guardrail between `usage.feed` and `write_response_body`. The output
+        // static rules arrive precompiled (H3) — `from_compiled` Arc-clones the
+        // compiled set instead of re-compiling or re-cloning the rules.
         let mut usage = UsageSnapshot::new(UsageSchema::Generic);
-        let mut resp_pipeline = ResponsePipeline::new(out_rules);
+        let mut resp_pipeline = ResponsePipeline::from_compiled(compiled_static);
         let mut ttft: Option<f64> = None;
         let mut first = true;
         while let Some(chunk) = resp
@@ -1541,6 +1548,12 @@ async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> Ping
 ///
 /// The body is `{"error":{"message":<message>,"type":<err_type>}}`; `extra`
 /// carries e.g. the rate-limit `Retry-After` header.
+///
+/// H1: the error response is complete, so the downstream connection stays
+/// eligible for keep-alive (it is only force-closed on a mid-stream break —
+/// the B4c guardrail hit or a downstream write failure). Pingora's own reuse
+/// logic still closes the connection when the exchange did not finish cleanly
+/// (e.g. an early rejection before the request body was drained).
 async fn short_circuit_typed(
     session: &mut Session,
     status: u16,
@@ -1562,7 +1575,6 @@ async fn short_circuit_typed(
     for (name, v) in pairs {
         let _ = resp.insert_header(name, v);
     }
-    session.set_keepalive(None);
     session.write_response_header(Box::new(resp), false).await?;
     session.write_response_body(Some(body), true).await?;
     Ok(true)

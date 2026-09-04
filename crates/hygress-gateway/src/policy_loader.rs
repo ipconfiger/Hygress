@@ -37,13 +37,15 @@
 //!   after the global ones), the route's `llm`/`fail_mode` win when present;
 //! - `actions` — route-level only (there is no `global` routing-policy slot).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
 use hygress_core::prelude::{
-    GuardrailSpec, LimitsSpec, PolicyConfig, QuotaSpec, RoutePolicyActions, StaticRuleSpec,
+    GlobalPolicy, GuardrailSpec, LimitsSpec, PolicyConfig, QuotaSpec, RoutePolicyActions,
+    RoutePolicySpec, StaticRuleSet, StaticRuleSpec,
 };
 use tracing::warn;
 
@@ -69,8 +71,13 @@ pub fn load_policy(path: impl AsRef<Path>) -> Result<PolicyConfig, String> {
     serde_yaml::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
-/// The live policy holder: an `ArcSwap<PolicyConfig>` (lock-free per-request
-/// load) plus the source path and an mtime watermark for the 1s poll.
+/// The live policy holder: an `ArcSwap<PolicyRuntime>` (lock-free per-request
+/// load of the config **and** its precomputed merged-policy index) plus the
+/// source path and an mtime watermark for the 1s poll.
+///
+/// The per-request policy cost is one `Arc` load ([`PolicyHandle::shared`] /
+/// [`PolicyHandle::merged_for`]); the merge (and static-rule regex compilation)
+/// happens once per load/reload in [`MergedTable::build`] (H3).
 ///
 /// Cheap to `Arc`-clone (all state is `Arc`-shared); the admin `/reload`
 /// closure and the poll task share one handle.
@@ -79,8 +86,15 @@ pub struct PolicyHandle {
     inner: Arc<PolicyInner>,
 }
 
+/// One consistent, atomically-swapped policy view: the parsed config plus its
+/// precomputed merge index.
+struct PolicyRuntime {
+    config: Arc<PolicyConfig>,
+    merged: Arc<MergedTable>,
+}
+
 struct PolicyInner {
-    config: ArcSwap<PolicyConfig>,
+    state: ArcSwap<PolicyRuntime>,
     path: String,
     /// The last observed file mtime (`None` when the file is absent) — the
     /// poll reloads only when this changes.
@@ -109,7 +123,7 @@ impl PolicyHandle {
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Self {
             inner: Arc::new(PolicyInner {
-                config: ArcSwap::new(Arc::new(initial)),
+                state: ArcSwap::new(Arc::new(PolicyRuntime::of(initial))),
                 path,
                 last_mtime: std::sync::Mutex::new(last_mtime),
             }),
@@ -118,7 +132,15 @@ impl PolicyHandle {
 
     /// The current policy snapshot (lock-free `Arc` load — cheap per request).
     pub fn shared(&self) -> Arc<PolicyConfig> {
-        self.inner.config.load_full()
+        self.inner.state.load_full().config.clone()
+    }
+
+    /// The precomputed effective (merged) policy for one **bare** ingress name
+    /// (lock-free `Arc` load — cheap per request). The merge and the static-rule
+    /// compilation were done once at load/reload (H3).
+    pub fn merged_for(&self, bare_ingress: &str) -> Arc<MergedEntry> {
+        let runtime = self.inner.state.load_full();
+        runtime.merged.for_ingress(&runtime.config, bare_ingress)
     }
 
     /// The configured source path.
@@ -135,7 +157,7 @@ impl PolicyHandle {
     pub fn reload_from(&self, path: &str) -> bool {
         match load_policy(path) {
             Ok(c) => {
-                self.inner.config.store(Arc::new(c));
+                self.inner.state.store(Arc::new(PolicyRuntime::of(c)));
                 *self.inner.last_mtime.lock().unwrap() =
                     std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
                 true
@@ -174,6 +196,19 @@ impl PolicyHandle {
     }
 }
 
+impl PolicyRuntime {
+    /// Build one atomically-swapped view: the config + its precomputed merge
+    /// index (H3 — the expensive per-ingress merges + regex compilation run
+    /// here, not on the request path).
+    fn of(config: PolicyConfig) -> Self {
+        let merged = Arc::new(MergedTable::build(&config));
+        Self {
+            config: Arc::new(config),
+            merged,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Merge (design §3: global defaults → matched route override)
 // ---------------------------------------------------------------------------
@@ -201,20 +236,108 @@ pub fn bare_ingress_name(ingress: &str) -> &str {
 
 /// Merge the matched route (selected by core `for_ingress`, D-12) over the
 /// `global` defaults. A non-matching ingress yields the bare global section.
+///
+/// This is the pure merge used by the (test) direct callers and as the base of
+/// the precomputed [`MergedEntry`]; the request path uses
+/// [`PolicyHandle::merged_for`] (H3) instead.
 pub fn merge_policy(cfg: &PolicyConfig, bare_ingress: &str) -> MergedPolicy {
-    match cfg.for_ingress(bare_ingress) {
+    merge_spec(&cfg.global, cfg.for_ingress(bare_ingress))
+}
+
+/// The pure merge of a (possibly absent) route spec over the `global` defaults.
+fn merge_spec(global: &GlobalPolicy, route: Option<&RoutePolicySpec>) -> MergedPolicy {
+    match route {
         Some(route) => MergedPolicy {
-            limits: merge_limits(cfg.global.limits.as_ref(), route.limits.as_ref()),
-            quota: merge_quota(cfg.global.quota.as_ref(), route.quota.as_ref()),
-            guardrail: merge_guardrail(cfg.global.guardrail.as_ref(), route.guardrail.as_ref()),
+            limits: merge_limits(global.limits.as_ref(), route.limits.as_ref()),
+            quota: merge_quota(global.quota.as_ref(), route.quota.as_ref()),
+            guardrail: merge_guardrail(global.guardrail.as_ref(), route.guardrail.as_ref()),
             actions: route.policy.clone(),
         },
         None => MergedPolicy {
-            limits: cfg.global.limits.clone(),
-            quota: cfg.global.quota.clone(),
-            guardrail: cfg.global.guardrail.clone(),
+            limits: global.limits.clone(),
+            quota: global.quota.clone(),
+            guardrail: global.guardrail.clone(),
             actions: None,
         },
+    }
+}
+
+/// A **precomputed** effective policy for one ingress context: the merged spec
+/// fields plus the merged static-rule regexes compiled once at load/reload.
+///
+/// `static_set` is `None` when the effective guardrail has no static rules or a
+/// rule failed to compile — the observe / pass-through state (D-14), decided
+/// once here instead of per request / per response. The compiled set is
+/// `Arc`-shared so the per-response scanner clones a pointer, not the rule vec.
+#[derive(Clone, Debug)]
+pub struct MergedEntry {
+    /// The effective spec fields (`limits` / `quota` / `guardrail` / `actions`).
+    pub policy: MergedPolicy,
+    /// The compiled effective static rules (observe/pass-through when `None`).
+    pub static_set: Option<Arc<StaticRuleSet>>,
+}
+
+impl MergedEntry {
+    /// Compile a merged policy's static rules once (a compile failure only
+    /// disables the static scan — the LLM stage and the rest are unaffected).
+    fn compile(policy: MergedPolicy) -> Self {
+        let static_set = policy.guardrail.as_ref().and_then(|g| {
+            if g.static_rules.is_empty() {
+                return None;
+            }
+            match StaticRuleSet::new(&g.static_rules) {
+                Ok(set) => Some(Arc::new(set)),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "guardrail static rule compile failed; static scanning disabled"
+                    );
+                    None
+                }
+            }
+        });
+        Self { policy, static_set }
+    }
+}
+
+/// The precomputed merge index for a whole policy: the global-only section
+/// plus one section per route spec, keyed by its `name_glob`.
+///
+/// The **last** entry for a glob wins (build order = route order), which is
+/// exactly `PolicyConfig::for_ingress`'s last-match semantics — a bare ingress
+/// that matches a glob resolves to the same precomputed merge the direct merge
+/// would produce (H3).
+#[derive(Debug)]
+struct MergedTable {
+    global: Arc<MergedEntry>,
+    by_glob: HashMap<String, Arc<MergedEntry>>,
+}
+
+impl MergedTable {
+    /// Precompute the global-only entry and one entry per route spec (runs once
+    /// per load/reload — the per-request policy cost becomes an `Arc` load).
+    fn build(cfg: &PolicyConfig) -> Self {
+        let global = Arc::new(MergedEntry::compile(merge_spec(&cfg.global, None)));
+        let mut by_glob = HashMap::with_capacity(cfg.routes.len());
+        for spec in &cfg.routes {
+            by_glob.insert(
+                spec.name_glob.clone(),
+                Arc::new(MergedEntry::compile(merge_spec(&cfg.global, Some(spec)))),
+            );
+        }
+        Self { global, by_glob }
+    }
+
+    /// The precomputed entry for `bare_ingress`.
+    fn for_ingress(&self, cfg: &PolicyConfig, bare_ingress: &str) -> Arc<MergedEntry> {
+        match cfg.for_ingress(bare_ingress) {
+            Some(spec) => self
+                .by_glob
+                .get(&spec.name_glob)
+                .cloned()
+                .unwrap_or_else(|| self.global.clone()),
+            None => self.global.clone(),
+        }
     }
 }
 

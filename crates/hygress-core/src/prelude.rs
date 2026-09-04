@@ -1,9 +1,9 @@
 //! `hygress-core` public type surface (re-exports for downstream crates).
 
 pub use crate::config::{
-    literal_anchor_len, ConfigData, FallbackSpec, GatewayFeatureConfig, ModelRouterSettings,
-    ProviderToken, RouteTable, SanitizeResult, SharedConfig, TimingConfig, TlsConfig, TlsHost,
-    ValidationError, provider_bearer,
+    literal_anchor_len, ConfigData, FallbackSpec, GatewayFeatureConfig, ModelRouterConfig,
+    ModelRouterSettings, ProviderToken, RouteTable, SanitizeResult, SharedConfig, Snapshot,
+    TimingConfig, TlsConfig, TlsHost, ValidationError, provider_bearer,
 };
 pub use crate::destination::{
     parse_destinations, parse_service_with_port, Destination, ServiceRef, ServiceType,
@@ -22,7 +22,9 @@ pub use crate::policy::{
 };
 pub use crate::quota::{QuotaDecision, QuotaEngine};
 pub use crate::ratelimit::{Buckets, RatLimiter, TokenBucket};
-pub use crate::registry::{OutboundProxy, Registry, ResolvedTarget};
+pub use crate::registry::{
+    OutboundProxy, PreResolvedRegistry, Registry, ResolvedTarget, precompute_registries,
+};
 pub use crate::retry::{ParsedRetry, RetryCond, RetryPolicy};
 pub use crate::route_policy::pin_matches;
 pub use crate::route::{

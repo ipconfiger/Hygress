@@ -15,6 +15,10 @@ use crate::context::SharedConfigHandle;
 ///
 /// Returns the destinations in SWRR order (selected = index 0). Zero-weight
 /// destinations are retained (they are only reachable via the failover walk).
+///
+/// This build-from-scratch form is kept for direct callers / tests; the pipe
+/// uses [`order_route`], which borrows the route table's precomputed SWRR group
+/// key + candidate vec (M7).
 pub fn order(config: &SharedConfigHandle, route: &RouteRule) -> Vec<Destination> {
     // Guard: no destinations (should not happen — validated), nothing to order.
     if route.destinations.is_empty() {
@@ -47,12 +51,46 @@ pub fn order(config: &SharedConfigHandle, route: &RouteRule) -> Vec<Destination>
 
 /// Order candidates for the route at `index` in `table` (convenience for the
 /// pipe).
+///
+/// M7: the SWRR group key + candidate vec were precomputed into `table` at
+/// snapshot build time, and only the tiny per-group weight map lives in the
+/// `DashMap` — the per-request path no longer rebuilds the `Vec<String>` /
+/// `Vec<SwrrCandidate>` scratch, no longer recomputes the sorted-service FNV
+/// digest, and only holds the shard lock for the ordering round itself (an
+/// `O(1)` map-back via the precomputed destination index replaces the O(n²)
+/// `find`).
 pub fn order_route(
     config: &SharedConfigHandle,
     table: &RouteTable,
     index: usize,
 ) -> Vec<Destination> {
-    order(config, table.route(index))
+    let route = table.route(index);
+    // Guard: no destinations (should not happen — validated), nothing to order.
+    if route.destinations.is_empty() {
+        return Vec::new();
+    }
+    // The SWRR round reorders its own operating copy of the (small) precomputed
+    // candidate vec.
+    let mut candidates = table.swrr_candidates(index).to_vec();
+    let key = table.swrr_group_key(index);
+
+    // One deterministic SWRR round over the shared per-group state. The group is
+    // created on first sight; afterwards only the existing (tiny) weight map is
+    // mutated under the shard lock (`get_mut` — no key rebuild).
+    match config.swrr_group_state_mut(key) {
+        Some(mut guard) => hygress_core::swrr_order(&mut candidates, &mut guard),
+        None => {
+            let mut guard = config.swrr_group_state_entry(key.clone()).or_default();
+            hygress_core::swrr_order(&mut candidates, &mut guard);
+        }
+    }
+
+    // Map candidates back to their destination entries via the precomputed
+    // per-route index (O(1) per candidate).
+    candidates
+        .iter()
+        .filter_map(|c| table.destination_for_service(index, &c.id).cloned())
+        .collect()
 }
 
 #[cfg(test)]

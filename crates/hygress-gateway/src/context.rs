@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use hygress_core::prelude::{MatchKind, ModelRouterSettings};
+use hygress_core::prelude::MatchKind;
 use hygress_core::transform::HeaderMap;
 
 /// Wire-header names (contract-pin §3.1). Centralized so the stages and the
@@ -85,70 +85,11 @@ impl InboundRequest {
     }
 }
 
-/// The `gpustack-model-router` (`generic-proxy-router`) configuration — the
-/// plugin `defaultConfig` + preserved keys (contract-pin §2.3).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelRouterConfig {
-    /// Path prefix that arms PATH-DRIVEN (alias) mode (default `/model/proxy/`).
-    pub prefix: String,
-    /// The header the resolved model is written to (default `x-higress-llm-model`).
-    pub target_header: String,
-    /// JSON body key for the model field (default `model`).
-    pub model_key: String,
-    /// Path suffixes (whole-path suffix match) that arm BODY-DRIVEN mode.
-    pub enable_on_path_suffix: Vec<String>,
-    /// `aliasNameMapping`: path-alias id -> route/model name.
-    pub alias_name_mapping: std::collections::BTreeMap<String, String>,
-    /// Hard cap on the buffered request body (bytes) -> 413 above it.
-    pub max_body_bytes: usize,
-}
-
-impl Default for ModelRouterConfig {
-    fn default() -> Self {
-        Self {
-            prefix: "/model/proxy/".to_string(),
-            target_header: hdr::LLM_MODEL.to_string(),
-            model_key: "model".to_string(),
-            enable_on_path_suffix: Vec::new(),
-            alias_name_mapping: std::collections::BTreeMap::new(),
-            max_body_bytes: 8 * 1024 * 1024,
-        }
-    }
-}
-
-impl ModelRouterConfig {
-    /// The default body cap (8 MiB) used when the plugin did not set
-    /// `maxBodyBytes` (core `ModelRouterSettings.max_body_bytes` is `None`).
-    pub const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-    /// Build the stage-② config from the **hot-reloadable** snapshot settings
-    /// (`ConfigData.model_router`, plugin-contract-pin §2.3). The data plane
-    /// reads this from the current `SharedConfig` snapshot per request (the
-    /// `ArcSwap` load is cheap; no DB re-read), so a `defaultConfig` update
-    /// (`enableOnPathSuffix` / `aliasNameMapping` / `maxBodyBytes` / `prefix` /
-    /// `targetHeader`) takes effect on the next request.
-    ///
-    /// `model_key` is fixed to `model` (the plugin's `modelKey` default; the
-    /// core settings type does not carry it — GPUStack does not override it).
-    pub fn from_settings(s: &ModelRouterSettings) -> Self {
-        Self {
-            prefix: if s.prefix.is_empty() {
-                ModelRouterConfig::default().prefix
-            } else {
-                s.prefix.clone()
-            },
-            target_header: if s.target_header.is_empty() {
-                ModelRouterConfig::default().target_header
-            } else {
-                s.target_header.clone()
-            },
-            model_key: "model".to_string(),
-            enable_on_path_suffix: s.enable_on_path_suffix.clone(),
-            alias_name_mapping: s.alias_name_mapping.clone(),
-            max_body_bytes: s.max_body_bytes.unwrap_or(Self::DEFAULT_MAX_BODY_BYTES),
-        }
-    }
-}
+/// The `gpustack-model-router` (`generic-proxy-router`) configuration — derived
+/// once per snapshot in `hygress-core` (so the request path never re-derives /
+/// re-clones it, and the value can never go stale). Re-exported here (and via
+/// `hygress_gateway::ModelRouterConfig`) to preserve the established path.
+pub use hygress_core::prelude::ModelRouterConfig;
 
 /// The stage-② model resolution outcome (contract-pin §2.3 decision tree).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +374,11 @@ pub struct RateLimitEntry {
 
 /// A thin `Clone` handle over [`hygress_core::SharedConfig`] so [`GatewayState`]
 /// can clone it cheaply (core holds it by value; this wraps it in `Arc`).
+///
+/// Snapshot-derived state — the compiled route table + registry index and the
+/// derived [`ModelRouterConfig`] — lives in the core [`hygress_core::Snapshot`],
+/// built once per snapshot at store time. The request path needs no per-snapshot
+/// cache of its own (and therefore has no address-reuse / ABA hazard).
 #[derive(Clone, Debug)]
 pub struct SharedConfigHandle {
     pub inner: Arc<hygress_core::SharedConfig>,
@@ -443,6 +389,14 @@ impl SharedConfigHandle {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// The current snapshot's data + route table (with its registry index) +
+    /// derived model-router config, from **one** atomic read (they can never
+    /// drift across a hot reload) — the pipe threads it through
+    /// [`crate::pipeline::PipelineCtx`].
+    pub fn snapshot(&self) -> hygress_core::prelude::Snapshot {
+        self.inner.snapshot()
     }
 }
 

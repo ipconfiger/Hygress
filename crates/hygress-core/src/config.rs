@@ -10,7 +10,7 @@
 //! `DashMap`), so data-plane workers read it lock-free and a 1s poll diff
 //! takes effect on the next request without restart (design D6).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::destination::ServiceType;
 use crate::error::Error;
 use crate::matcher::RouteMatch;
-use crate::registry::{OutboundProxy, Registry};
+use crate::registry::{OutboundProxy, PreResolvedRegistry, Registry, precompute_registries};
 use crate::route::{FallbackLink, RouteKind, RouteRule};
-use crate::swrr::SwrrState;
+use crate::swrr::{SwrrCandidate, SwrrState};
 
 // ---------------------------------------------------------------------------
 // Snapshot data
@@ -500,6 +500,81 @@ impl Default for ModelRouterSettings {
 }
 
 // ---------------------------------------------------------------------------
+// ModelRouterConfig (the derived stage-② runtime config)
+// ---------------------------------------------------------------------------
+
+/// The `gpustack-model-router` (`generic-proxy-router`) configuration — the
+/// plugin `defaultConfig` + preserved keys (contract-pin §2.3), **derived**
+/// from the hot-reloadable [`ModelRouterSettings`].
+///
+/// The gateway derives one [`ModelRouterConfig`] per snapshot (inside
+/// [`crate::config::SharedConfig`]) so the request path never re-applies the
+/// default fallbacks / re-clones the alias map and suffix list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRouterConfig {
+    /// Path prefix that arms PATH-DRIVEN (alias) mode (default `/model/proxy/`).
+    pub prefix: String,
+    /// The header the resolved model is written to (default `x-higress-llm-model`).
+    pub target_header: String,
+    /// JSON body key for the model field (default `model`).
+    pub model_key: String,
+    /// Path suffixes (whole-path suffix match) that arm BODY-DRIVEN mode.
+    pub enable_on_path_suffix: Vec<String>,
+    /// `aliasNameMapping`: path-alias id -> route/model name.
+    pub alias_name_mapping: BTreeMap<String, String>,
+    /// Hard cap on the buffered request body (bytes) -> 413 above it.
+    pub max_body_bytes: usize,
+}
+
+impl Default for ModelRouterConfig {
+    fn default() -> Self {
+        Self {
+            prefix: "/model/proxy/".to_string(),
+            target_header: "x-higress-llm-model".to_string(),
+            model_key: "model".to_string(),
+            enable_on_path_suffix: Vec::new(),
+            alias_name_mapping: BTreeMap::new(),
+            max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
+        }
+    }
+}
+
+impl ModelRouterConfig {
+    /// The default body cap (8 MiB) used when the plugin did not set
+    /// `maxBodyBytes` (core `ModelRouterSettings.max_body_bytes` is `None`).
+    pub const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Build the stage-② config from the **hot-reloadable** snapshot settings
+    /// (`ConfigData.model_router`, plugin-contract-pin §2.3). The data plane
+    /// reads this from the current `SharedConfig` snapshot per request (the
+    /// `ArcSwap` load is cheap; no DB re-read), so a `defaultConfig` update
+    /// (`enableOnPathSuffix` / `aliasNameMapping` / `maxBodyBytes` / `prefix` /
+    /// `targetHeader`) takes effect on the next request.
+    ///
+    /// `model_key` is fixed to `model` (the plugin's `modelKey` default; the
+    /// core settings type does not carry it — GPUStack does not override it).
+    pub fn from_settings(s: &ModelRouterSettings) -> Self {
+        let default = Self::default();
+        Self {
+            prefix: if s.prefix.is_empty() {
+                default.prefix
+            } else {
+                s.prefix.clone()
+            },
+            target_header: if s.target_header.is_empty() {
+                default.target_header
+            } else {
+                s.target_header.clone()
+            },
+            model_key: "model".to_string(),
+            enable_on_path_suffix: s.enable_on_path_suffix.clone(),
+            alias_name_mapping: s.alias_name_mapping.clone(),
+            max_body_bytes: s.max_body_bytes.unwrap_or(Self::DEFAULT_MAX_BODY_BYTES),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Provider tokens (the ai-proxy key-swap source; design D6 / §7)
 // ---------------------------------------------------------------------------
 
@@ -588,12 +663,19 @@ fn full_match_pattern(pattern: &str) -> String {
 /// Lock-free runtime route index built from a [`ConfigData`].
 ///
 /// Owns a copy of the routes (snapshot semantics) plus compiled full-match
-/// path predicates and two **separate** exact-key indexes:
+/// path predicates, two **separate** exact-key indexes (see below), the
+/// precomputed registry-resolution index, and the per-route SWRR group key /
+/// candidate list — all derived once per snapshot. This keeps the per-request
+/// weighted-selection path from rebuilding the FNV group digest, the candidate
+/// vec, or the O(n²) map-back, and it keeps a request's whole decision path on
+/// one consistent snapshot (the registry index is read from this table, which
+/// came from the same atomic snapshot load as `data`):
 /// - [`RouteTable::by_main_key`] — Main routes only (initial requests);
 /// - [`RouteTable::by_fallback_key`] — Fallback routes only (fallback redirects).
 ///
 /// The two key spaces are physically separated so a Fallback rule can never
 /// be selected by an initial request (and vice versa).
+#[derive(Clone, Debug)]
 pub struct RouteTable {
     routes: Vec<RouteRule>,
     /// Exact-key index over Main routes (initial requests only).
@@ -606,6 +688,22 @@ pub struct RouteTable {
     anchors: Vec<Vec<usize>>,
     /// First `Mirror` route, if any (the only path-based catch-all).
     mirror_index: Option<usize>,
+    /// Per-route SWRR group key `(route key, digest of sorted service ids)` —
+    /// precomputed (M7) so the request path borrows it instead of rebuilding
+    /// the BTreeSet-sorted FNV digest per request.
+    swrr_group_keys: Vec<(String, String)>,
+    /// Per-route SWRR candidates (`service id` + effective weight, same order
+    /// as `destinations`) — precomputed (M7) so the request path only clones
+    /// the (small) operating copy the SWRR round reorders.
+    swrr_candidates: Vec<Vec<SwrrCandidate>>,
+    /// Per-route `service id → destination index` — the O(1) map-back from the
+    /// SWRR ordering to the destination entries (no O(n²) `find` per request).
+    destination_index: Vec<HashMap<String, usize>>,
+    /// The precomputed registry-resolution index (`name.type` → resolved
+    /// connect target or the resolve error), derived from the same snapshot as
+    /// the rest of the table (M8) so the per-request registry lookup is an O(1)
+    /// hit against a snapshot that can never drift from the routes.
+    registry_index: Arc<HashMap<String, Result<PreResolvedRegistry, String>>>,
 }
 
 impl RouteTable {
@@ -620,6 +718,10 @@ impl RouteTable {
         let mut regexes: Vec<Vec<regex::Regex>> = Vec::with_capacity(routes.len());
         let mut anchors: Vec<Vec<usize>> = Vec::with_capacity(routes.len());
         let mut mirror_index: Option<usize> = None;
+        let mut swrr_group_keys: Vec<(String, String)> = Vec::with_capacity(routes.len());
+        let mut swrr_candidates: Vec<Vec<SwrrCandidate>> = Vec::with_capacity(routes.len());
+        let mut destination_index: Vec<HashMap<String, usize>> = Vec::with_capacity(routes.len());
+        let registry_index = Arc::new(precompute_registries(&data.registries, &data.proxies));
 
         for (r, route) in routes.iter().enumerate() {
             // Separate Main / Fallback key spaces (type-safe: a Fallback rule
@@ -656,6 +758,29 @@ impl RouteTable {
             }
             regexes.push(compiled);
             anchors.push(anchor_lens);
+
+            // M7: precompute the SWRR group key + candidate vec + per-route
+            // destination index once (the request path borrows / cheaply clones
+            // these instead of rebuilding the digest, candidates, and an O(n²)
+            // map-back per request).
+            let services: Vec<String> = route
+                .destinations
+                .iter()
+                .map(|d| d.service.clone())
+                .collect();
+            swrr_group_keys.push(group_key(&route.key, &services));
+            swrr_candidates.push(
+                route
+                    .destinations
+                    .iter()
+                    .map(|d| SwrrCandidate::new(d.service.clone(), d.weight() as i32))
+                    .collect(),
+            );
+            let mut idx = HashMap::with_capacity(route.destinations.len());
+            for (di, d) in route.destinations.iter().enumerate() {
+                idx.insert(d.service.clone(), di);
+            }
+            destination_index.push(idx);
         }
 
         Ok(RouteTable {
@@ -665,6 +790,10 @@ impl RouteTable {
             regexes,
             anchors,
             mirror_index,
+            swrr_group_keys,
+            swrr_candidates,
+            destination_index,
+            registry_index,
         })
     }
 
@@ -769,6 +898,37 @@ impl RouteTable {
         self.mirror_index
     }
 
+    /// The precomputed SWRR group key for the `index`-th route (borrowed — the
+    /// request path never rebuilds the sorted-service digest).
+    pub fn swrr_group_key(&self, index: usize) -> &(String, String) {
+        &self.swrr_group_keys[index]
+    }
+
+    /// The precomputed SWRR candidates for the `index`-th route (same order as
+    /// `destinations`). The SWRR round reorders its **own** operating copy, so
+    /// the caller clones this small vec per request.
+    pub fn swrr_candidates(&self, index: usize) -> &[SwrrCandidate] {
+        &self.swrr_candidates[index]
+    }
+
+    /// The `index`-th route's destination whose service string equals
+    /// `service_id` (the O(1) map-back from the SWRR ordering).
+    pub fn destination_for_service(&self, index: usize, service_id: &str) -> Option<&crate::destination::Destination> {
+        self.destination_index[index]
+            .get(service_id)
+            .map(|&i| &self.routes[index].destinations[i])
+    }
+
+    /// The precomputed registry-resolution index (`name.type` → resolved
+    /// connect target or the resolve error), derived from the same snapshot as
+    /// this table (M8). Reading it here (instead of a second `ArcSwap` load)
+    /// keeps a request's decision path on **one** consistent snapshot.
+    pub fn registry_index(
+        &self,
+    ) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
+        &self.registry_index
+    }
+
     /// The Main-route index for an `x-higress-llm-model` value.
     pub fn main_route_indices(&self, model_key: &str) -> &[usize] {
         self.by_main_key
@@ -826,8 +986,49 @@ fn valid_group_keys(data: &ConfigData) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// Runtime shared state: `ArcSwap<ConfigData>` snapshot + per-route-group
-/// SWRR state (design §6.2 / §8).
+/// The per-snapshot derived state that threads the whole request path: the
+/// sanitized [`ConfigData`], the compiled [`RouteTable`] (which also carries
+/// the precomputed registry-resolution index), and the derived
+/// [`ModelRouterConfig`] — all swapped together as one atomic unit, so a worker
+/// always reads one consistent snapshot (the route match, the registry lookups,
+/// the model-router set-up, and the mapping never drift across a hot reload,
+/// design §5.3 / §6.3).
+///
+/// Deriving the router here (inside `build`, not in a per-request cache) also
+/// removes any address-reuse hazard: the value lives in the snapshot, keyed by
+/// nothing — it cannot go stale.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    /// The sanitized control-plane data.
+    pub data: Arc<ConfigData>,
+    /// The compiled route table (with the precomputed registry index).
+    pub table: Arc<RouteTable>,
+    /// The stage-② model-router config derived from `data.model_router`.
+    pub router: Arc<ModelRouterConfig>,
+}
+
+impl Snapshot {
+    /// Build the derived state for one (sanitized) snapshot.
+    fn build(data: ConfigData, table: RouteTable) -> Self {
+        let router = Arc::new(ModelRouterConfig::from_settings(&data.model_router));
+        Self {
+            data: Arc::new(data),
+            table: Arc::new(table),
+            router,
+        }
+    }
+
+    /// The precomputed registry-resolution index for this snapshot (carried by
+    /// the route table — same atomic read as [`Snapshot::table`]).
+    pub fn registries(
+        &self,
+    ) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
+        self.table.registry_index()
+    }
+}
+
+/// Runtime shared state: `ArcSwap<Snapshot>` (data + route table + derived
+/// model-router config) + per-route-group SWRR state (design §6.2 / §8).
 ///
 /// The SWRR key is a **route group**: `(route key, digest of the sorted
 /// destination service ids)`. One [`SwrrState`] (holding `current_weights`
@@ -835,7 +1036,7 @@ fn valid_group_keys(data: &ConfigData) -> BTreeSet<(String, String)> {
 /// weighted selection stays smooth and Nginx-deterministic across workers.
 #[derive(Debug)]
 pub struct SharedConfig {
-    data: ArcSwap<ConfigData>,
+    data: ArcSwap<Snapshot>,
     swrr_states: DashMap<(String, String), SwrrState>,
 }
 
@@ -851,13 +1052,16 @@ impl SharedConfig {
             accepted,
             issues,
         } = data.sanitize();
-        if let Err(e) = RouteTable::rebuild(&accepted) {
-            let mut all = issues;
-            all.push(ValidationError::new(format!("structural: {e}")));
-            return Err(all);
-        }
+        let table = match RouteTable::rebuild(&accepted) {
+            Ok(t) => t,
+            Err(e) => {
+                let mut all = issues;
+                all.push(ValidationError::new(format!("structural: {e}")));
+                return Err(all);
+            }
+        };
         Ok(Self {
-            data: ArcSwap::from_pointee(accepted),
+            data: ArcSwap::from_pointee(Snapshot::build(accepted, table)),
             swrr_states: DashMap::new(),
         })
     }
@@ -873,22 +1077,33 @@ impl SharedConfig {
             accepted,
             issues,
         } = data.sanitize();
-        if let Err(e) = RouteTable::rebuild(&accepted) {
-            let mut all = issues;
-            all.push(ValidationError::new(format!("structural: {e}")));
-            return Err(all);
-        }
+        let table = match RouteTable::rebuild(&accepted) {
+            Ok(t) => t,
+            Err(e) => {
+                let mut all = issues;
+                all.push(ValidationError::new(format!("structural: {e}")));
+                return Err(all);
+            }
+        };
         // Prune stale SWRR state for removed routes / destination groups.
         let valid = valid_group_keys(&accepted);
         self.swrr_states
             .retain(|k, _| valid.contains(k));
-        self.data.store(Arc::new(accepted));
+        self.data
+            .store(Arc::new(Snapshot::build(accepted, table)));
         Ok(())
     }
 
     /// The current snapshot (lock-free read).
     pub fn load(&self) -> Arc<ConfigData> {
-        self.data.load_full()
+        self.data.load_full().data.clone()
+    }
+
+    /// The current snapshot's data + route table (with its registry index) +
+    /// derived model-router config, from **one** atomic read — these can never
+    /// drift across a hot reload.
+    pub fn snapshot(&self) -> Snapshot {
+        (*self.data.load_full()).clone()
     }
 
     /// Borrow (creating on first use) the shared SWRR state for one
@@ -913,10 +1128,29 @@ impl SharedConfig {
         self.swrr_states.get(&key)
     }
 
+    /// The current SWRR state for a **precomputed** route-group key, if one
+    /// exists (exclusive). The request path uses this to avoid rebuilding the
+    /// group key and to mutate only the tiny weight map.
+    pub fn swrr_group_state_mut(
+        &self,
+        key: &(String, String),
+    ) -> Option<dashmap::mapref::one::RefMut<'_, (String, String), SwrrState>> {
+        self.swrr_states.get_mut(key)
+    }
+
+    /// Create (or return) the shared SWRR state entry for a **precomputed**
+    /// route-group key (first request for the group only).
+    pub fn swrr_group_state_entry(
+        &self,
+        key: (String, String),
+    ) -> dashmap::mapref::entry::Entry<'_, (String, String), SwrrState> {
+        self.swrr_states.entry(key)
+    }
+
     /// Rebuild the route table for the current snapshot (call after
     /// `store` when the gateway wants a fresh index).
     pub fn route_table(&self) -> Result<RouteTable, Error> {
-        RouteTable::rebuild(&self.data.load_full())
+        Ok((*self.data.load_full().table).clone())
     }
 }
 

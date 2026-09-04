@@ -8,17 +8,53 @@
 //!
 //! The registry is keyed by `name.type` (**no** port) — the same key space as
 //! the model-mapper `name.type` key and the `X-GPUStack-Model-Instance` value.
+//!
+//! The **hot path** ([`resolve_index`]) reads the snapshot's precomputed
+//! registry index (M8) — O(1) per candidate, no per-request linear rescan or
+//! scheme-stripping `Registry` clone. [`resolve_destination`] is the direct
+//! resolution kept for configs built without the precompute (tests).
 
-use hygress_core::prelude::{ConfigData, Destination, ResolvedTarget};
+use std::collections::HashMap;
+
+use hygress_core::prelude::{ConfigData, Destination, PreResolvedRegistry, ResolvedTarget};
 
 use crate::context::{CandidateTarget, Scheme};
 use crate::error::GatewayError;
 
-/// Resolve one destination to a concrete target.
+/// Resolve one destination to a concrete target via the snapshot's
+/// **precomputed** registry index (M8) — O(1) per candidate.
 ///
 /// Fails (`GatewayError::RegistryResolve`) when the `name.type` has no
-/// registered entry, or the registry itself cannot resolve (unknown proxy ref,
-/// missing dns port, empty domain, …).
+/// registered entry, or its precomputed resolution recorded an error.
+pub fn resolve_index(
+    index: &HashMap<String, Result<PreResolvedRegistry, String>>,
+    dest: &Destination,
+) -> Result<CandidateTarget, GatewayError> {
+    let service_ref = dest
+        .service_ref()
+        .map_err(|e| GatewayError::RegistryResolve(e.to_string()))?;
+    let service_name = service_ref.service_name(); // `name.type` (no port)
+    match index.get(&service_name) {
+        Some(Ok(info)) => Ok(CandidateTarget {
+            service: dest.service.clone(),
+            service_name,
+            address: info.address.clone(),
+            proxied: info.proxied,
+            scheme: if info.https { Scheme::Https } else { Scheme::Http },
+            proxy: info.proxy.clone(),
+        }),
+        Some(Err(e)) => Err(GatewayError::RegistryResolve(format!(
+            "'{service_name}': {e}"
+        ))),
+        None => Err(GatewayError::RegistryResolve(format!(
+            "no registry for '{service_name}'"
+        ))),
+    }
+}
+
+/// Resolve one destination to a concrete target by scanning the snapshot's
+/// `registries` directly (the precomputed index is derived from these; kept
+/// for configs constructed without the precompute, e.g. tests).
 pub fn resolve_destination(data: &ConfigData, dest: &Destination) -> Result<CandidateTarget, GatewayError> {
     let service_ref = dest
         .service_ref()

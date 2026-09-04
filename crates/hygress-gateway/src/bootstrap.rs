@@ -406,7 +406,15 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             let idle_ms: u64 = 300_000;
             loop {
                 interval.tick().await;
-                policy_poll.poll();
+                // L10: the policy poll does synchronous fs metadata + (on a
+                // change) a YAML parse — run the sync work on the blocking
+                // pool so the 1s tick never blocks a runtime worker.
+                let owner = policy_poll.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || owner.poll()).await
+                {
+                    debug!(error = %e, "policy poll task failed");
+                }
                 // Evict idle quota counters (BLOCK-2: spec-agnostic leak
                 // prevention; complements the window-based `gc_stale`).
                 let now_ms = std::time::SystemTime::now()

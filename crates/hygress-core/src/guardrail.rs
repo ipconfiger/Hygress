@@ -13,6 +13,8 @@
 //! The LLM verdict client (B4b) lives in the egress crate; this module is the
 //! pure core (no I/O).
 
+use std::sync::Arc;
+
 use regex::Regex;
 
 use crate::error::Error;
@@ -89,7 +91,7 @@ impl std::fmt::Debug for StaticRuleSet {
 /// match a pattern split across chunk boundaries.
 pub struct ChunkScanner {
     buffer: Vec<u8>,
-    rules: StaticRuleSet,
+    rules: Arc<StaticRuleSet>,
     /// Max bytes of tail to retain (bounds memory; must be ≥ the longest rule
     /// pattern to catch cross-boundary matches).
     max_tail: usize,
@@ -97,11 +99,12 @@ pub struct ChunkScanner {
 
 impl ChunkScanner {
     /// Create a scanner over `rules`, retaining at most `max_tail` bytes of
-    /// tail across chunk boundaries.
-    pub fn new(rules: StaticRuleSet, max_tail: usize) -> Self {
+    /// tail across chunk boundaries. The compiled set is `Arc`-shared so
+    /// per-response scanners clone a pointer, not the rule vec / regexes.
+    pub fn new(rules: impl Into<Arc<StaticRuleSet>>, max_tail: usize) -> Self {
         Self {
             buffer: Vec::new(),
-            rules,
+            rules: rules.into(),
             max_tail,
         }
     }

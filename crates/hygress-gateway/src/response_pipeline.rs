@@ -32,6 +32,8 @@
 //! the output side uses the effective **static rules** (the same set as the
 //! input side, `global ++ route`).
 
+use std::sync::Arc;
+
 use hygress_core::prelude::{ChunkScanner, GuardDecision, StaticRuleSet, StaticRuleSpec};
 use tracing::warn;
 
@@ -50,27 +52,36 @@ pub struct ResponsePipeline {
 
 impl ResponsePipeline {
     /// Build the pipeline over the **effective** static rules (the merged
-    /// `global ++ route` set).
+    /// `global ++ route` set), compiling them now.
     ///
     /// - no rules → the **observe** pass-through state (no scanner);
     /// - an uncompilable regex → pass-through **with a warn** (fail-safe: a
     ///   bad rule must not cut every response, design §7).
     pub fn new(rules: &[StaticRuleSpec]) -> Self {
-        let scanner = if rules.is_empty() {
-            None
-        } else {
-            match StaticRuleSet::new(rules) {
-                Ok(set) => Some(ChunkScanner::new(set, MAX_TAIL)),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "guardrail static rule compile failed; output scanning disabled"
-                    );
-                    None
-                }
+        if rules.is_empty() {
+            return Self { scanner: None };
+        }
+        match StaticRuleSet::new(rules) {
+            Ok(set) => Self::from_compiled(Some(&Arc::new(set))),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "guardrail static rule compile failed; output scanning disabled"
+                );
+                Self { scanner: None }
             }
-        };
-        Self { scanner }
+        }
+    }
+
+    /// Build the per-response pipeline from an **already compiled** static set
+    /// (the merged policy compiles its rules once at load/reload — H3 — so the
+    /// per-response path `Arc`-clones the compiled set instead of re-compiling
+    /// the regexes or re-cloning the rule vec). `None` = the observe
+    /// pass-through state.
+    pub fn from_compiled(set: Option<&Arc<StaticRuleSet>>) -> Self {
+        Self {
+            scanner: set.map(|s| ChunkScanner::new(s.clone(), MAX_TAIL)),
+        }
     }
 
     /// Feed one response chunk (after `usage.feed`, before `write_response_body`).

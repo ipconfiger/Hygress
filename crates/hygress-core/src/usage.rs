@@ -351,40 +351,44 @@ impl UsageSnapshot {
     /// object was absorbed from this chunk.
     ///
     /// Never panics on malformed input; reassembles a `data:` line (or the
-    /// whole non-streaming body) split across chunks via the tail buffer.
+    /// whole non-streaming body) split across chunks via a persistent tail
+    /// buffer (capacity reused across feeds — no per-chunk realloc).
     pub fn feed(&mut self, chunk: &[u8]) -> bool {
-        let mut buf = std::mem::take(&mut self.tail);
-        buf.extend_from_slice(chunk);
-        if buf.is_empty() {
+        self.tail.extend_from_slice(chunk);
+        if self.tail.is_empty() {
             return false;
         }
 
         match self.mode {
-            Mode::Unknown => {
-                if has_anchored_data(&buf) {
-                    self.mode = Mode::Sse;
-                    self.process_sse(&buf)
-                } else if let Ok(value) = serde_json::from_slice::<Value>(&buf) {
-                    if value.is_object() {
-                        self.mode = Mode::Json;
-                        self.finish_json(&value)
-                    } else {
-                        // Valid JSON but not an object: not a usage body.
-                        self.tail = buf;
-                        false
-                    }
-                } else {
-                    // Incomplete (fragmented) prefix: hold for reassembly.
-                    self.tail = buf;
-                    false
-                }
-            }
-            Mode::Sse => self.process_sse(&buf),
-            // The single non-streaming body is already consumed; ignore any
-            // trailing bytes.
             Mode::Json => {
+                // The single non-streaming body is already consumed; drop any
+                // trailing bytes and ignore the rest of the response.
                 self.tail.clear();
                 false
+            }
+            Mode::Unknown | Mode::Sse => {
+                if self.mode == Mode::Unknown {
+                    if has_anchored_data(&self.tail) {
+                        self.mode = Mode::Sse;
+                    } else if let Ok(value) = serde_json::from_slice::<Value>(&self.tail) {
+                        if value.is_object() {
+                            self.mode = Mode::Json;
+                            let absorbed = self.finish_json(&value);
+                            self.tail.clear();
+                            return absorbed;
+                        }
+                        // Valid JSON but not an object: not a usage body.
+                        return false;
+                    } else {
+                        // Incomplete (fragmented) prefix: hold for reassembly.
+                        return false;
+                    }
+                }
+                let (consumed, found) = self.consume_sse();
+                if consumed > 0 {
+                    self.discard_prefix(consumed);
+                }
+                found
             }
         }
     }
@@ -448,14 +452,21 @@ impl UsageSnapshot {
         }
     }
 
-    /// Process an SSE buffer: count + absorb each **newline-terminated**
-    /// anchored `data:` line exactly once; buffer the incomplete trailing
-    /// line for the next `feed`.
-    fn process_sse(&mut self, buf: &[u8]) -> bool {
+    /// Process the buffered tail's SSE lines: count + absorb each
+    /// **newline-terminated** anchored `data:` line exactly once; return the
+    /// number of bytes consumed (through the last newline — the incomplete
+    /// trailing line stays in the persistent buffer) and whether any usage
+    /// object was absorbed.
+    ///
+    /// The buffer is detached for the duration so the line slices never alias
+    /// the mutable borrow of `self`; its allocation (capacity) survives the
+    /// move and is carried back, so no per-chunk reallocation happens.
+    fn consume_sse(&mut self) -> (usize, bool) {
+        let buf = std::mem::take(&mut self.tail);
         let mut found = false;
         let mut pos = 0;
         while pos < buf.len() {
-            let Some(nl) = find_subseq(buf, b"\n", pos) else {
+            let Some(nl) = find_subseq(&buf, b"\n", pos) else {
                 break;
             };
             let line = &buf[pos..nl];
@@ -464,9 +475,19 @@ impl UsageSnapshot {
             }
             pos = nl + 1;
         }
-        // Incomplete trailing line (no newline yet) -> reassemble on next feed.
-        self.tail = buf[pos..].to_vec();
-        found
+        self.tail = buf;
+        (pos, found)
+    }
+
+    /// Drop the consumed prefix, keeping the incomplete trailing line in the
+    /// persistent buffer (no per-chunk reallocation — the capacity is reused).
+    fn discard_prefix(&mut self, consumed: usize) {
+        if consumed >= self.tail.len() {
+            self.tail.clear();
+        } else {
+            self.tail.copy_within(consumed.., 0);
+            self.tail.truncate(self.tail.len() - consumed);
+        }
     }
 
     /// Handle one full (newline-terminated) SSE line. Only anchored `data:`
@@ -482,6 +503,14 @@ impl UsageSnapshot {
         }
         // Count this data line exactly once (it is newline-terminated).
         self.output_chunk_count += 1;
+        // M5 prefilter: a usage object requires the literal `"usage"` JSON key
+        // somewhere in the payload (OpenAI `usage` or Anthropic
+        // `message.usage` — both contain the byte token `"usage"`). Skip the
+        // full `serde_json::Value` DOM parse for the ~all data lines that carry
+        // content only.
+        if find_subseq(payload, b"\"usage\"", 0).is_none() {
+            return false;
+        }
         // The usage object must come from the parsed top-level payload JSON.
         if let Ok(value) = serde_json::from_slice::<Value>(payload) {
             if let Some(usage) = usage_from_payload(&value) {

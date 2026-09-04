@@ -16,7 +16,10 @@
 # =============================================================================
 set -euo pipefail
 REMOTE="${REMOTE:?usage: REMOTE=root@host ./ship_to_remote.sh}"
-REPO="$(cd "$(dirname "$0")" && pwd)/../.."   # scripts/ -> gpustack-validation/ -> repo root
+# Resolve the repo root from the git metadata (not a fixed `../..` depth), so the
+# script works regardless of how deeply the scripts/ dir is nested in the repo.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" || { echo "FATAL: ship_to_remote.sh must be run from inside the Hygress git repo"; exit 1; }
 HYGR="$REPO"
 DEPLOY=/root/hygress-deploy
 echo "Hygress source : $HYGR"

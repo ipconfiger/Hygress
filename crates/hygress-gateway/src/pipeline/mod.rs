@@ -109,7 +109,12 @@ fn prepare_inner(
     //    configured `targetHeader` (and the body `model` field) when resolved.
     let mut body = inbound.body.clone();
     let mr = model_router::resolve(&inbound.path, &body, &inbound.content_type, ctx.router)?;
-    if let Some(model) = &mr.model {
+    // B4: the body's model value as of the end of prepare — the carrier for the
+    // per-candidate model-mapper identity short-circuit. When prepare rewrote
+    // the body, use the resolved value (no re-scan); otherwise extract it once
+    // (amortized over every candidate), `None` covering missing / non-string /
+    // malformed (each candidate then skips its body-mapper scan entirely).
+    let body_model = if let Some(model) = &mr.model {
         base_headers.insert(ctx.router.target_header.as_str(), model);
         // The route-match key is canonically `x-higress-llm-model` (the Ingress
         // `higress.io/exact-match-header-x-higress-llm-model`). When the plugin's
@@ -119,15 +124,28 @@ fn prepare_inner(
         if ctx.router.target_header != crate::context::hdr::LLM_MODEL {
             base_headers.insert(crate::context::hdr::LLM_MODEL, model);
         }
+        let content_type = Some(inbound.content_type.as_str());
         if let Some(nb) = crate::body::rewrite_model_field(
             &body,
-            Some(inbound.content_type.as_str()),
+            content_type,
             &ctx.router.model_key,
             model,
         ) {
             body = nb;
+            Some(model.clone()) // rewritten → the body now carries `mr.model`
+        } else {
+            // Rewrite no-op'd (no string model field to splice): the body is
+            // unchanged, so its current model value is the extracted one.
+            crate::body::extract_model(&body, content_type, &ctx.router.model_key)
         }
-    }
+    } else {
+        // No resolved model (path/header-driven): the body was not rewritten.
+        crate::body::extract_model(
+            &body,
+            Some(inbound.content_type.as_str()),
+            &ctx.router.model_key,
+        )
+    };
 
     // ③ transformer-in: rename legacy model header, restore fallback path, backstop
     //    `:path` → `x-gpustack-original-path` (all pure core semantics).
@@ -202,6 +220,7 @@ fn prepare_inner(
         upstream_path,
         query: inbound.query.clone(),
         body,
+        body_model,
         content_type: inbound.content_type.clone(),
         model_mapping: route.model_mapping.clone(),
         usage,
@@ -243,14 +262,19 @@ pub fn build_outbound(
         }
     }
 
-    // ⑧ model-mapper: rewrite the outbound body `model` field for this candidate's
-    //    `name.type` (the selected instance's service identity).
+    // ⑧ model-mapper: rewrite the outbound body `model` field for this
+    //    candidate's `name.type` (the selected instance's service identity).
+    //    The body's current model value was recorded once at prepare
+    //    (`body_model`, B4): None → skip the per-candidate scan entirely;
+    //    identity mapping → reuse the Bytes reference (no scan, no splice);
+    //    otherwise one bounded rewrite.
     let mut out_body = prepared.body.clone();
-    model_mapper::apply(
+    model_mapper::apply_with_current(
         &prepared.model_mapping,
         &candidate.service_name,
         &mut out_body,
         &prepared.content_type,
+        prepared.body_model.as_deref(),
     );
 
     // ⑨ set-model-pre-route: the selected instance cluster name + the route
@@ -383,6 +407,7 @@ mod tests {
             upstream_path: "/v1/chat/completions".into(),
             query: String::new(),
             body: bytes::Bytes::new(),
+            body_model: None,
             content_type: "application/json".into(),
             model_mapping: Default::default(),
             usage: None,

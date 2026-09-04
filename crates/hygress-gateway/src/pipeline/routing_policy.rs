@@ -156,6 +156,7 @@ mod tests {
             upstream_path: "/v1/chat/completions".into(),
             query: String::new(),
             body: bytes::Bytes::new(),
+            body_model: None,
             content_type: "application/json".into(),
             model_mapping: Default::default(),
             usage: None,

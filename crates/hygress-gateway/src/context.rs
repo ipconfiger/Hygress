@@ -251,6 +251,12 @@ pub struct PreparedRequest {
     pub query: String,
     /// The request body after model-router ② (pre per-candidate model-mapper).
     pub body: Bytes,
+    /// The body `model` value as of the end of stage ② (B4). `Some(..)` =
+    /// the body carries a top-level string `model` and this is its **current**
+    /// value (the value after prepare's own rewrite when one happened);
+    /// `None` = the body has no rewritable model (missing / non-string /
+    /// malformed) — per-candidate model-mapper then skips its scan entirely.
+    pub body_model: Option<String>,
     /// The request `Content-Type` forwarded upstream.
     pub content_type: String,
     /// The matched route's per-destination model mapping (⑧; keyed `name.type`).

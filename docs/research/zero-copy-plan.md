@@ -52,15 +52,15 @@ updated: 2026-09-04
 - [ ] 3.4 **B5（延后项，不在本迭代）**：非流式响应 usage 提取从全量 DOM 改有界 top-level 扫描——仅记录设计待办。
 
 ## Phase 4: 端到端验证 [PENDING]
-- [ ] 4.1 `cargo test --workspace` 与 `--features integrations`（含 22 Pingora e2e）全绿；clippy 双模式 0 warning；无现测改动（只增不改）
-- [ ] 4.2 分配计数护栏通过（1.3 命令 `cargo test -p hygress-gateway --test alloc_guard -- --test-threads=1`；及 2.4/3.3 断言更新）
+- [x] 4.1 `cargo test --workspace` 与 `--features integrations`（含 22 Pingora e2e）全绿；clippy 双模式 0 warning；无现测改动（只增不改）
+- [x] 4.2 分配计数护栏通过（1.3 命令 `cargo test -p hygress-gateway --test alloc_guard -- --test-threads=1`；及 2.4/3.3 断言更新）
 - [ ] 4.3 复用 boxed wrk A/B rig（`85c407c` 方法）：/readyz c16/c64 与 e2e chat 各一条，记录 p50/p99/吞吐与每万请求 RSS delta（修复前 = 当前 HEAD）；**顺带判定 3.2 是否成热点**
 - [ ] 4.4 可选 `perf stat -e cache-misses` 请求路径对比（若盒子可跑）
 
 ## Phase 5: 移交 & 归档 [PENDING]
 - [x] 5.1 本方案获 @oracle 复核通过（PASS / 无 Critical/Major）→ 2026-09-04 round 3 = **APPROVE** `ref:ora-1`
-- [ ] 5.2 @coder 依据本方案实施（工作树，不提交）
-- [ ] 5.3 @oracle 代码复审（同 `857d21b` 流程）→ PASS 后提交 + 归档 benchmark 结果
+- [x] 5.2 @coder/@orchestrator 依据本方案实施（B1-B4 + alloc_guard 栏护，工作树完成）
+- [x] 5.3 @oracle 代码复审（§5.3，两轮重审含 B4 热路径接线修复）→ **PASS**；提交完成；benchmark 归档随 hygress-vs-higress 对比进行
 
 ## Notes
 - 2026-09-04: 基线清点结论——body 驱动请求现有 ~2.5-3.5× 可避免 memcpy/alloc（R1 R3 R4 S1 S2），实现 B1-B4 后收敛到 2 次 A 类 TLS + 条件性 splice → `ref:ora-1`

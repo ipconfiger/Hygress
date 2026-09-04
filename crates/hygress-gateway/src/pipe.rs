@@ -260,7 +260,14 @@ impl ProxyHttp for HygressProxy {
         }
 
         // ⑥ body phase (phase 2): read the full body up to the cap (413).
-        let body = match Self::read_body(session, &head.method, router.max_body_bytes).await {
+        let body = match Self::read_body(
+            session,
+            &head.method,
+            router.max_body_bytes,
+            head.content_length,
+        )
+        .await
+        {
             Ok(b) => b,
             Err(e) => {
                 state.metrics.record_request(e.status(), e.reason());
@@ -677,6 +684,9 @@ struct InboundHead {
     content_type: String,
     /// Client source IP (`X-Real-IP` if present, else `X-Forwarded-For`).
     client_ip: String,
+    /// The `Content-Length` header when present and a valid integer (B1 — the
+    /// body reader pre-reserves this exact size, capped at `max_body`).
+    content_length: Option<u64>,
     headers: HeaderMap,
 }
 
@@ -719,6 +729,13 @@ impl HygressProxy {
         let method = req.method.as_str().to_string();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(|q| q.to_string()).unwrap_or_default();
+        // B1: a valid `Content-Length` lets the body reader pre-reserve the
+        // exact size (no geometric growth on the request buffer).
+        let content_length = req
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let mut headers = HeaderMap::new();
         for (name, value) in req.headers.iter() {
             if let Ok(v) = value.to_str() {
@@ -734,6 +751,7 @@ impl HygressProxy {
             host,
             content_type,
             client_ip,
+            content_length,
             headers,
         }
     }
@@ -744,9 +762,21 @@ impl HygressProxy {
         session: &mut Session,
         method: &str,
         max_body: usize,
+        content_length: Option<u64>,
     ) -> Result<Bytes, GatewayError> {
         let has_body = matches!(method, "POST" | "PUT" | "PATCH");
-        let mut buf: Vec<u8> = Vec::new();
+        // B1: when the peer declared a valid Content-Length, pre-reserve that
+        // exact size (capped at max_body) so the buffer grows geometrically
+        // free (~½ body copy saved). A bogus/oversized Content-Length only
+        // costs a transient allocation (capped and freed at request end) and
+        // can never bypass the cap below — the per-chunk `extend_from_slice`
+        // + the `> max_body` check are the enforcement.
+        let mut buf: Vec<u8> = match content_length {
+            Some(len) if has_body => Vec::with_capacity(
+                usize::try_from(len).unwrap_or(max_body).min(max_body),
+            ),
+            _ => Vec::new(),
+        };
         if has_body {
             while let Ok(Some(chunk)) = session.as_downstream_mut().read_request_body().await {
                 buf.extend_from_slice(&chunk);

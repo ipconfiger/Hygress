@@ -313,67 +313,93 @@ fn parse_json_string(b: &[u8], from: usize) -> Option<(String, usize)> {
     }
     let mut out = String::new();
     let mut i = from + 1;
-    while i < b.len() {
-        match b[i] {
-            b'"' => return Some((out, i + 1)),
-            b'\\' => {
-                let esc = *b.get(i + 1)?;
-                match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        // `\uXXXX` — a high+low surrogate pair combines into
-                        // the scalar (matching serde_json); a lone surrogate is
-                        // rejected exactly like serde.
-                        let cp = parse_hex4(b, i + 2)?;
-                        if (0xD800..=0xDBFF).contains(&cp) {
-                            // High surrogate: the next escape MUST be a low
-                            // surrogate.
-                            if b.get(i + 6) != Some(&b'\\') || b.get(i + 7) != Some(&b'u') {
-                                return None; // lone leading surrogate
-                            }
-                            let low = parse_hex4(b, i + 8)?;
-                            if !(0xDC00..=0xDFFF).contains(&low) {
-                                return None;
-                            }
-                            let scalar = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-                            out.push(char::from_u32(scalar)?);
-                            // Total escape: `\u`(2) + 4 + `\u`(2) + 4 = 12 bytes.
-                            i += 10;
-                        } else if (0xDC00..=0xDFFF).contains(&cp) {
-                            return None; // lone low surrogate
-                        } else {
-                            out.push(char::from_u32(cp)?);
-                            i += 4; // total escape: `\u`(2) + 4 = 6 bytes.
-                        }
-                    }
-                    _ => return None,
-                }
-                i += 2;
-            }
-            c if c < 0x20 => return None,
-            c if c < 0x80 => {
-                // ASCII fast path: a single byte, no validation of the
-                // remainder (O(1) per byte — the scan stays linear).
-                out.push(c as char);
-                i += 1;
-            }
-            _ => {
-                // A multi-byte UTF-8 char: decode from a bounded ≤4-byte
-                // window (never the whole remaining slice).
-                let (ch, len) = decode_utf8(b, i)?;
-                out.push(ch);
-                i += len;
-            }
+    loop {
+        let (next, ch) = json_string_char(b, i).ok()?;
+        match ch {
+            Some(c) => out.push(c),
+            None => return Some((out, next)), // closing quote
+        }
+        i = next;
+    }
+}
+
+/// Validate-and-advance a JSON string token starting at `from` (must point at
+/// `"`), **without materializing** the decoded `String` (B3) — the skip path
+/// for non-target keys/values. Returns the position after the closing quote.
+///
+/// Validation is identical to [`parse_json_string`] (same escape table, control
+/// chars, bounded multi-byte UTF-8, surrogate pairing), so a malformed token in
+/// a **skipped** string still rejects the document exactly like serde — the
+/// skip path is validate-and-advance, never merely-advance.
+fn skip_json_string(b: &[u8], from: usize) -> Option<usize> {
+    if b.get(from) != Some(&b'"') {
+        return None;
+    }
+    let mut i = from + 1;
+    loop {
+        let (next, ch) = json_string_char(b, i).ok()?;
+        match ch {
+            Some(_) => i = next,
+            None => return Some(next), // closing quote
         }
     }
-    None
+}
+
+/// Decode the character beginning at `i` inside a JSON string token.
+///
+/// Returns `(next_i, Some(ch))` for an ordinary character / escape to emit,
+/// `(next_i, None)` for the closing quote (the caller returns), and `Err(())`
+/// for malformed input (bad escape, control char, lone surrogate, invalid
+/// UTF-8). Surrogate-pair escapes are combined into the scalar here.
+fn json_string_char(b: &[u8], i: usize) -> Result<(usize, Option<char>), ()> {
+    let c = *b.get(i).ok_or(())?;
+    match c {
+        b'"' => Ok((i + 1, None)),
+        b'\\' => {
+            let esc = *b.get(i + 1).ok_or(())?;
+            match esc {
+                b'"' => Ok((i + 2, Some('"'))),
+                b'\\' => Ok((i + 2, Some('\\'))),
+                b'/' => Ok((i + 2, Some('/'))),
+                b'b' => Ok((i + 2, Some('\u{0008}'))),
+                b'f' => Ok((i + 2, Some('\u{000C}'))),
+                b'n' => Ok((i + 2, Some('\n'))),
+                b'r' => Ok((i + 2, Some('\r'))),
+                b't' => Ok((i + 2, Some('\t'))),
+                b'u' => {
+                    let cp = parse_hex4(b, i + 2).ok_or(())?;
+                    if (0xD800..=0xDBFF).contains(&cp) {
+                        // High surrogate: the next escape MUST be a low
+                        // surrogate.
+                        if b.get(i + 6) != Some(&b'\\') || b.get(i + 7) != Some(&b'u') {
+                            return Err(()); // lone leading surrogate
+                        }
+                        let low = parse_hex4(b, i + 8).ok_or(())?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return Err(());
+                        }
+                        let scalar = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        let ch = char::from_u32(scalar).ok_or(())?;
+                        // Total escape: `\u`(2) + 4 + `\u`(2) + 4 = 12 bytes.
+                        Ok((i + 12, Some(ch)))
+                    } else if (0xDC00..=0xDFFF).contains(&cp) {
+                        Err(()) // lone low surrogate
+                    } else {
+                        let ch = char::from_u32(cp).ok_or(())?;
+                        Ok((i + 6, Some(ch))) // total escape: `\u`(2) + 4 = 6 bytes.
+                    }
+                }
+                _ => Err(()),
+            }
+        }
+        c if c < 0x20 => Err(()),
+        c if c < 0x80 => Ok((i + 1, Some(c as char))),
+        _ => {
+            // A multi-byte UTF-8 char: decode from a bounded ≤4-byte window.
+            let (ch, len) = decode_utf8(b, i).ok_or(())?;
+            Ok((i + len, Some(ch)))
+        }
+    }
 }
 
 /// Parse exactly 4 hex digits at `from` (the `XXXX` of `\uXXXX`).
@@ -458,14 +484,14 @@ fn skip_json_value(b: &[u8], i: usize, depth: usize) -> Option<usize> {
     }
     let p = skip_ws(b, i);
     match *b.get(p)? {
-        b'"' => parse_json_string(b, p).map(|(_, e)| e),
+        b'"' => skip_json_string(b, p),
         b'{' => {
             let mut q = skip_ws(b, p + 1);
             if b.get(q) == Some(&b'}') {
                 return Some(q + 1);
             }
             loop {
-                let (_, after_key) = parse_json_string(b, q)?;
+                let after_key = skip_json_string(b, q)?;
                 let mut q2 = skip_ws(b, after_key);
                 if b.get(q2)? != &b':' {
                     return None;
@@ -891,6 +917,54 @@ mod tests {
         // Valid numbers still scan fine (model extracted).
         let ok = r#"{"bad":-0.5e+2,"model":"ok"}"#;
         assert_eq!(extract_model(&Bytes::from(ok), Some(MODEL), "model"), Some("ok".to_string()));
+    }
+
+    #[test]
+    fn skip_path_validates_bad_escape_in_skipped_string() {
+        // B3: the skip path is validate-and-advance. A bad escape inside a
+        // NON-target (skipped) string must reject the whole document — serde
+        // refuses it, so the model must not be extracted.
+        let src = r#"{"bad":"\q","model":"x"}"#;
+        assert_eq!(extract_model(&Bytes::from(src), Some(MODEL), "model"), None);
+        assert_eq!(serde_model(src), None);
+
+        // The same holds for an escape inside a skipped NESTED value.
+        let nested = r#"{"meta":{"note":"\q"},"model":"x"}"#;
+        assert_eq!(extract_model(&Bytes::from(nested), Some(MODEL), "model"), None);
+        assert_eq!(serde_model(nested), None);
+    }
+
+    #[test]
+    fn skip_path_validates_invalid_utf8_in_skipped_string() {
+        // B3: an invalid UTF-8 byte inside a skipped string must reject the
+        // document (validate-and-advance, not merely-advance) — a bare
+        // "advance without validation" skip would have accepted it. The oracle
+        // is a byte-level serde parse (an invalid-UTF-8 doc is not a `&str`).
+        let bytes = {
+            let mut b = Vec::from(br#"{"bad":"ok"#);
+            b.push(0xFF); // invalid UTF-8 inside a SKIPPED string value
+            b.extend_from_slice(br#","model":"x"}"#);
+            b
+        };
+        let body = Bytes::from(bytes);
+        assert_eq!(extract_model(&body, Some(MODEL), "model"), None);
+        let serde_ok = serde_json::from_slice::<Value>(&body).is_err();
+        assert!(serde_ok, "serde must also reject the invalid-UTF-8 document");
+    }
+
+    #[test]
+    fn skip_path_accepts_valid_multibyte_utf8_in_skipped_string() {
+        // B3: valid multi-byte UTF-8 inside a skipped string is accepted and
+        // discarded (the model extraction still succeeds, matching serde).
+        let src = "{\"bad\":\"café-🚀 中文\",\"model\":\"x\"}";
+        assert_eq!(extract_model(&Bytes::from(src), Some(MODEL), "model"), Some("x".to_string()));
+        assert_eq!(serde_model(src), Some("x".to_string()));
+
+        // Escapes (incl. surrogate pairs) inside a skipped string are also
+        // validated-and-advanced:
+        let esc = r#"{"bad":"\uD83D\uDE80 \n \t \\","model":"x"}"#;
+        assert_eq!(extract_model(&Bytes::from(esc), Some(MODEL), "model"), Some("x".to_string()));
+        assert_eq!(serde_model(esc), Some("x".to_string()));
     }
 
     #[test]

@@ -10,28 +10,64 @@
 use bytes::Bytes;
 use hygress_core::prelude::ModelMapping;
 
-/// Rewrite the outbound body `model` field for `service_name`.
+/// Rewrite the outbound body `model` field for `service_name` (convenience
+/// form: re-derives the body's current model by scanning — used by tests /
+/// direct callers). The hot path is [`apply_with_current`], which carries the
+/// body model recorded once at prepare (B4).
 ///
 /// Returns `true` when the body was actually rewritten. `service_name` is the
 /// selected candidate's `name.type` (e.g. `model-1-10.static`).
-///
-/// The JSON path uses the bounded top-level byte-splice rewrite (H4) — no
-/// `serde_json::Value` DOM round-trip per candidate, so failover candidates
-/// pay a small splice instead of a full parse + re-serialization.
 pub fn apply(
     mapping: &ModelMapping,
     service_name: &str,
     body: &mut Bytes,
     content_type: &str,
 ) -> bool {
+    let current = crate::body::extract_model(body, Some(content_type), "model");
+    apply_with_current(mapping, service_name, body, content_type, current.as_deref())
+}
+
+/// Rewrite the outbound body `model` field for `service_name`, given the body's
+/// **current** model value (`current_model`) recorded once at prepare (B4).
+///
+/// Returns `true` only when the body was actually rewritten.
+///
+/// - empty body → `false`;
+/// - no mapping entry for `service_name` → `false`;
+/// - `current_model == None` (missing / non-string / malformed body) → `false`
+///   **without scanning** — the per-candidate body scan (incl. on malformed
+///   bodies) is skipped entirely;
+/// - `mapped == current_model` (identity mapping) → `false` with the body
+///   **reused as-is** (the caller keeps `prepared.body`, which already carries
+///   the right model): no second scan, no splice. ⚠ Values are compared, never
+///   spans — any span from the prepare scan is invalid after prepare's own
+///   rewrite.
+/// - otherwise → one bounded rewrite (validate-and-skip scan + byte splice via
+///   [`crate::body::rewrite_json_model`], or the multipart form-part splice).
+pub fn apply_with_current(
+    mapping: &ModelMapping,
+    service_name: &str,
+    body: &mut Bytes,
+    content_type: &str,
+    current_model: Option<&str>,
+) -> bool {
+    // Guard: nothing to rewrite for an empty body.
     if body.is_empty() {
         return false;
     }
+    let Some(mapped) = mapping.lookup(service_name) else {
+        return false;
+    };
+    let Some(current) = current_model else {
+        return false;
+    };
+    if current == mapped {
+        // Identity mapping: reuse the body Bytes reference (O(1)) — no scan,
+        // no splice.
+        return false;
+    }
     if crate::body::is_json(Some(content_type)) {
-        let Some(model) = mapping.lookup(service_name) else {
-            return false;
-        };
-        if let Some(nb) = crate::body::rewrite_json_model(body, "model", model) {
+        if let Some(nb) = crate::body::rewrite_json_model(body, "model", mapped) {
             *body = nb;
             return true;
         }
@@ -114,5 +150,77 @@ mod tests {
         let m = ModelMapping::single("a.static", "x");
         let mut body = Bytes::new();
         assert!(!apply(&m, "a.static", &mut body, JSON));
+    }
+
+    // ----- B4: apply_with_current short-circuit (zero-copy plan §2.3) -----
+
+    #[test]
+    fn b4_identity_mapping_reuses_body_no_rewrite() {
+        // Identity: the body already carries the mapped model -> false, body
+        // untouched (no scan, no splice — the caller keeps the Bytes ref).
+        let m = ModelMapping::single("a.static", "same");
+        let mut body = Bytes::from(r#"{"model":"same","stream":true}"#);
+        assert!(!apply_with_current(&m, "a.static", &mut body, JSON, Some("same")));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["model"], json!("same"));
+        assert_eq!(v["stream"], json!(true));
+    }
+
+    #[test]
+    fn b4_none_current_skips_scan_even_with_mapping() {
+        // current_model None (missing/non-string/malformed body): skip the body
+        // mapper entirely — the candidate never scans.
+        let m = ModelMapping::single("a.static", "x");
+        let mut body = Bytes::from(r#"{"model":"irrelevant","stream":true}"#);
+        assert!(!apply_with_current(&m, "a.static", &mut body, JSON, None));
+    }
+
+    #[test]
+    fn b4_absent_model_fields_skip_without_scan() {
+        // No top-level string model in the body -> prepared.body_model is None
+        // -> apply_with_current returns false without scanning (previously the
+        // per-candidate rewrite scanned + found nothing).
+        let m = ModelMapping::single("a.static", "x");
+        for body in [
+            Bytes::from(r#"{"model":5}"#),      // non-string model
+            Bytes::from(r#"{"messages":[]}"#),  // missing model
+            Bytes::from(r#"{broken"#),          // malformed
+        ] {
+            let mut b = body;
+            assert!(!apply_with_current(&m, "a.static", &mut b, JSON, None));
+        }
+    }
+
+    #[test]
+    fn b4_real_rewrite_when_current_differs() {
+        let m = ModelMapping::single("a.static", "mapped");
+        let mut body = Bytes::from(r#"{"model":"org1/llama","stream":true}"#);
+        assert!(apply_with_current(&m, "a.static", &mut body, JSON, Some("org1/llama")));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["model"], json!("mapped"));
+    }
+
+    #[test]
+    fn b4_multipart_identity_and_rewrite() {
+        let mk = |model: &str| {
+            Bytes::from(format!(
+                "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+                 --B--\r\n"
+            ))
+        };
+        // Identity multipart -> false, body untouched (the model part already
+        // carries the mapped value).
+        let m = ModelMapping::single("a.static", "org/llama");
+        let mut body = mk("org/llama");
+        assert!(!apply_with_current(&m, "a.static", &mut body, MP, Some("org/llama")));
+        assert!(String::from_utf8_lossy(&body).contains("org/llama"));
+
+        // Non-identity multipart -> real rewrite of the model part.
+        let m2 = ModelMapping::single("a.static", "mapped-name");
+        let mut body = mk("org/llama");
+        assert!(apply_with_current(&m2, "a.static", &mut body, MP, Some("org/llama")));
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("mapped-name"));
+        assert!(!s.contains("org/llama"));
     }
 }

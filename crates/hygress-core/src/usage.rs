@@ -350,15 +350,17 @@ impl UsageSnapshot {
     /// Consume one response chunk. Returns `true` when at least one usage
     /// object was absorbed from this chunk.
     ///
-    /// Never panics on malformed input; reassembles a `data:` line (or the
-    /// whole non-streaming body) split across chunks via a persistent tail
-    /// buffer (capacity reused across feeds — no per-chunk realloc).
+    /// Never panics on malformed input. In the SSE steady state the complete
+    /// lines fully inside `chunk` are processed **in place** (zero-copy); only
+    /// a cross-buffer line (a partial tail prefix + the chunk prefix up to the
+    /// first newline) is spliced once into the persistent tail, and only the
+    /// incomplete trailing sliver is buffered — per-chunk payload copies drop
+    /// from ~chunk.len() to ~partial-tail (B2). The first (mode-classifying)
+    /// chunk still copies once.
     pub fn feed(&mut self, chunk: &[u8]) -> bool {
-        self.tail.extend_from_slice(chunk);
-        if self.tail.is_empty() {
+        if chunk.is_empty() {
             return false;
         }
-
         match self.mode {
             Mode::Json => {
                 // The single non-streaming body is already consumed; drop any
@@ -366,30 +368,34 @@ impl UsageSnapshot {
                 self.tail.clear();
                 false
             }
-            Mode::Unknown | Mode::Sse => {
-                if self.mode == Mode::Unknown {
-                    if has_anchored_data(&self.tail) {
-                        self.mode = Mode::Sse;
-                    } else if let Ok(value) = serde_json::from_slice::<Value>(&self.tail) {
-                        if value.is_object() {
-                            self.mode = Mode::Json;
-                            let absorbed = self.finish_json(&value);
-                            self.tail.clear();
-                            return absorbed;
-                        }
-                        // Valid JSON but not an object: not a usage body.
-                        return false;
-                    } else {
-                        // Incomplete (fragmented) prefix: hold for reassembly.
-                        return false;
+            Mode::Unknown => {
+                // Mode classification needs the accumulated bytes, so this
+                // (transition) chunk is appended to the tail and processed
+                // there — a one-time full-chunk copy.
+                self.tail.extend_from_slice(chunk);
+                if has_anchored_data(&self.tail) {
+                    self.mode = Mode::Sse;
+                    let (consumed, found) = self.consume_sse();
+                    if consumed > 0 {
+                        self.discard_prefix(consumed);
                     }
+                    found
+                } else if let Ok(value) = serde_json::from_slice::<Value>(&self.tail) {
+                    if value.is_object() {
+                        self.mode = Mode::Json;
+                        let absorbed = self.finish_json(&value);
+                        self.tail.clear();
+                        absorbed
+                    } else {
+                        // Valid JSON but not an object: not a usage body.
+                        false
+                    }
+                } else {
+                    // Incomplete (fragmented) prefix: hold for reassembly.
+                    false
                 }
-                let (consumed, found) = self.consume_sse();
-                if consumed > 0 {
-                    self.discard_prefix(consumed);
-                }
-                found
             }
+            Mode::Sse => self.consume_sse_slice(chunk),
         }
     }
 
@@ -477,6 +483,67 @@ impl UsageSnapshot {
         }
         self.tail = buf;
         (pos, found)
+    }
+
+    /// Process the SSE `chunk` **in place** (B2): complete lines fully inside
+    /// the chunk are each judged from the chunk slice itself (no copy), and at
+    /// most ONE cross-buffer line — the pending partial tail + the chunk prefix
+    /// up to the first newline — is spliced into the persistent tail and judged
+    /// there. The `"usage"` prefilter runs on the **reassembled** cross-buffer
+    /// line, so a `"usage"` token split across chunk boundaries is still seen.
+    /// The incomplete trailing sliver of the chunk becomes the new tail.
+    /// Returns `true` when at least one usage object was absorbed.
+    fn consume_sse_slice(&mut self, chunk: &[u8]) -> bool {
+        let mut found = false;
+        let mut start = 0usize;
+
+        // If a partial (newline-less) tail line is pending, the first line of
+        // this chunk completes it — one bounded splice into the persistent tail.
+        if !self.tail.is_empty() {
+            match find_subseq(chunk, b"\n", 0) {
+                Some(nl) => {
+                    // Detach the partial tail so the joined line never aliases
+                    // the mutable borrow of `self`; the buffer allocation is
+                    // carried back (capacity reused for future splices).
+                    let mut joined = std::mem::take(&mut self.tail);
+                    joined.extend_from_slice(&chunk[..nl]);
+                    if self.process_sse_line(&joined) {
+                        found = true;
+                    }
+                    joined.clear();
+                    self.tail = joined;
+                    start = nl + 1;
+                }
+                None => {
+                    // The whole chunk continues the partial line.
+                    self.tail.extend_from_slice(chunk);
+                    return found;
+                }
+            }
+        }
+
+        // Judge complete newline-terminated lines fully inside the chunk, in
+        // place (the line slice borrows `chunk`, never `self` — no aliasing).
+        let mut pos = start;
+        while pos < chunk.len() {
+            let Some(nl) = find_subseq(chunk, b"\n", pos) else {
+                break;
+            };
+            let line = &chunk[pos..nl];
+            if self.process_sse_line(line) {
+                found = true;
+            }
+            pos = nl + 1;
+        }
+
+        // The incomplete trailing sliver becomes the new partial tail (a
+        // bounded copy, never the whole chunk).
+        if pos < chunk.len() {
+            self.tail.extend_from_slice(&chunk[pos..]);
+        } else {
+            self.tail.clear();
+        }
+        found
     }
 
     /// Drop the consumed prefix, keeping the incomplete trailing line in the
@@ -1117,5 +1184,26 @@ mod tests {
         // The nested usage is not top-level -> no completion, no tokens.
         assert!(!s.complete());
         assert_eq!(s.tokens(), (0, 0, 0));
+    }
+
+    #[test]
+    fn usage_token_split_across_chunk_boundary_is_absorbed() {
+        // B2: the `"usage"` prefilter must run on the REASSEMBLED line. Here the
+        // literal token is split by the chunk boundary (`"us` + `age"`), so a
+        // per-chunk-slice prefilter would miss it — only the cross-buffer line
+        // splice sees the contiguous token.
+        let full = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n";
+        // Split inside the `"usage"` token (after the `"us` prefix).
+        let split = find_subseq(full, b"\"usage\"", 0).expect("anchor") + 3;
+        let (a, b) = full.split_at(split);
+        assert!(a.ends_with(b"\"us"));
+        assert!(b.starts_with(b"age\""));
+
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        s.feed(a);
+        assert!(!s.complete(), "no newline yet -> nothing absorbed");
+        s.feed(b);
+        assert!(s.complete(), "reassembled line must be seen and absorbed");
+        assert_eq!(s.tokens(), (11, 4, 0));
     }
 }

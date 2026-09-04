@@ -1,0 +1,14 @@
+Running 15s test @ http://127.0.0.1:80/v1/chat/completions
+  2 threads and 2 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   296.68ms   18.67ms 394.24ms   84.00%
+    Req/Sec     3.07      0.50     5.00     90.00%
+  Latency Distribution
+     50%  295.18ms
+     75%  303.15ms
+     90%  316.49ms
+     99%  394.24ms
+  100 requests in 15.04s, 44.17KB read
+  Socket errors: connect 0, read 100, write 0, timeout 0
+Requests/sec:      6.65
+Transfer/sec:      2.94KB

@@ -1,0 +1,14 @@
+Running 30s test @ http://127.0.0.1:80/readyz
+  4 threads and 16 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    28.08ms   66.99ms 501.29ms   94.96%
+    Req/Sec   288.09     38.05   333.00     96.21%
+  Latency Distribution
+     50%   13.43ms
+     75%   13.84ms
+     90%   15.11ms
+     99%  417.19ms
+  32817 requests in 30.03s, 3.63MB read
+  Socket errors: connect 0, read 32817, write 0, timeout 0
+Requests/sec:   1092.92
+Transfer/sec:    123.82KB

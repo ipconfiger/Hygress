@@ -1,0 +1,13 @@
+[INFO] Saving docker run args to /run/gpustack/args
+[INFO] Starting gpustack prerun check.
+[INFO] Postgres root password read from /var/lib/gpustack/postgres_root_pass.
+  datname  | recorded_version | actual_version 
+-----------+------------------+----------------
+ postgres  | 2.39             | 2.39
+ gpustack  | 2.39             | 2.39
+ template1 | 2.39             | 2.39
+(3 rows)
+
+[INFO] Starting Postgres.
+[INFO] Checking Postgres readiness.
+[INFO] Postgres is ready.

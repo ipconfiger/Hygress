@@ -370,7 +370,7 @@ spec:
           - exact: x-gpustack-auth-cache
           - exact: X-GPUStack-Auth-Token
           headers_to_add:
-            X-GPUStack-Auth-Token: REDACTED_GATEWAY_TOKEN
+            X-GPUStack-Auth-Token: 0f894c45ec55426905099cba0af78d5e7e707bdea9418110c63e62ce550e21f4
         authorization_response:
           allowed_upstream_headers:
           - exact: X-Mse-Consumer
@@ -616,7 +616,7 @@ spec:
       service_name: gpustack.static
       service_port: 80
     header_add:
-      X-GPUStack-Auth-Token: REDACTED_GATEWAY_TOKEN
+      X-GPUStack-Auth-Token: 0f894c45ec55426905099cba0af78d5e7e707bdea9418110c63e62ce550e21f4
   defaultConfigDisable: false
 status: {}
 ---

@@ -1,0 +1,1 @@
+higress-image id=sha256:55ecc762950a32641b6a4d96195c0662ef72998eaeeda31bba0e8e218d41afef tag=[gpustack/gpustack:latest quay.io/gpustack/gpustack:latest]

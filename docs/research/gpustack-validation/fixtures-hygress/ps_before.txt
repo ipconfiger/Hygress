@@ -1,11 +1,11 @@
-root          60  0.0  0.0    220    80 ?        S    17:55   0:00 s6-supervise controller-logger
-root          61  0.0  0.0    220    80 ?        S    17:55   0:00 s6-supervise pilot
-root          63  0.0  0.0    220    80 ?        S    17:55   0:00 s6-supervise pilot-logger
-root          67  0.0  0.0    220    76 ?        S    17:55   0:00 s6-supervise supercronic
-root          68  0.0  0.0    220    80 ?        S    17:55   0:00 s6-supervise controller
-root          72  0.0  0.0    220    80 ?        S    17:55   0:00 s6-supervise supercronic-logger
-nobody       106  0.0  0.0    292   140 ?        Ss   17:55   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/supercronic
-nobody       111  0.0  0.0    276   128 ?        Ss   17:55   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/pilot
-nobody       119  0.0  0.0    276   128 ?        Ss   17:55   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/controller
-root         464  1.5  0.0 1445184 60028 ?       Ssl  17:56   4:42 /usr/local/bin/hygress
-root         474  0.0  0.0 1236384 11212 ?       Ssl  17:56   0:00 /usr/local/bin/supercronic /var/lib/istio/cron.txt
+root          60  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise controller-logger
+root          61  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise pilot
+root          63  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise pilot-logger
+root          67  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise supercronic
+root          68  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise controller
+root          72  0.0  0.0    220    80 ?        S    Sep04   0:00 s6-supervise supercronic-logger
+nobody       106  0.0  0.0    292   140 ?        Ss   Sep04   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/supercronic
+nobody       116  0.0  0.0    284   132 ?        Ss   Sep04   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/pilot
+nobody       122  0.0  0.0    284   128 ?        Ss   Sep04   0:00 s6-log -b -- n20 s1000000 T /var/lib/gpustack/log/controller
+root         453  1.6  0.0 1512384 34408 ?       Ssl  Sep04   1:57 /usr/local/bin/hygress
+root         458  0.0  0.0 1235232 10916 ?       Ssl  Sep04   0:00 /usr/local/bin/supercronic /var/lib/istio/cron.txt

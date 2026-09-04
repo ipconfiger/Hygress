@@ -1,20 +1,21 @@
-=== before count: 25 ; after count: 27 (delta=2) ===
+=== before count: 129 ; after count: 131 (delta=2) ===
 
 === model_usage_details (this model, newest 5) ===
- id | user_name | model_id |      model_name       | model_route_id |   model_route_name    | api_key_name |    access_key    | prompt_token_count | completion_token_count | prompt_cached_token_count | completed |       started_at        |      completed_at       
-----+-----------+----------+-----------------------+----------------+-----------------------+--------------+------------------+--------------------+------------------------+---------------------------+-----------+-------------------------+-------------------------
- 50 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 29 |                      7 |                         0 | t         | 2026-09-04 15:01:05.548 | 2026-09-04 15:01:05.73
- 49 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 50 |                     10 |                         0 | t         | 2026-09-04 15:01:04.952 | 2026-09-04 15:01:05.506
- 48 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 24 |                     14 |                         0 | t         | 2026-09-04 09:56:21.314 | 2026-09-04 09:56:21.864
- 47 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 29 |                      3 |                         0 | t         | 2026-09-04 09:55:04.855 | 2026-09-04 09:55:04.967
- 46 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 29 |                      3 |                         0 | t         | 2026-09-04 09:49:11.609 | 2026-09-04 09:49:11.763
+ id  | user_name | model_id |      model_name       | model_route_id |   model_route_name    | api_key_name |    access_key    | prompt_token_count | completion_token_count | prompt_cached_token_count | completed |       started_at        |      completed_at       
+-----+-----------+----------+-----------------------+----------------+-----------------------+--------------+------------------+--------------------+------------------------+---------------------------+-----------+-------------------------+-------------------------
+ 154 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 29 |                      7 |                         0 | t         | 2026-09-04 17:03:09.327 | 2026-09-04 17:03:09.499
+ 153 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 50 |                      9 |                         0 | t         | 2026-09-04 17:03:08.814 | 2026-09-04 17:03:09.294
+ 152 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 27 |                      0 |                         0 | f         | 2026-09-04 15:03:18.979 | 2026-09-04 15:03:19.291
+ 151 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 27 |                      0 |                         0 | f         | 2026-09-04 15:03:18.83  | 2026-09-04 15:03:19.148
+ 150 | admin     |        8 | qwen2.5-0.5b-instruct |              6 | qwen2.5-0.5b-instruct | baseline     | 905a9ac6a66554e2 |                 24 |                      9 |                         0 | t         | 2026-09-04 15:03:18.683 | 2026-09-04 15:03:18.978
 (5 rows)
 
 
 === model_usages (daily aggregate, this model, newest 3) ===
  id | user_name | model_id |      model_name       |    date    | prompt_token_count | completion_token_count | request_count | api_key_name | model_route_id |   model_route_name    
 ----+-----------+----------+-----------------------+------------+--------------------+------------------------+---------------+--------------+----------------+-----------------------
-  2 | admin     |        8 | qwen2.5-0.5b-instruct | 2026-09-04 |                652 |                   1464 |            24 | baseline     |              6 | qwen2.5-0.5b-instruct
+ 35 | admin     |        8 | qwen2.5-0.5b-instruct | 2026-09-05 |                 79 |                     16 |             2 | baseline     |              6 | qwen2.5-0.5b-instruct
+  2 | admin     |        8 | qwen2.5-0.5b-instruct | 2026-09-04 |               3106 |                   2371 |           126 | baseline     |              6 | qwen2.5-0.5b-instruct
   1 | admin     |        8 | qwen2.5-0.5b-instruct | 2026-09-03 |                119 |                     17 |             3 | baseline     |              6 | qwen2.5-0.5b-instruct
-(2 rows)
+(3 rows)
 

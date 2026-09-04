@@ -106,3 +106,30 @@
   镜像不同，直接量化修复收益。§2 的 Hygress vs envoy 对比为客户端受限口径；如需同 wrk 的 envoy 数据点，
   需再切回原生镜像复测（留作后续）。证据留档 `fixtures-hygress/bench_{before,after}_wrk_*.txt`、
   `bench_after_e2e_chat.txt`、`after_image.txt`（提交 `85c407c`）。
+
+## 7. 同硬件盒内对比（wrk：Hygress B1-B4 vs 原生 Higress/envoy，2026-09-05）
+
+跟进（补齐 §6 留作后续的"envoy 需同 wrk 复测"缺口）：在**同一台 GPUStack 测试主机**（`gpu-14c528e0-…`，
+Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**同一 wrk、同参数、同 `:80/readyz`
+端点**，只更换 `gpustack-server` 容器镜像做顺序 A/B（hygress → 原生 → hygress，一次会话内完成；模型
+实例与 worker 不动）。两端 `:80/readyz` 均实时 200，功能 e2e 均 PASS。
+
+| 侧 | 网关套件进程 | 镜像 | `/readyz` c16 (t4·30s) | c16 p50/p99 | `/readyz` c64 (t8·20s) | c64 p50/p99 |
+|---|---|---|---|---|---|---|
+| **Hygress (B1-B4)** | **1**（单二进制 ≈22MB RSS） | `12048b52ea14` | **1099.3 req/s** | 13.4 / 390 ms | **834.4 req/s** | 56.6 / 548 ms |
+| **原生 Higress/envoy** | **4**（envoy+pilot-agent+pilot-discovery+higress ≈2GB） | `55ecc762950a`（gpustack:latest） | 1065.8 req/s | 13.8 / 408 ms | 732.8 req/s | 58.2 / 540 ms |
+| 差值 | — | — | **+3.1%** | p50 −3.5% | **+13.9%** | p50 −2.7% |
+
+- **结论（同口径，直截了当）**：在正式盒内 wrk 微基准下，**Hygress 镜像路径吞吐 ≥ 原生 envoy，p50 略优**。
+  c64 的 +13.9% 可信；c16 的 +3.1%/p50 −3.5% 处于单次运行噪声区间，但方向一致。§2 的"441 vs 595"差距
+  确认为客户端受限测量噪声 + 已修复的每请求路由表重建。**资源差距仍然数量级**：数据面 4 进程 ≈2GB → 1 进程
+  ≈22MB（≈90×）。
+- **判据说明**：`Socket errors: read` 计数两侧均全量（镜像路径连接关闭计量特性，详见 §6）；native `:80`
+  对 `/readyz` 返回体更大（Transfer 259 vs 124 KB/s，运行期 read 7.6MB vs 3.65MB），req/s 为对比主口径。
+  p99 尾部两侧同量级（390-550ms，周期控制面轮询/指标竞争，§6 遗留观察，非一侧独有）。
+- **B1-B4 收益不体现在本表**：`/readyz` 为轻路径；B1-B4 削的是大 body 请求/SSE 流的拷贝 CPU（见
+  `zero-copy-plan.md` 与 `alloc_guard` 分配的预算断言），其影响在模型路径（GPU 受限）与高并发大 payload
+  场景，本表方法是镜像路径所以差距极小。
+- e2e chat（GPU 受限，非网关判据）：原生 0.60/0.18/0.18s；Hygress 侧功能 e2e 通过（usage 行落库）。
+- 证据：`fixtures-hygress/bench_{after2,higress}_wrk_c{16,64}.txt`、`after2_image.txt`、`higress_image.txt`、
+  `higress_ps.txt`（提交随本报告）。

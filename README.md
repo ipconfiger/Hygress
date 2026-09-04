@@ -183,6 +183,9 @@ gpustack-server:
 | `GATEWAY_PILOT_AGENT_METRICS_PORT` | 15020 | stats 浅兼容端口 |
 | `HYGRESS_API_READY_TIMEOUT` / `HYGRESS_SNAPSHOT_TIMEOUT` | 30s / 60s | 启动窗口（launcher 已放宽 300s） |
 | `HYGRESS_TOPOLOGY_B` | 关 | 外部网关拓扑时播种 IngressClass |
+| `HYGRESS_POLICY_PATH` | `/etc/hygress/policy.yaml` | 延伸能力配置文件路径（限流/配额/路由策略/护栏） |
+| `HYGRESS_QUOTA_K` | 4 | token 配额预留估算分母（`est = ceil(body_bytes / K)`） |
+| `HYGRESS_GUARDRAIL_URL` | 无 | LLM 护栏判定服务 URL（未设置 ⇒ LLM 护栏未配置 → 直通） |
 
 ### 4.4 验证（真机验证矩阵）
 
@@ -215,6 +218,65 @@ docker exec gpustack-server ps aux | grep -E 'hygress|envoy|pilot|controller'
 docker compose -f compose.yaml up -d gpustack-server
 # 2) 若需保留 Hygress 镜像并仅在容器内恢复原脚本：原始 scripts 已在 /etc/s6-overlay/s6-rc.d.dist/
 ```
+
+---
+
+---
+
+## 5. 延伸能力：token 配额 · 限流 · 路由策略 · 安全护栏
+
+> 本次升级新增的四类网关延伸能力（`docs/extensions-design.md`），**全部由 Hygress 自有配置文件驱动**
+> （`hygress.policy.yaml`），与 GPUStack 控制面**无新增契约**（CRD 只读不变）。配置经
+> **1s mtime 热重载**（亦可用 admin `POST /reload`，token 门禁）即点生效；缺文件/坏文件 → 默认放行 /
+> 保留上次有效（fail-safe）。
+
+### 5.1 能力清单
+
+| 能力 | 语义 | 落点与关键语义 |
+|---|---|---|
+| **限流**（P1） | RPS/突发，按 `IP`（早拒）与 `consumer`（认证后）维度；`none`/空键跳过 | `core::RatLimiter` 令牌桶；429 `rate_limit_error` + `Retry-After` |
+| **token 配额**（P2） | 按 `consumer × model` 固定窗口 token 预算（soft/hard） | `core::QuotaEngine` 两段式 `reserve → commit(est, actual)/release`（RAII 覆盖全部终端路径）；`hard` 超限 429 `quota_limit_error`；窗口态内存（v1） |
+| **路由策略**（P3） | 覆盖层：override 目标（运行时 miss 回退）、pin provider（service 名模式）、头增删、超时/重试覆盖 | 仅 Main 路由首跳；**只覆盖不重写** SWRR；metric `policy_applied` |
+| **安全护栏**（P4） | 提示注入/敏感词（静态规则）、LLM 判定（fail-closed）、输出侧 per-chunk 断流 | `guardrail_in` 403 `guardrail_blocked`；`guardrail_out` 跨块 tail(4096) 命中断流 + `completed=false` usage；未配置=直通 |
+
+> v1 边界（详见设计 §10.2）：响应侧 `mode: buffer` 未实现（per-chunk 为主）；路由级 `limits.ip` 覆盖不生效
+> （IP 早拒仅 global）；async LLM 护栏为旁路记录；公共路由共享 `''/none` 配额桶。
+
+### 5.2 配置示例（`/etc/hygress/policy.yaml`）
+
+```yaml
+version: 1
+global:
+  limits:
+    ip:        { rps: 20, burst: 40 }        # 令牌桶：rps(填充率)+burst(容量)，无 window
+  quota:
+    by_model_tokens: { window_secs: 86400, soft: null, hard: 1_000_000 }  # 固定窗口（秒）
+  guardrail:
+    fail_mode: closed                        # 已启用且 LLM 外呼失败时拒绝（fail-closed）
+    static_rules:
+      - { name: prompt-inject, regex: "(?i)ignore previous instruction", action: block }
+routes:
+  - name_glob: "ai-route-route-*"            # bare ingress 名 glob（最具体/后配置优先）
+    limits: { consumer: { rps: 5, burst: 10 } }
+    quota:  { by_model_tokens: { window_secs: 86400, hard: 50_000 } }
+    policy:
+      override_route: "model-8-6.static:80"  # 目标需存在于 McpBridge；否则运行时回退原路由+告警
+      header_add: [[x-canary, "true"]]
+      timeout_ms: 30000
+      retries: 2
+```
+
+> 键名与 `hygress-core::policy` serde 完全一致（`window_secs`/`timeout_ms`/`cache_ttl_secs`/`name_glob`/…
+> ），按上例书写即可被加载。
+
+### 5.3 真机验证（live GPUStack v2.2.3，升级版）
+
+| 场景 | 结果 |
+|---|---|
+| 限流（consumer rps=1/burst=1） | 200 → 200 → **429 `rate_limit_error`** + `Retry-After: 1` |
+| 配额（hard=60） | 200 → **429 429 `quota_limit_error`** |
+| 输入护栏（`FORBIDDEN_MARKER`） | 命中 **403 `guardrail_blocked`**；正常 200 |
+| 复位（移除政策） | `:80/readyz`=200、chat=200，实例稳定（R=0） |
 
 ---
 

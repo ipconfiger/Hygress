@@ -363,3 +363,34 @@ boot blocker (validate on the real remote env), run `scripts/run_all_hygress.sh`
 
 Fixes live: **368 tests green / clippy 0 / zero mock-stub**. Evidence:
 `fixtures-hygress/{hygress.log,dump.log,usage_rows.txt}` + `scripts/compose-hygress.yaml`.
+
+---
+
+## 14. 升级扩展能力：真机验证 + 最终健康确认（2026-09-04）
+
+> 升级版（token 配额 / 限流 / 路由策略 / 安全护栏，见 `docs/extensions-design.md` §10）在基线主机真机验证。
+> 测试实例运行于测试主机（live GPUStack v2.2.3）。
+
+**扩展能力 e2e**（`policy.yaml` 经 `docker cp` → `/etc/hygress/policy.yaml`，由 1s mtime 热重载生效，零重启）
+
+| 场景 | 政策 | 结果 |
+|---|---|---|
+| 限流(consumer) | 路由 `limits.consumer {rps:1, burst:1}` | 200 → 200 → **429 `rate_limit_error`** + `Retry-After: 1` |
+| 配额(hard) | `global.quota.by_model_tokens {window_secs:3600, hard:60}` | 200 → **429 429 `quota_limit_error`** |
+| 输入护栏 | `static_rules [{name:marker, regex:FORBIDDEN_MARKER, action:block}]` | 命中 **403 `guardrail_blocked`**；正常内容 200 |
+| 复位 | 移除 policy.yaml → 默认放行 | `:80/readyz=200`、chat=200 |
+
+> 部署漂移修复：升级期间真机镜像曾用旧 pack（缺 `/etc/hygress` 目录）导致 policy 不生效（全放行 200）；
+> 重传 pack/Dockerfile 重建镜像后恢复，远端部署与仓库 pack 一致。
+
+**最终健康确认（升级版实例）**
+- 稳定性：`R=0`（无重启循环）；worker/模型实例持续运行。
+- 健康端点：`:30080/healthz=200`、`:80/readyz`（经 hygress 镜像）=200。
+- 端口纪律：`0.0.0.0:80/15020` + `127.0.0.1:18443/30080/8081`；禁 5 端口（9876/15010/15012/8888/15051）零绑定。
+- 进程：仅 `hygress`+s6/supercronic，无 envoy/pilot/controller。
+- 数据面 e2e：真实 Qwen 推理 HTTP 200。
+- 用量（DoD 5）：`model_usage_details` 22 行（今日 +19），`model_name=qwen2.5-0.5b-instruct`，token 计数与响应一致；
+  含 1 行 `completed=false`（护栏断流/中止路径的 `completed=false` 上报——D-11 终端矩阵在线佐证）。
+- hygress 日志：无 panic/error（仅启动 INFO + IngressClass seed 405 非阻塞 WARN，embedded 正常）。
+
+> 注：先前按 `model_name` 过滤查询得 `(0 rows)` 系查询引号转义误差，非数据问题；全量查询确认用量正常落库。

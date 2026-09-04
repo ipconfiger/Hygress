@@ -1,0 +1,88 @@
+[package]
+name = "hygress-gateway"
+description = "Hygress data plane: Pingora terminate-mode proxy implementing the GPUStack plugin-equivalent pipeline (model-router/transformer/ext-auth/model-mapper/ai-proxy/fallback), routing over the adapter-built RouteTable, TLS SNI from Secrets, admin/metrics + 15020 shallow-compat, and the container main()."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# ---------------------------------------------------------------------------
+# Feature split (P5 reconciliation)
+# ---------------------------------------------------------------------------
+# `integrations` gates the egress/adapter-wired surfaces: the Pingora data-plane
+# proxy (`pipe`), the forward-auth / usage / provider callsites, the control-plane
+# `Controller` bootstrap loop, and the container server launch. It is OFF by
+# default so the **pure pipeline + its unit tests** build and run before the two
+# dependency crates (`hygress-egress` / `hygress-adapter`, implemented by parallel
+# lanes) land with their frozen public API. Enabling it (P5) compiles the full
+# gateway against the frozen contracts.
+[features]
+default = []
+integrations = ["dep:hygress-egress", "dep:hygress-adapter"]
+
+[dependencies]
+hygress-core = { path = "../hygress-core" }
+# Frozen contracts (their concrete `Controller` / `forward_auth::Client` /
+# `usage_sink::GpustackSink` / `provider::ProviderClient` symbols are implemented
+# by their own lanes and reconciled at P5). OPTIONAL + `integrations`-gated so the
+# default build compiles the PURE gateway (pipeline + admin/stats/tls/config)
+# WITHOUT pulling in the two parallel-lane dependency crates (which may still be
+# landing). Enabling `integrations` (P5) compiles the full egress/adapter-wired
+# gateway against the frozen contracts.
+hygress-egress = { path = "../hygress-egress", optional = true }
+hygress-adapter = { path = "../hygress-adapter", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+regex = { workspace = true }
+prometheus = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# D6/§7: the provider forward (`integrations`) builds the outbound upstream URL via the
+# frozen `hygress_egress::provider::ProviderClient::build_upstream_request`, which takes a
+# `url::Url` (the resolved origin). Must be the same `url 2.x` the egress crate + `reqwest`
+# 0.13 use so `upstream.url` (a `url::Url`) is accepted by `reqwest::Client::request`.
+url = "2"
+# Downstream TLS: SNI cert store fed from `Secret gpustack-tls-*` (design §4.4 /
+# §5.3). rustls is used for the cert/key PEM parse + a `ServerConfig` the data
+# plane attaches to its listener, AND — critically — for the control-plane
+# kube client + egress reqwest connections to `https://` (= apiserver :18443,
+# upstream providers). A rustls CryptoProvider must be installed at runtime:
+# without one, rustls panics ("Could not automatically determine the process-level
+# CryptoProvider"). We pin the `ring` provider + install it in `main()`.
+rustls = { workspace = true, features = ["ring"] }
+rustls-pemfile = { workspace = true }
+pingora = "0.8"
+pingora-proxy = "0.8"
+pingora-core = "0.8"
+pingora-http = "0.8"
+
+# The real e2e `integration` test (gated `integrations`) needs to build a
+# `ConfigData` / register routes and wire the frozen egress clients directly, so
+# `hygress-core` + `hygress-egress` are direct dev-deps (they are also
+# `[dependencies]`; `egress` is `optional` there, so this dev-edge is the
+# always-available one the test links against).
+[dev-dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+hygress-core = { path = "../hygress-core" }
+hygress-egress = { path = "../hygress-egress" }
+
+# The e2e test drives the real Pingora terminate-mode proxy (feature `integrations`)
+# against real local upstream/auth/usage servers. It is only built when that
+# feature is on (the `pipe` module + the egress/adapter contracts exist then).
+[[test]]
+name = "integration"
+required-features = ["integrations"]

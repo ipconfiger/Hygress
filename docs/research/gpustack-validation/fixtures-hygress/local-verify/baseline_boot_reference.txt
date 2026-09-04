@@ -1,0 +1,1 @@
+# BASELINE (pristine gpustack:latest) boot, same host/env: API up at 24s, gateway+pilot up(ready)

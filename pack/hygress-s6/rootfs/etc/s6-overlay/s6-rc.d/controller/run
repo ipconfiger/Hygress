@@ -1,0 +1,14 @@
+#!/command/with-contenv /bin/bash
+# no-op for the Higress Controller that is being replaced by Hygress (gateway slot).
+# Signals s6 readiness via notification-fd 3 (see pilot/run note — same requirement).
+echo "hygress: Higress 'controller' disabled (CRD consumption moved into hygress)." >&2
+
+if [ -e /etc/s6-overlay/scripts/base.sh ]; then
+  # shellcheck source=/dev/null
+  . /etc/s6-overlay/scripts/base.sh
+fi
+
+: >&3 2>/dev/null || true
+printf '\n' >&3 2>/dev/null || true
+
+exec sleep infinity

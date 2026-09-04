@@ -1,0 +1,11 @@
+# s6 service states (hygress-swapped server, local test) — BLOCKED boot
+gateway: down (not started yet) 
+supercronic: down (not started yet) 
+controller: up (pid 473 pgid 473) 250 seconds, normally down
+pilot: down (signal SIGTERM) 68 seconds, ready 68 seconds
+apiserver: up (pid 194 pgid 194) 253 seconds, ready 250 seconds
+postgres: up (pid 193 pgid 193) 253 seconds, ready 250 seconds
+
+# s6-rc transition in flight (blocked):
+root          74  0.0  0.0    228    96 ?        S    17:48   0:00 s6-rc -v1 -u -t 0 -- change top
+

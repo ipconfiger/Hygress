@@ -1,0 +1,34 @@
+[package]
+name = "hygress-egress"
+description = "Hygress out-of-band HTTP clients to GPUStack: ForwardAuthClient (GET /token-auth forward-auth with header pass-through/write-back), GpustackSink (POST /v2/usage/gateway-metrics with HMAC token), ProviderClient (upstream LLM request builder with key swap/path rewrite/Host)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hygress-core = { path = "../hygress-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+async-trait = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+futures = { workspace = true }
+# Integration tests (`tests/`) are separate crates: they need the same crates the unit tests
+# use. `tokio` (full) provides `#[tokio::test]`; the rest are used to construct/inspect the
+# wire (core `ModelUsageMetrics`, `http` headers, `reqwest` clients, JSON assertions).
+tokio = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+hygress-core = { path = "../hygress-core" }

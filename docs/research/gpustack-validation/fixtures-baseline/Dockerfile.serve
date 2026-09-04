@@ -1,0 +1,26 @@
+# Local, self-contained OpenAI-compatible GGUF server for GPUStack Custom-backend
+# validation. Built on top of the already-pulled GPUStack base (which provides
+# python3.11, pip/uv, cmake and a C++ toolchain) so NO large image layer has to be
+# pulled from an unreachable registry - only the small llama-cpp-python sdist is
+# fetched from PyPI/Aliyun-PyPI and compiled locally for CPU.
+FROM quay.io/gpustack/gpustack:latest
+
+# llama-cpp-python is sdist-only for Python 3.11 linux; build it for CPU.
+# GGML_NATIVE=off -> faster build, still correct for a 0.5B CPU model.
+ENV CMAKE_BUILD_TYPE=Release \
+    CMAKE_ARGS=-DGGML_NATIVE=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_NO_CACHE_DIR=1
+
+COPY serve.py /opt/serve.py
+
+# --index-url uses the Aliyun PyPI mirror (fast + reachable); pypi.org also works.
+RUN python3 -m pip install --no-cache-dir \
+        --index-url https://mirrors.aliyun.com/pypi/simple/ \
+        llama-cpp-python==0.3.35
+
+# GPUStack's Custom backend runs:  <ENTRYPOINT>  <rendered run_command args>
+# run_command = "-m {{model_path}} --port {{port}} --alias {{model_name}}"
+#   => python3 /opt/serve.py -m <host gguf path> --port <p> --alias <name>
+ENTRYPOINT ["python3", "/opt/serve.py"]

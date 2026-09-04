@@ -1,0 +1,4 @@
+[2m2026-09-03T09:22:08.063646Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:18081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T09:22:08.063664Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m30000
+[2m2026-09-03T09:22:38.155577Z[0m [31mERROR[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target not reachable within timeout [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m61 [3mtimeout[0m[2m=[0m30000
+hygress-gateway: startup failed: readiness: 127.0.0.1:30080 not reachable within 30s after 61 attempts (fail-fast)

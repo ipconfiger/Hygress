@@ -1,0 +1,43 @@
+# Custom GPUStack image with the embedded Higress data plane replaced by Hygress
+# (design §11.1 / pack/hygress-s6). Keeps the embedded kube-apiserver + supercronic;
+# the `gateway` s6 slot runs hygress. Builder-agnostic (no BuildKit-only directives).
+#
+# Build (test host with docker):
+#   docker build -f pack/Dockerfile.hygress -t gpustack:hygress \
+#     --build-arg GPUSTACK_TAG=latest --build-arg HYGRESS_BIN=target/release/hygress .
+#
+# Rollback: pristine Higress s6 run scripts preserved at
+# /etc/s6-overlay/s6-rc.d.dist/ (copied from the base BEFORE overwriting).
+
+ARG GPUSTACK_TAG=latest
+FROM gpustack/gpustack:${GPUSTACK_TAG}
+
+# Preserve the PRISTINE upstream gateway/pilot/controller run scripts for rollback
+# (must happen BEFORE the surgery COPYs overwrite them).
+RUN mkdir -p /etc/s6-overlay/s6-rc.d.dist/gateway \
+             /etc/s6-overlay/s6-rc.d.dist/pilot \
+             /etc/s6-overlay/s6-rc.d.dist/controller \
+ && cp -a /etc/s6-overlay/s6-rc.d/gateway/run    /etc/s6-overlay/s6-rc.d.dist/gateway/run \
+ && cp -a /etc/s6-overlay/s6-rc.d/pilot/run      /etc/s6-overlay/s6-rc.d.dist/pilot/run \
+ && cp -a /etc/s6-overlay/s6-rc.d/controller/run /etc/s6-overlay/s6-rc.d.dist/controller/run
+
+# Hygress static-ish binary (terminate-mode data plane + control-plane adapter)
+ARG HYGRESS_BIN=target/release/hygress
+COPY ${HYGRESS_BIN} /usr/local/bin/hygress
+
+# s6 surgery scripts: gateway=hygress launcher; pilot/controller long-sleep no-ops
+# that SIGNAL s6 readiness on notification-fd 3 (required so the s6-rc `change top`
+# transition settles and the main gpustack process starts); supercronic without the
+# `readinessCheck "Higress Pilot"` gate.
+COPY pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/gateway/run     /etc/s6-overlay/s6-rc.d/gateway/run
+COPY pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/pilot/run       /etc/s6-overlay/s6-rc.d/pilot/run
+COPY pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/controller/run  /etc/s6-overlay/s6-rc.d/controller/run
+COPY pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/supercronic/run /etc/s6-overlay/s6-rc.d/supercronic/run
+
+RUN chmod 0755 /usr/local/bin/hygress \
+ && chmod 0755 /etc/s6-overlay/s6-rc.d/gateway/run \
+              /etc/s6-overlay/s6-rc.d/pilot/run \
+              /etc/s6-overlay/s6-rc.d/controller/run \
+              /etc/s6-overlay/s6-rc.d/supercronic/run
+
+HEALTHCHECK NONE

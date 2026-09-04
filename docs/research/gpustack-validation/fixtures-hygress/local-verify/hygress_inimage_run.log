@@ -1,0 +1,4 @@
+2026-09-03T09:26:41.533677Z  INFO hygress_gateway::bootstrap: hygress-gateway bootstrap: state built (admin + stats listeners) http_port=80 tls_port=443 admin="127.0.0.1:8081" stats_port=15020
+2026-09-03T09:26:41.533691Z  INFO hygress_gateway::bootstrap: readiness: waiting for target addr="127.0.0.1:30080" timeout=30000
+hygress-gateway: startup failed: readiness: 127.0.0.1:30080 not reachable within 30s after 61 attempts (fail-fast)
+2026-09-03T09:27:11.623333Z ERROR hygress_gateway::bootstrap: readiness: target not reachable within timeout addr="127.0.0.1:30080" attempt=61 timeout=30000

@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+# no-op for the Higress Pilot that is being replaced by Hygress (gateway/run).
+# LONG-SLEEP, NOT exit 0: s6-supervise would restart-loop a fast-exiting longrun.
+echo "hygress: Higress 'pilot' disabled (replaced by hygress data plane)."
+exec sleep infinity

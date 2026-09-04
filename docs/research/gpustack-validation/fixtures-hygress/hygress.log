@@ -1,0 +1,76 @@
+[2m2026-09-03T10:42:20.193519Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T10:42:20.193596Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T10:42:35.238866Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m31
+[2m2026-09-03T10:42:35.238987Z[0m [31mERROR[0m [2mhygress_gateway::bootstrap[0m[2m:[0m fail-fast: jwt_secret_key unresolved: jwt_secret_key not found (set env GPUSTACK_JWT_SECRET_KEY or create jwt_secret_key/jwt_secret_key)
+hygress-gateway: startup failed: fail-fast: jwt_secret_key unresolved: jwt_secret_key not found (set env GPUSTACK_JWT_SECRET_KEY or create jwt_secret_key/jwt_secret_key)
+[2m2026-09-03T10:46:13.914011Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T10:46:13.914069Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T10:46:39.490725Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m52
+
+thread 'tokio-rt-worker' (489) panicked at /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.43/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+hygress-gateway: startup failed: control plane produced no first snapshot within 300s; refusing to bind the data plane (fail-fast)
+[2m2026-09-03T10:51:55.721246Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T10:51:55.721315Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T10:52:10.762797Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m31
+
+thread 'tokio-rt-worker' (507) panicked at /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.43/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[2m2026-09-03T10:52:25.640843Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T10:52:25.640901Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T10:52:40.177727Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m30
+[2m2026-09-03T10:52:40.212487Z[0m [33m WARN[0m [2mkube_client::client::tls::rustls_tls[0m[2m:[0m Server cert bypassed
+[2m2026-09-03T10:52:40.257312Z[0m [32m INFO[0m [2mhygress_adapter::reconcile[0m[2m:[0m api-resources discovery OK; apiserver ready [3mattempts[0m[2m=[0m0 [3mapi_groups[0m[2m=[0m9
+[2m2026-09-03T10:52:40.259577Z[0m [33m WARN[0m [2mhygress_adapter[0m[2m:[0m IngressClass seed (best-effort) failed: kube: ApiError: the server does not allow this method on the requested resource: MethodNotAllowed (Status { status: Some(Failure), code: 405, message: "the server does not allow this method on the requested resource", metadata: Some(ListMeta { continue_: None, remaining_item_count: None, resource_version: None, self_link: None }), reason: "MethodNotAllowed", details: Some(StatusDetails { name: "", group: "", kind: "", uid: "", causes: [], retry_after_seconds: 0 }) })
+[2m2026-09-03T10:52:40.299763Z[0m [32m INFO[0m [2mhygress_adapter[0m[2m:[0m first snapshot stored; signalling bind-ready
+[2m2026-09-03T10:52:40.299862Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m controller ready: first snapshot stored; binding data plane
+[2m2026-09-03T10:52:40.300059Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap starting
+[2m2026-09-03T10:52:40.300075Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap done
+[2m2026-09-03T10:52:40.320007Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway: all pre-conditions met; starting server (blocking until SIGTERM/SIGINT)
+[2m2026-09-03T10:52:40.320051Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Server starting
+[2m2026-09-03T10:52:40.320064Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting services in dependency order: ["Pingora HTTP Proxy Service", "hygress-stats", "hygress-admin"]
+[2m2026-09-03T10:52:40.320075Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: Pingora HTTP Proxy Service
+[2m2026-09-03T10:52:40.320260Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-stats
+[2m2026-09-03T10:52:40.320416Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-admin
+[2m2026-09-03T11:05:30.286976Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T11:05:30.287033Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T11:05:45.831136Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m32
+[2m2026-09-03T11:05:45.883759Z[0m [33m WARN[0m [2mkube_client::client::tls::rustls_tls[0m[2m:[0m Server cert bypassed
+[2m2026-09-03T11:05:45.926368Z[0m [32m INFO[0m [2mhygress_adapter::reconcile[0m[2m:[0m api-resources discovery OK; apiserver ready [3mattempts[0m[2m=[0m0 [3mapi_groups[0m[2m=[0m9
+[2m2026-09-03T11:05:45.927991Z[0m [33m WARN[0m [2mhygress_adapter[0m[2m:[0m IngressClass seed (best-effort) failed: kube: ApiError: the server does not allow this method on the requested resource: MethodNotAllowed (Status { status: Some(Failure), code: 405, message: "the server does not allow this method on the requested resource", metadata: Some(ListMeta { continue_: None, remaining_item_count: None, resource_version: None, self_link: None }), reason: "MethodNotAllowed", details: Some(StatusDetails { name: "", group: "", kind: "", uid: "", causes: [], retry_after_seconds: 0 }) })
+[2m2026-09-03T11:05:45.969274Z[0m [32m INFO[0m [2mhygress_adapter[0m[2m:[0m first snapshot stored; signalling bind-ready
+[2m2026-09-03T11:05:45.969420Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m controller ready: first snapshot stored; binding data plane
+[2m2026-09-03T11:05:45.969634Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap starting
+[2m2026-09-03T11:05:45.969646Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap done
+[2m2026-09-03T11:05:45.989752Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway: all pre-conditions met; starting server (blocking until SIGTERM/SIGINT)
+[2m2026-09-03T11:05:45.989789Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Server starting
+[2m2026-09-03T11:05:45.989803Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting services in dependency order: ["Pingora HTTP Proxy Service", "hygress-stats", "hygress-admin"]
+[2m2026-09-03T11:05:45.989815Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: Pingora HTTP Proxy Service
+[2m2026-09-03T11:05:45.990017Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-stats
+[2m2026-09-03T11:05:45.990235Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-admin
+[2m2026-09-03T11:15:37.604297Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway bootstrap: state built (admin + stats listeners) [3mhttp_port[0m[2m=[0m80 [3mtls_port[0m[2m=[0m443 [3madmin[0m[2m=[0m"127.0.0.1:8081" [3mstats_port[0m[2m=[0m15020
+[2m2026-09-03T11:15:37.604424Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: waiting for target [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mtimeout[0m[2m=[0m300000
+[2m2026-09-03T11:15:52.651672Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m readiness: target reachable [3maddr[0m[2m=[0m"127.0.0.1:30080" [3mattempt[0m[2m=[0m31
+[2m2026-09-03T11:15:52.713594Z[0m [33m WARN[0m [2mkube_client::client::tls::rustls_tls[0m[2m:[0m Server cert bypassed
+[2m2026-09-03T11:15:52.756455Z[0m [32m INFO[0m [2mhygress_adapter::reconcile[0m[2m:[0m api-resources discovery OK; apiserver ready [3mattempts[0m[2m=[0m0 [3mapi_groups[0m[2m=[0m9
+[2m2026-09-03T11:15:52.759357Z[0m [33m WARN[0m [2mhygress_adapter[0m[2m:[0m IngressClass seed (best-effort) failed: kube: ApiError: the server does not allow this method on the requested resource: MethodNotAllowed (Status { status: Some(Failure), code: 405, message: "the server does not allow this method on the requested resource", metadata: Some(ListMeta { continue_: None, remaining_item_count: None, resource_version: None, self_link: None }), reason: "MethodNotAllowed", details: Some(StatusDetails { name: "", group: "", kind: "", uid: "", causes: [], retry_after_seconds: 0 }) })
+[2m2026-09-03T11:15:52.807811Z[0m [32m INFO[0m [2mhygress_adapter[0m[2m:[0m first snapshot stored; signalling bind-ready
+[2m2026-09-03T11:15:52.807880Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m controller ready: first snapshot stored; binding data plane
+[2m2026-09-03T11:15:52.808038Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap starting
+[2m2026-09-03T11:15:52.808085Z[0m [32m INFO[0m [2mpingora_core::server::bootstrap_services[0m[2m:[0m Bootstrap done
+[2m2026-09-03T11:15:52.828879Z[0m [32m INFO[0m [2mhygress_gateway::bootstrap[0m[2m:[0m hygress-gateway: all pre-conditions met; starting server (blocking until SIGTERM/SIGINT)
+[2m2026-09-03T11:15:52.828926Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Server starting
+[2m2026-09-03T11:15:52.828953Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting services in dependency order: ["Pingora HTTP Proxy Service", "hygress-stats", "hygress-admin"]
+[2m2026-09-03T11:15:52.828969Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: Pingora HTTP Proxy Service
+[2m2026-09-03T11:15:52.829232Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-stats
+[2m2026-09-03T11:15:52.829437Z[0m [32m INFO[0m [2mpingora_core::server[0m[2m:[0m Starting service: hygress-admin

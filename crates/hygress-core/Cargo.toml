@@ -1,0 +1,15 @@
+[package]
+name = "hygress-core"
+description = "Hygress pure domain logic: GPUStack/Higress route rules, matchers, registries, destination parsing, model mapping, SWRR, retry policies, transformer rules, usage metric types, config validation. Zero I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }

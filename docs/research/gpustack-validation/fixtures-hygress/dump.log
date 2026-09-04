@@ -1,0 +1,889 @@
+apiserver: https://127.0.0.1:18443
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: higress-ca-root-cert
+  namespace: higress-system
+  resourceVersion: '3'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    istio.io/config: 'true'
+  managedFields:
+  - manager: pilot-discovery
+    operation: Update
+    apiVersion: v1
+    time: '2026-09-03T07:50:34Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:data:
+        .: {}
+        f:root-cert.pem: {}
+      f:metadata:
+        f:labels:
+          .: {}
+          f:istio.io/config: {}
+data:
+  root-cert.pem: '-----BEGIN CERTIFICATE-----
+
+    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
+
+    -----END CERTIFICATE-----
+
+    '
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: higress-config
+  namespace: higress-system
+  resourceVersion: '2'
+  creationTimestamp: '2000-01-01T00:00:00Z'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: v1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:data:
+        f:higress: {}
+data:
+  higress: "downstream:\n  connectionBufferLimits: 32768\n  http2:\n    initialConnectionWindowSize: 1048576\n    initialStreamWindowSize: 65535\n    maxConcurrentStreams: 100\n  idleTimeout: 1800\n  maxRequestHeadersKb: 60\n  routeTimeout: 0\nmcpServer:\n  enable: false\n  match_list: []\n  redis:\n    address: redis-address:6379\n    db: 0\n    password: ''\n    username: ''\n  servers: []\n  sse_path_suffix: /sse\nupstream:\n  connectionBufferLimits: 10485760\n  idleTimeout: 3\n"
+  mesh: "accessLogEncoding: TEXT\naccessLogFile: /dev/stdout\naccessLogFormat: |\n  {\"ai_log\":\"%FILTER_STATE(wasm.ai_log:PLAIN)%\",\"authority\":\"%REQ(X-ENVOY-ORIGINAL-HOST?:AUTHORITY)%\",\"bytes_received\":\"%BYTES_RECEIVED%\",\"bytes_sent\":\"%BYTES_SENT%\",\"downstream_local_address\":\"%DOWNSTREAM_LOCAL_ADDRESS%\",\"downstream_remote_address\":\"%DOWNSTREAM_REMOTE_ADDRESS%\",\"duration\":\"%DURATION%\",\"istio_policy_status\":\"%DYNAMIC_METADATA(istio.mixer:status)%\",\"method\":\"%REQ(:METHOD)%\",\"path\":\"%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%\",\"protocol\":\"%PROTOCOL%\",\"request_id\":\"%REQ(X-REQUEST-ID)%\",\"requested_server_name\":\"%REQUESTED_SERVER_NAME%\",\"response_code\":\"%RESPONSE_CODE%\",\"response_flags\":\"%RESPONSE_FLAGS%\",\"route_name\":\"%ROUTE_NAME%\",\"start_time\":\"%START_TIME%\",\"trace_id\":\"%REQ(X-B3-TRACEID)%\",\"upstream_cluster\":\"%UPSTREAM_CLUSTER%\",\"upstream_host\":\"%UPSTREAM_HOST%\",\"upstream_local_address\":\"%UPSTREAM_LOCAL_ADDRESS%\",\"upstream_service_time\":\"%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%\",\"upstream_transport_failure_reason\":\"%UPSTREAM_TRANSPORT_FAILURE_REASON%\",\"user_agent\":\"%REQ(USER-AGENT)%\",\"x_forwarded_for\":\"%REQ(X-FORWARDED-FOR)%\",\"response_code_details\":\"%RESPONSE_CODE_DETAILS%\"}\nconfigSources:\n- address: xds://127.0.0.1:15051\n- address: k8s://\ndefaultConfig:\n  disableAlpnH2: false\n  discoveryAddress: 127.0.0.1:15012\n  controlPlaneAuthPolicy: MUTUAL_TLS\n  proxyStatsMatcher:\n    inclusionRegexps:\n    - .*\ndnsRefreshRate: 200s\nenableAutoMtls: false\nenablePrometheusMerge: true\ningressControllerMode: \"OFF\"\nmseIngressGlobalConfig:\n  enableH3: false\n  enableProxyProtocol: false\nprotocolDetectionTimeout: 100ms\nrootNamespace: higress-system\ntrustDomain: cluster.local"
+  meshNetworks: 'networks: {}'
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: higress-https
+  namespace: higress-system
+  resourceVersion: '1'
+  creationTimestamp: '2026-09-03T06:35:46Z'
+  managedFields:
+  - manager: higress
+    operation: Update
+    apiVersion: v1
+    time: '2026-09-03T06:35:46Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:data:
+        .: {}
+        f:cert: {}
+data:
+  cert: "acmeIssuer:\n- ak: \"\"\n  email: your26155@yours7893.com\n  name: letsencrypt\n  sk: \"\"\nautomaticHttps: true\ncredentialConfig: []\nfallbackForInvalidSecret: false\nrenewBeforeDays: 30\nversion: \"20260903023546\"\n"
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: higress-gateway
+  namespace: higress-system
+  resourceVersion: '1'
+  creationTimestamp: '2000-01-01T00:00:00Z'
+  labels:
+    higress: higress-system-higress-gateway
+spec:
+  ports:
+  - name: http2
+    protocol: TCP
+    port: 80
+    targetPort: 80
+  - name: https
+    protocol: TCP
+    port: 443
+    targetPort: 443
+  selector:
+    higress: higress-system-higress-gateway
+  type: LoadBalancer
+status:
+  loadBalancer: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-ai-proxy
+  namespace: higress-system
+  resourceVersion: '70'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T08:07:43Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:providers: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:matchRules: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/gpustack-ai-proxy/2.0.0-patched/plugin.wasm
+  priority: 100
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    providers:
+    - failover:
+        enabled: false
+      id: ai-route-route-6
+      retryOnFailure:
+        enabled: false
+      type: openai
+  matchRules:
+  - ingress:
+    - ai-route-route-6.internal
+    config:
+      activeProviderId: ai-route-route-6
+    configDisable: false
+    service:
+    - model-8-6.static
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-ai-statistics
+  namespace: higress-system
+  resourceVersion: '52'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:attributes: {}
+          f:enable_content_types: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/ai-statistics/2.0.0/plugin.wasm
+  priority: 900
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    attributes:
+    - apply_to_log: true
+      apply_to_span: false
+      key: consumer
+      value: x-mse-consumer
+      value_source: request_header
+    enable_content_types:
+    - application/json
+    - text/event-stream
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-header-transformer
+  namespace: higress-system
+  resourceVersion: '52'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:reqRules: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:phase: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/transformer/2.0.0/plugin.wasm
+  phase: AUTHN
+  priority: 810
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    reqRules:
+    - headers:
+      - key: X-GPUStack-Auth-Token
+      - key: X-GPUStack-Model-Instance
+      operate: remove
+    - headers:
+      - newKey: x-higress-llm-model
+        oldKey: x-gpustack-model
+      - newKey: :path
+        oldKey: x-gpustack-fallback-path
+      operate: rename
+    - headers:
+      - key: x-gpustack-model
+        strategy: RETAIN_FIRST
+      - key: x-higress-llm-model
+        strategy: RETAIN_FIRST
+      - key: :path
+        strategy: RETAIN_LAST
+      operate: dedupe
+    - headers:
+      - fromKey: :path
+        toKey: x-gpustack-original-path
+      operate: map
+    - headers:
+      - key: x-gpustack-fallback-path
+      operate: remove
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-llm-ext-auth
+  namespace: higress-system
+  resourceVersion: '1'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:_rules_: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:phase: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/ext-auth/2.0.0/plugin.wasm
+  phase: AUTHN
+  priority: 360
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    _rules_:
+    - _match_route_prefix_:
+      - ai-route-route-
+      http_service:
+        authorization_request:
+          allowed_headers:
+          - exact: X-Real-IP
+          - exact: X-Forwarded-For
+          - exact: x-higress-llm-model
+          - exact: x-api-key
+          - exact: cookie
+          - exact: x-gpustack-auth-cache
+          - exact: X-GPUStack-Auth-Token
+          headers_to_add:
+            X-GPUStack-Auth-Token: REDACTED_GATEWAY_TOKEN
+        authorization_response:
+          allowed_upstream_headers:
+          - exact: X-Mse-Consumer
+          - exact: Authorization
+          - exact: cookie
+          - exact: x-gpustack-auth-cache
+        endpoint:
+          path: /token-auth
+          request_method: GET
+          service_name: gpustack.static
+          service_port: 80
+        endpoint_mode: forward_auth
+        timeout: 30000
+      match_list:
+      - match_rule_path: /
+        match_rule_type: prefix
+      match_type: blacklist
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-model-mapper
+  namespace: higress-system
+  resourceVersion: '90'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:modelMapping: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:phase: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/gpustack-model-mapper/1.0.1/plugin.wasm
+  phase: AUTHN
+  priority: 800
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    modelMapping: {}
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-model-router
+  namespace: higress-system
+  resourceVersion: '52'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:aliasNameMapping: {}
+          f:enableOnPathSuffix: {}
+          f:prefix: {}
+          f:targetHeader: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:phase: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/gpustack-generic-proxy-router/1.0.1/plugin.wasm
+  phase: AUTHN
+  priority: 900
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    aliasNameMapping: {}
+    enableOnPathSuffix:
+    - /v1/chat/completions
+    - /v1/completions
+    - /v1/responses
+    - /v1/embeddings
+    - /v1/audio/transcriptions
+    - /v1/audio/speech
+    - /v1/images/generations
+    - /v1/images/edits
+    - /v1-openai/chat/completions
+    - /v1-openai/completions
+    - /v1-openai/responses
+    - /v1-openai/embeddings
+    - /v1-openai/audio/transcriptions
+    - /v1-openai/audio/speech
+    - /v1-openai/images/generations
+    - /v1-openai/images/edits
+    - /v1/audio/translations
+    - /v1/images/variations
+    - /v1/moderations
+    - /v1/score
+    - /v1/rerank
+    - /v2/rerank
+    - /v1/messages
+    - /v1/messages/count_tokens
+    - /v1/complete
+    prefix: /model/proxy/
+    targetHeader: x-higress-llm-model
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-set-model-pre-route
+  namespace: higress-system
+  resourceVersion: '52'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:clusterNameHeader: {}
+          f:enableOnPathPrefix: {}
+          f:enableOnPathSuffix: {}
+          f:routeNameHeader: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:phase: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/gpustack-set-header-pre-route/1.0.1/plugin.wasm
+  phase: AUTHN
+  priority: 90
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    clusterNameHeader: X-GPUStack-Model-Instance
+    enableOnPathPrefix:
+    - /model/proxy
+    enableOnPathSuffix:
+    - /v1/chat/completions
+    - /v1/completions
+    - /v1/responses
+    - /v1/embeddings
+    - /v1/audio/transcriptions
+    - /v1/audio/speech
+    - /v1/images/generations
+    - /v1/images/edits
+    - /v1-openai/chat/completions
+    - /v1-openai/completions
+    - /v1-openai/responses
+    - /v1-openai/embeddings
+    - /v1-openai/audio/transcriptions
+    - /v1-openai/audio/speech
+    - /v1-openai/images/generations
+    - /v1-openai/images/edits
+    - /v1/audio/translations
+    - /v1/images/variations
+    - /v1/moderations
+    - /v1/score
+    - /v1/rerank
+    - /v2/rerank
+    - /v1/messages
+    - /v1/messages/count_tokens
+    - /v1/complete
+    routeNameHeader: X-GPUStack-Route-Name
+  defaultConfigDisable: false
+status: {}
+---
+kind: WasmPlugin
+apiVersion: extensions.higress.io/v1alpha1
+metadata:
+  name: gpustack-token-usage
+  namespace: higress-system
+  resourceVersion: '52'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: extensions.higress.io/v1alpha1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:defaultConfig:
+          .: {}
+          f:endpoint:
+            .: {}
+            f:path: {}
+            f:service_name: {}
+            f:service_port: {}
+          f:header_add:
+            .: {}
+            f:X-GPUStack-Auth-Token: {}
+        f:defaultConfigDisable: {}
+        f:failStrategy: {}
+        f:priority: {}
+        f:url: {}
+spec:
+  url: http://127.0.0.1:30080/wasm-plugins/gpustack-token-usage/1.1.1/plugin.wasm
+  priority: 400
+  failStrategy: FAIL_OPEN
+  defaultConfig:
+    endpoint:
+      path: /v2/usage/gateway-metrics
+      service_name: gpustack.static
+      service_port: 80
+    header_add:
+      X-GPUStack-Auth-Token: REDACTED_GATEWAY_TOKEN
+  defaultConfigDisable: false
+status: {}
+---
+kind: McpBridge
+apiVersion: networking.higress.io/v1
+metadata:
+  name: default
+  namespace: higress-system
+  resourceVersion: '4'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: networking.higress.io/v1
+    time: '2026-09-03T08:07:43Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:spec:
+        f:registries: {}
+spec:
+  registries:
+  - type: static
+    name: gpustack
+    domain: 127.0.0.1:30080
+    port: 80
+    protocol: http
+  - type: static
+    name: model-8-6
+    domain: 172.16.46.23:10150
+    port: 80
+    protocol: http
+status: {}
+---
+kind: EnvoyFilter
+apiVersion: networking.istio.io/v1alpha3
+metadata:
+  name: higress-gateway-global-custom-response
+  namespace: higress-system
+  resourceVersion: '1'
+  creationTimestamp: '2000-01-01T00:00:00Z'
+  labels:
+    app: higress-gateway
+    higress: higress-system-higress-gateway
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+    patch:
+      operation: INSERT_FIRST
+      value:
+        name: envoy.filters.http.custom_response
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.filters.http.custom_response.v3.CustomResponse
+status: {}
+---
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: ai-route-route-6.internal
+  namespace: higress-system
+  resourceVersion: '2'
+  creationTimestamp: '2026-09-03T08:07:15Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  annotations:
+    higress.io/destination: 100% model-8-6.static:80
+    higress.io/exact-match-header-x-higress-llm-model: qwen2.5-0.5b-instruct
+    higress.io/ignore-path-case: 'true'
+    higress.io/proxy-next-upstream: error,timeout,http_503,http_502,non_idempotent
+    higress.io/proxy-next-upstream-tries: '2'
+    higress.io/rewrite-target: /$1$3
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: networking.k8s.io/v1
+    time: '2026-09-03T08:07:43Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:annotations:
+          .: {}
+          f:higress.io/destination: {}
+          f:higress.io/exact-match-header-x-higress-llm-model: {}
+          f:higress.io/ignore-path-case: {}
+          f:higress.io/proxy-next-upstream: {}
+          f:higress.io/proxy-next-upstream-tries: {}
+          f:higress.io/rewrite-target: {}
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:ingressClassName: {}
+        f:rules: {}
+spec:
+  ingressClassName: higress
+  rules:
+  - http:
+      paths:
+      - path: /(v1)(-openai)?(/chat/completions)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/completions)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/responses)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/embeddings)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/audio/transcriptions)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/audio/speech)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/images/generations)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)(-openai)?(/images/edits)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/audio/translations)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/images/variations)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/moderations)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/score)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/rerank)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v2)()(/rerank)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/messages)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/messages/count_tokens)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+      - path: /(v1)()(/complete)
+        pathType: ImplementationSpecific
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+status:
+  loadBalancer: {}
+---
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: gpustack
+  namespace: higress-system
+  resourceVersion: '1'
+  creationTimestamp: '2026-09-03T06:36:02Z'
+  labels:
+    gpustack.ai/managed: 'true'
+  annotations:
+    higress.io/destination: gpustack.static:80
+    higress.io/ignore-path-case: 'false'
+  managedFields:
+  - manager: OpenAPI-Generator
+    operation: Update
+    apiVersion: networking.k8s.io/v1
+    time: '2026-09-03T06:36:02Z'
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:annotations:
+          .: {}
+          f:higress.io/destination: {}
+          f:higress.io/ignore-path-case: {}
+        f:labels:
+          .: {}
+          f:gpustack.ai/managed: {}
+      f:spec:
+        f:ingressClassName: {}
+        f:rules: {}
+spec:
+  ingressClassName: higress
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+status:
+  loadBalancer: {}
+total unique objects: 16

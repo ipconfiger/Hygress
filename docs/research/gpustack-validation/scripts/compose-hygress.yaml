@@ -1,0 +1,72 @@
+# Hygress-swap deployment (A/B "hygress" side).
+#
+# IDENTICAL to the baseline compose.yaml EXCEPT the gpustack-server image is
+# `gpustack:hygress` (built from pack/Dockerfile.hygress): the embedded Higress
+# data plane (envoy/pilot/controller) is replaced by the single Hygress binary.
+#
+# KEPT UNTOUCHED (per A/B contract):
+#   - gpustack-worker: same image, same env, same GPU reservation. NOT restarted.
+#   - server data volume /root/gpustack-validation/server-data -> /var/lib/gpustack
+#     (holds the embedded Postgres DB + embedded kube-apiserver + embedded
+#      gateway state + the 16 baseline CRDs). hygress reads the SAME CRDs via the
+#      same kubeconfig, so the CRD diff vs baseline must be identical (DoD 2).
+#
+# Swap (on the baseline remote, from /root/gpustack-validation):
+#   docker rm -f gpustack-server
+#   docker compose -f compose-hygress.yaml up -d gpustack-server   # server ONLY
+#   (the worker was started by the baseline `up` and is left running)
+name: gpustack-validation
+
+services:
+  gpustack-server:
+    image: gpustack:hygress
+    container_name: gpustack-server
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      GPUSTACK_BOOTSTRAP_PASSWORD: ${GPUSTACK_BOOTSTRAP_PASSWORD}
+      GPUSTACK_TOKEN: ${GPUSTACK_TOKEN}
+      GPUSTACK_LOG_LEVEL: info
+      HF_ENDPOINT: https://hf-mirror.com
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+    volumes:
+      - /root/gpustack-validation/server-data:/var/lib/gpustack
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - --disable-worker
+
+  gpustack-worker:
+    image: quay.io/gpustack/gpustack:latest
+    container_name: gpustack-worker
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    depends_on:
+      - gpustack-server
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      HF_ENDPOINT: https://hf-mirror.com
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+      GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT: "false"
+    volumes:
+      - /var/lib/gpustack:/var/lib/gpustack
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - --server-url=http://127.0.0.1:30080
+      - --token=${GPUSTACK_TOKEN}
+      - --worker-name=worker1

@@ -1,0 +1,43 @@
+#!/command/with-contenv /bin/bash
+# Hygress replaces the Higress gateway data plane (envoy via pilot-agent).
+#
+# IMPORTANT: keep the SAME startup contract as the pristine gateway/run — source
+# base.sh (defines readinessCheck/createDir/handleServiceExit) + the GPUStack
+# gateway config + default-variables.sh, then `readinessCheck` the GPUStack API,
+# then exec the data plane. s6-rc's "change top" ordering depends on the pristine
+# scripts' sourcing pattern; skipping base.sh / default-variables.sh leaves the
+# default s6 set unable to settle -> the GPUStack API (the "top" process) never
+# starts. Only the FINAL data-plane process differs: hygress (a single terminate-mode
+# binary) instead of `pilot-agent proxy router` (which would spawn istio envoy).
+# The `readinessCheck "... API server"` gate is kept (hygress still needs the API up
+# before it can serve).
+SCRIPT_ROOT=/etc/s6-overlay/scripts
+source "$SCRIPT_ROOT/base.sh"
+source "$GPUSTACK_GATEWAY_CONFIG"
+source "$SCRIPT_ROOT/default-variables.sh"
+
+export HYGRESS_KUBECONFIG="${HYGRESS_KUBECONFIG:-${EMBEDDED_KUBECONFIG_PATH:-/var/lib/gpustack/higress/kubeconfig}}"
+export GATEWAY_HTTP_PORT="${GATEWAY_HTTP_PORT:-80}"
+export GATEWAY_HTTPS_PORT="${GATEWAY_HTTPS_PORT:-443}"
+export GPUSTACK_API_PORT="${GPUSTACK_API_PORT:-80}"
+export HYGRESS_DATA_DIR="${HYGRESS_DATA_DIR:-/var/lib/gpustack}"
+export GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-higress-system}"
+export HYGRESS_ADMIN_ADDR="${HYGRESS_ADMIN_ADDR:-127.0.0.1:8081}"
+export GATEWAY_PILOT_AGENT_METRICS_PORT="${GATEWAY_PILOT_AGENT_METRICS_PORT:-15020}"
+export HIGRESS_LOG_DIR="${HIGRESS_LOG_DIR:-/var/log/higress}"
+export INSTANCE_NAME="higress-gateway"
+export POD_NAME="higress-gateway"
+export POD_NAMESPACE="higress-system"
+
+set -e
+exec 2>&1
+
+createDir "${HIGRESS_LOG_DIR}"
+ACCESS_LOG_PATH="${HIGRESS_LOG_DIR}/access.log"
+touch "${ACCESS_LOG_PATH}"
+
+# Same readiness gate as pristine: wait for the GPUStack API before the data plane serves.
+readinessCheck "GPUStack API server" "$GPUSTACK_API_PORT"
+
+cd /
+exec /usr/local/bin/hygress >>"${ACCESS_LOG_PATH}" 2>&1

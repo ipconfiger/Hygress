@@ -1,0 +1,17 @@
+#!/command/with-contenv /bin/bash
+# supercronic — EDITED for the Hygress replacement.
+# Mirrors the pristine script except the `readinessCheck "Higress Pilot" 15010`
+# line is REMOVED (the Higress pilot no longer exists), so the cron jobs GPUStack
+# injects (incl. postgres log cleanup) keep running.
+SCRIPT_ROOT=/etc/s6-overlay/scripts
+# shellcheck source=/dev/null
+source "$SCRIPT_ROOT/base.sh"
+# shellcheck disable=SC1090
+source "$GPUSTACK_GATEWAY_CONFIG"
+# shellcheck source=/dev/null
+source "$SCRIPT_ROOT/default-variables.sh"
+
+set -e
+exec 2>&1
+
+exec /usr/local/bin/supercronic /var/lib/istio/cron.txt

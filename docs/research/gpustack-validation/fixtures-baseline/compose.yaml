@@ -1,0 +1,91 @@
+# Baseline (unmodified) GPUStack v2 deployment for Hygress-replacement comparison.
+#
+# Single node: GPUStack server (embedded Higress gateway on :80, API on :30080)
+# + one standalone GPU worker on the RTX 4090.
+#
+# Image: quay.io/gpustack/gpustack:latest (GPUStack v2.2.3, commit 1cfcbbf).
+#   docker.io is unreachable from this host; quay.io is the official mirror.
+#
+# Both services use host networking + privileged (the canonical GPUStack docker
+# deployment) and mount /var/run/docker.sock so the worker can spawn
+# model-instance backend containers through the host docker daemon.
+#
+# Volumes:
+#   - worker uses an IDENTITY bind mount (/var/lib/gpustack -> /var/lib/gpustack)
+#     so the model file the worker downloads lives at a host path that the host
+#     docker daemon can bind-mount into the backend container (matches the
+#     official deployment).
+#   - server uses a separate host dir for its own data (DB + embedded gateway
+#     state) to avoid colliding with the worker's /var/lib/gpustack.
+name: gpustack-validation
+
+services:
+  gpustack-server:
+    image: quay.io/gpustack/gpustack:latest
+    container_name: gpustack-server
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      GPUSTACK_BOOTSTRAP_PASSWORD: ${GPUSTACK_BOOTSTRAP_PASSWORD}
+      GPUSTACK_TOKEN: ${GPUSTACK_TOKEN}
+      GPUSTACK_LOG_LEVEL: info
+      # huggingface.co is unreachable from this host; the scheduler fetches the
+      # GGUF (list_repo / resource-fit) here, so it must use the HF mirror too.
+      HF_ENDPOINT: https://hf-mirror.com
+      # Docker Hub is unreachable; unprefixed GPUStack images (e.g.
+      # gpustack/runtime:pause) resolve via quay.io (official mirror).
+      # Prefixed images (ghcr.io/...) are unaffected.
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+    volumes:
+      - /root/gpustack-validation/server-data:/var/lib/gpustack
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      # Fresh install has no embedded worker, but set explicitly so ONLY the
+      # dedicated worker below owns the GPU (server is privileged => sees GPU).
+      - --disable-worker
+
+  gpustack-worker:
+    image: quay.io/gpustack/gpustack:latest
+    container_name: gpustack-worker
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    depends_on:
+      - gpustack-server
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      # huggingface.co is unreachable from this host; route model downloads
+      # through the HF mirror.
+      HF_ENDPOINT: https://hf-mirror.com
+      # Docker Hub is unreachable; unprefixed GPUStack images (e.g.
+      # gpustack/runtime:pause) resolve via quay.io (official mirror).
+      # Prefixed images (ghcr.io/...) are unaffected.
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+      # Mirrored deployment (default true) gives the instance container a
+      # separate /var/lib/gpustack VOLUME (empty) instead of a host bind, which
+      # hides the worker's host-side GGUF file. We use an identity host bind for
+      # the worker, so disable mirroring to force a host bind of the model dir
+      # into the instance container (ContainerMount(path=...) -> host bind).
+      GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT: "false"
+    volumes:
+      - /var/lib/gpustack:/var/lib/gpustack
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - --server-url=http://127.0.0.1:30080
+      - --token=${GPUSTACK_TOKEN}
+      - --worker-name=worker1

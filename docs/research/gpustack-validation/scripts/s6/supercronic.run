@@ -1,0 +1,25 @@
+#!/command/with-contenv /bin/bash
+# Hygress: supercronic (cron runner for GPUStack-injected jobs, e.g. postgres log
+# cleanup). Mirrors the pristine supercronic/run startup contract (source base.sh +
+# gateway config + default-variables.sh) so the default s6 set settles, EXCEPT the
+# `readinessCheck "Higress Pilot" 15010` gate is dropped: the Higress pilot no longer
+# exists (hygress replaces it) and that gate would block supercronic — and therefore
+# `s6-rc -t 0 change top` (the whole boot) — forever.
+#
+# CRITICAL: the cron file lives at /var/lib/istio/cron.txt (baked into the image +
+# GPUStack injects jobs here). If the file is missing, supercronic exits immediately ->
+# s6-supervise restart-loops it -> s6-rc never settles -> the GPUStack API never boots.
+# So ensure the file exists (touch empty = valid, 0 jobs; later jobs picked up on mtime).
+SCRIPT_ROOT=/etc/s6-overlay/scripts
+source "$SCRIPT_ROOT/base.sh"
+source "$GPUSTACK_GATEWAY_CONFIG"
+source "$SCRIPT_ROOT/default-variables.sh"
+
+set -e
+exec 2>&1
+
+CRONTAB="${CRON_FILE:-/var/lib/istio/cron.txt}"
+createDir "$(dirname "$CRONTAB")"
+[ -f "$CRONTAB" ] || : > "$CRONTAB"
+
+exec /usr/local/bin/supercronic "$CRONTAB"

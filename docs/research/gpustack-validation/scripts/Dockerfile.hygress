@@ -1,0 +1,32 @@
+# Custom GPUStack image with the embedded Higress data plane replaced by Hygress
+# (design §11.1 / pack/hygress-s6). Keeps the embedded kube-apiserver + supercronic;
+# pilots hygress as the gateway. Build from the official GPUStack image.
+#
+# Build (on the test host that has docker + nvidia):
+#   docker build -f pack/Dockerfile.hygress -t gpustack:hygress \
+#     --build-arg GPUSTACK_TAG=latest \
+#     --build-arg HYGRESS_BIN=target/release/hygress .
+#
+# Rollback: the pristine Higress s6 run scripts are preserved under
+# /etc/s6-overlay/s6-rc.d.dist/ (see pack/hygress-s6/ROLLBACK.md).
+
+ARG GPUSTACK_TAG=latest
+FROM gpustack/gpustack:${GPUSTACK_TAG}
+
+# Hygress static binary (terminate-mode data plane + control-plane adapter)
+ARG HYGRESS_BIN=target/release/hygress
+COPY --chmod=0755 ${HYGRESS_BIN} /usr/local/bin/hygress
+
+# s6 surgery: replace pilot/controller/gateway with hygress; keep apiserver+supercronic
+COPY --chmod=0755 pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/gateway/run      /etc/s6-overlay/s6-rc.d/gateway/run
+COPY --chmod=0755 pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/pilot/run         /etc/s6-overlay/s6-rc.d/pilot/run
+COPY --chmod=0755 pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/controller/run    /etc/s6-overlay/s6-rc.d/controller/run
+COPY --chmod=0755 pack/hygress-s6/rootfs/etc/s6-overlay/s6-rc.d/supercronic/run   /etc/s6-overlay/s6-rc.d/supercronic/run
+
+# Preserve the pristine gateway/pilot/controller run scripts for rollback
+RUN mkdir -p /etc/s6-overlay/s6-rc.d.dist/{gateway,pilot,controller} \
+ && cp -a /etc/s6-overlay/s6-rc.d/gateway/run    /etc/s6-overlay/s6-rc.d.dist/gateway/run  \
+ && cp -a /etc/s6-overlay/s6-rc.d/pilot/run      /etc/s6-overlay/s6-rc.d.dist/pilot/run    \
+ && cp -a /etc/s6-overlay/s6-rc.d/controller/run /etc/s6-overlay/s6-rc.d.dist/controller/run
+
+HEALTHCHECK NONE

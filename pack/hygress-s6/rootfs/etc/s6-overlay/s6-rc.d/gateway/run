@@ -30,6 +30,7 @@ export GATEWAY_PILOT_AGENT_METRICS_PORT="${GATEWAY_PILOT_AGENT_METRICS_PORT:-150
 # window so a slow-but-healthy boot does not trip hygress's fail-fast (design §11.2).
 export HYGRESS_API_READY_TIMEOUT="${HYGRESS_API_READY_TIMEOUT:-300}"
 export HYGRESS_SNAPSHOT_TIMEOUT="${HYGRESS_SNAPSHOT_TIMEOUT:-300}"
+export HYGRESS_POLICY_PATH="${HYGRESS_POLICY_PATH:-/etc/hygress/policy.yaml}"
 
 # honor the original access.log logrotate tooling + keep hygress's own output in a
 # host-visible file (under the GPUStack data bind volume) for diagnosis.

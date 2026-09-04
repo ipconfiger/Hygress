@@ -49,7 +49,11 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use hygress_core::prelude::{RouteTable, UsageSchema};
+use dashmap::DashMap;
+use hygress_core::prelude::{
+    GuardAction, GuardrailFailMode, LlmGuardSpec, LlmGuardMode, LlmOnError, MatchKind,
+    QuotaDecision, RouteTable, StaticRuleSet, StaticRuleSpec, TokenBucketSpec, UsageSchema,
+};
 use hygress_core::usage::{FlushFields, UsageSnapshot};
 use hygress_core::transform::HeaderMap;
 use pingora_core::server::Server;
@@ -62,10 +66,15 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 use tracing::{debug, warn};
 
-use crate::context::{hdr, GatewayState, InboundRequest, OutboundRequest, PreparedRequest};
+use crate::context::{
+    hdr, GatewayState, GuardrailClientKey, InboundRequest, OutboundRequest, PreparedRequest,
+};
 use crate::error::GatewayError;
 use crate::pipeline;
 use crate::pipeline::PipelineCtx;
+use crate::policy_loader::{MergedPolicy, bare_ingress_name, merge_policy};
+use crate::quota::QuotaReservation;
+use crate::response_pipeline::ResponsePipeline;
 
 /// A long-lived, per-process data-plane proxy. Cheap to `Arc`-clone per Pingora
 /// worker (all state is `Arc` / `Clone`).
@@ -221,18 +230,44 @@ impl ProxyHttp for HygressProxy {
         let data = state.config.load();
         let router = crate::context::ModelRouterConfig::from_settings(&data.model_router);
 
-        // ⑥ read the full request up front (body cap → 413; the cap is the
-        // snapshot's `maxBodyBytes`).
-        let inbound = match Self::read_inbound(session, router.max_body_bytes).await {
-            Ok(i) => i,
+        // ⑥ inbound header phase (phase 1 of the body read; design §4.1): the
+        // headers come first so `rate_limit_pre` can short-circuit **before**
+        // the body is read (an early 429 does not drain the body).
+        let head = Self::read_headers(session);
+
+        // B2 (design §4.1): `rate_limit_pre` — the **ip** dimension (the global
+        // spec: the route is not known before `route_match`), before the body
+        // read. Empty client ip skips the dimension (D-9).
+        if let Some(extra) = self.rate_limit_pre(&state, &head.client_ip) {
+            return short_circuit_typed(
+                session,
+                429,
+                "rate_limit_error",
+                "rate limit exceeded",
+                &extra,
+            )
+            .await;
+        }
+
+        // ⑥ body phase (phase 2): read the full body up to the cap (413).
+        let body = match Self::read_body(session, &head.method, router.max_body_bytes).await {
+            Ok(b) => b,
             Err(e) => {
-                self.state
-                    .metrics
-                    .record_request(e.status(), e.reason());
+                state.metrics.record_request(e.status(), e.reason());
                 return short_circuit(session, e.status(), e.reason()).await;
             }
         };
-        let method = inbound.method.clone();
+        let method = head.method;
+        let inbound = InboundRequest {
+            method: method.clone(),
+            path: head.path,
+            query: head.query,
+            headers: head.headers,
+            body,
+            content_type: head.content_type,
+            client_ip: head.client_ip,
+            host: head.host,
+        };
 
         let table = match RouteTable::rebuild(&data) {
             Ok(t) => t,
@@ -247,6 +282,14 @@ impl ProxyHttp for HygressProxy {
             config: &state.config,
             router: &router,
         };
+
+        // B1 (design §4.2 / D-11 / D-13): quota `reserve` — initial dispatch
+        // only, model-route traffic only (the `usage` scope: mirror /
+        // passthrough never reserve). `est = ceil(request_content_bytes / K)`.
+        // The RAII guard is declared **outside** the fallback loop so it
+        // survives across hops: hop-0 reserves, hop≥1 skips reserve but the
+        // guard lives to the true terminal (2xx commit; every abort release).
+        let mut quota: Option<QuotaReservation> = None;
 
         // ⑭ bounded fallback re-dispatch loop.
         let mut current = inbound;
@@ -269,6 +312,36 @@ impl ProxyHttp for HygressProxy {
             // A POST/PUT/PATCH inference request is non-idempotent (retry gate).
             let non_idempotent =
                 matches!(method.as_str(), "POST" | "PUT" | "PATCH");
+
+            // The effective policy for this hop (route key known after
+            // `route_match`; design §3 / D-12). `None` when no policy is loaded
+            // (all pass-through, design §7).
+            let merged: Option<MergedPolicy> = state.policy.as_ref().map(|h| {
+                let cfg = h.shared();
+                merge_policy(&cfg, bare_ingress_name(&prepared.route.ingress_name))
+            });
+
+            // ④' routing-policy override layer (design §4.3 / D-2 / D-3):
+            // decorate the matched **Main** route only, initial dispatch only
+            // (`redirect_count == 0`); Fallback / mirror never apply.
+            if redirect_count == 0 && prepared.route.matched_by == MatchKind::HeaderExact {
+                if let Some(actions) = merged.as_ref().and_then(|m| m.actions.as_ref()) {
+                    let applied = pipeline::routing_policy::apply(&mut prepared, actions);
+                    if applied.override_miss {
+                        warn!(
+                            route = %prepared.route.ingress_name,
+                            "override_route target not among the candidates; falling back to the original routing (D-2)"
+                        );
+                    }
+                    if applied.pin_miss {
+                        warn!(
+                            route = %prepared.route.ingress_name,
+                            "pin_provider_svc_pattern matched no candidate; keeping the original candidates (D-2)"
+                        );
+                    }
+                    state.metrics.record_policy_applied(applied.applied);
+                }
+            }
 
             // ⑤ ext-auth (only for `ai-route-route-` scoped model routes).
             let mut auth_writeback = HeaderMap::new();
@@ -298,7 +371,111 @@ impl ProxyHttp for HygressProxy {
                 // proceed (fail-open by configuration).
             }
 
+            // B2 (design §4.1): `rate_limit_post` — the **consumer** dimension
+            // (the effective global/route spec), after ext-auth (the consumer
+            // comes from the `X-Mse-Consumer` write-back), initial dispatch
+            // only (D-3). `none` / absent consumer skips (D-10).
+            if redirect_count == 0 {
+                let consumer = auth_writeback.get(hdr::MSE_CONSUMER).unwrap_or("").to_string();
+                if let Some(extra) = self.rate_limit_post(&state, merged.as_ref(), &consumer) {
+                    return short_circuit_typed(
+                        session,
+                        429,
+                        "rate_limit_error",
+                        "rate limit exceeded",
+                        &extra,
+                    )
+                    .await;
+                }
+            }
+
+            // B1 (design §4.2 / D-11 / D-13): quota `reserve` — initial
+            // dispatch only, model-route traffic only (the `usage` scope:
+            // mirror / passthrough never reserve). `est =
+            // ceil(request_content_bytes / K)`. The guard was declared outside
+            // the loop (BLOCK-1): it survives across fallback hops so the
+            // true terminal commits/releases exactly once.
+            if redirect_count == 0 {
+                if let (Some(merged), Some(ut)) = (merged.as_ref(), prepared.usage.as_ref()) {
+                    if let Some(spec) =
+                        merged.quota.as_ref().and_then(|q| q.by_model_tokens.as_ref())
+                    {
+                        let est = est_tokens(prepared.body.len(), state.quota_k);
+                        let now = now_millis();
+                        let decision =
+                            state.quota.reserve(now, &ut.mse_consumer, &ut.model, spec, est);
+                        match decision {
+                            QuotaDecision::HardDeny => {
+                                state.metrics.record_quota_denied();
+                                return short_circuit_typed(
+                                    session,
+                                    429,
+                                    "quota_limit_error",
+                                    "token quota exceeded",
+                                    &HeaderMap::new(),
+                                )
+                                .await;
+                            }
+                            QuotaDecision::SoftExceed => {
+                                state.metrics.record_quota_soft_exceed();
+                                quota = Some(QuotaReservation::new(
+                                    state.quota.clone(),
+                                    ut.mse_consumer.clone(),
+                                    ut.model.clone(),
+                                    spec.clone(),
+                                    now,
+                                    est,
+                                ));
+                            }
+                            QuotaDecision::Allowed => {
+                                quota = Some(QuotaReservation::new(
+                                    state.quota.clone(),
+                                    ut.mse_consumer.clone(),
+                                    ut.model.clone(),
+                                    spec.clone(),
+                                    now,
+                                    est,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // B4a/B4b (design §4.4 / D-14): `guardrail_in` — once before the
+            // candidate loop, initial dispatch only. A hit short-circuits 403
+            // `guardrail_blocked`; the quota guard releases on drop (D-11) and
+            // a `completed=false` usage row is reported (the terminal matrix).
+            if redirect_count == 0 {
+                if let Some(merged) = merged.as_ref() {
+                    if let Some(reason) =
+                        self.guardrail_in(&state, merged, &prepared.body).await
+                    {
+                        state.metrics.record_guardrail_blocked("in");
+                        self.report_incomplete_usage(&prepared, &prepared.selected_service)
+                            .await;
+                        return short_circuit_typed(
+                            session,
+                            403,
+                            "guardrail_blocked",
+                            &reason,
+                            &HeaderMap::new(),
+                        )
+                        .await;
+                    }
+                }
+            }
+
             // ⑩ failover loop over the SWRR-ordered candidates.
+            // The routing policy may override the retry count (the route's
+            // retry **conditions** are kept; design §4.3).
+            let retry_policy = match prepared.override_retries {
+                Some(tries) => hygress_core::prelude::RetryPolicy {
+                    tries,
+                    conditions: prepared.route.retry.conditions.clone(),
+                },
+                None => prepared.route.retry.clone(),
+            };
             let mut last: Option<Final> = None;
             // The candidate that produced the terminal non-2xx (NB7 usage
             // attribution: model_id / provider_id parse from its service name —
@@ -317,13 +494,30 @@ impl ProxyHttp for HygressProxy {
                         if (200..=299).contains(&status) {
                             // ⑪/⑫/⑬ success: stream back + usage + metrics.
                             if let Err(e) = self
-                                .stream_back(session, ctx, &prepared, candidate, resp, kind, started)
+                                .stream_back(
+                                    session,
+                                    ctx,
+                                    &prepared,
+                                    candidate,
+                                    resp,
+                                    kind,
+                                    started,
+                                    &mut quota,
+                                    static_rules_of(&merged),
+                                )
                                 .await
                             {
-                                // A downstream write failed after the 2xx header was
-                                // already sent — the client may have partial bytes.
-                                // Failover is impossible here; close the connection.
+                                // A downstream write (or an upstream mid-stream read
+                                // failure) after the 2xx header was already sent —
+                                // the client may have partial bytes. Failover is
+                                // impossible here; close the connection.
                                 warn!(error = %e, "downstream stream write failed; closing");
+                                // D-11: downstream write-fail abort → release the
+                                // quota (the guard drops at the return) + report a
+                                // `completed=false` usage row (previously: no usage
+                                // at all).
+                                self.report_incomplete_usage(&prepared, &candidate.service_name)
+                                    .await;
                                 return Ok(true);
                             }
                             ctx.status = status;
@@ -331,7 +525,7 @@ impl ProxyHttp for HygressProxy {
                         }
                         // Non-2xx: retry the next candidate when the policy allows.
                         if !is_last
-                            && prepared.route.retry.should_retry(Some(status), false, false, non_idempotent)
+                            && retry_policy.should_retry(Some(status), false, false, non_idempotent)
                         {
                             state.metrics.record_retry();
                             state.metrics.record_upstream_error();
@@ -346,7 +540,7 @@ impl ProxyHttp for HygressProxy {
                     Err(e) => {
                         state.metrics.record_upstream_error();
                         if !is_last
-                            && prepared.route.retry.should_retry(None, true, false, non_idempotent)
+                            && retry_policy.should_retry(None, true, false, non_idempotent)
                         {
                             state.metrics.record_retry();
                             debug!(error = %e, candidate = %candidate.service_name, "transport failure; trying next candidate");
@@ -450,49 +644,88 @@ impl ProxyHttp for HygressProxy {
     }
 }
 
-impl HygressProxy {
-    /// Read the full downstream request into an [`InboundRequest`] (① body read +
-    /// cap). `:path` is mirrored into the header map so the transformer-in can
-    /// backstop it for the fallback restore.
-    async fn read_inbound(session: &mut Session, max_body: usize) -> Result<InboundRequest, GatewayError> {
-        // (i) Immutable borrow of the request header to pull out method/path/headers.
-        let (method, path, query, host, content_type, client_ip, headers) = {
-            let req = session.req_header();
-            let host = req
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let content_type = req
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let client_ip = req
-                .headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .or_else(|| req.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()))
-                .unwrap_or("")
-                .to_string();
-            let method = req.method.as_str().to_string();
-            let path = req.uri.path().to_string();
-            let query = req.uri.query().map(|q| q.to_string()).unwrap_or_default();
-            let mut headers = HeaderMap::new();
-            for (name, value) in req.headers.iter() {
-                if let Ok(v) = value.to_str() {
-                    headers.append(name.as_str(), v.to_string());
-                }
-            }
-            // Mirror `:path` so transformer-in can backstop / restore it (stage ③⑭).
-            headers.insert(hdr::PATH, path.clone());
-            (method, path, query, host, content_type, client_ip, headers)
-        };
+/// The inbound **header phase** result (phase 1 of the two-phase read; design
+/// §4.1). `:path` is mirrored into `headers` so the transformer-in can
+/// backstop it for the fallback restore.
+struct InboundHead {
+    method: String,
+    /// Original `:path` (no query).
+    path: String,
+    /// Query string (empty when absent; leading `?` excluded).
+    query: String,
+    host: String,
+    content_type: String,
+    /// Client source IP (`X-Real-IP` if present, else `X-Forwarded-For`).
+    client_ip: String,
+    headers: HeaderMap,
+}
 
-        // (ii) Read the full body (POST/PUT/PATCH only) up to the cap.
-        let has_body = matches!(method.as_str(), "POST" | "PUT" | "PATCH");
+impl HygressProxy {
+    /// Inbound phase 1: read the request **headers** only (no body).
+    ///
+    /// Splitting the read into headers-then-body (design §4.1 / M1 refactor)
+    /// lets `rate_limit_pre` short-circuit **before** the body is read — an
+    /// early 429 does not drain a potentially large request body.
+    fn read_headers(session: &Session) -> InboundHead {
+        let req = session.req_header();
+        let host = req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let content_type = req
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let client_ip = req
+            .headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| {
+                // D-9: XFF is a comma-separated list; take the **first** value
+                // (the leftmost = the original client, per RFC 7239).
+                req.headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(',').next())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("")
+            .to_string();
+        let method = req.method.as_str().to_string();
+        let path = req.uri.path().to_string();
+        let query = req.uri.query().map(|q| q.to_string()).unwrap_or_default();
+        let mut headers = HeaderMap::new();
+        for (name, value) in req.headers.iter() {
+            if let Ok(v) = value.to_str() {
+                headers.append(name.as_str(), v.to_string());
+            }
+        }
+        // Mirror `:path` so transformer-in can backstop / restore it (stage ③⑭).
+        headers.insert(hdr::PATH, path.clone());
+        InboundHead {
+            method,
+            path,
+            query,
+            host,
+            content_type,
+            client_ip,
+            headers,
+        }
+    }
+
+    /// Inbound phase 2: read the **full** body (POST/PUT/PATCH only) up to the
+    /// cap (413 above it).
+    async fn read_body(
+        session: &mut Session,
+        method: &str,
+        max_body: usize,
+    ) -> Result<Bytes, GatewayError> {
+        let has_body = matches!(method, "POST" | "PUT" | "PATCH");
         let mut buf: Vec<u8> = Vec::new();
         if has_body {
             while let Ok(Some(chunk)) = session.as_downstream_mut().read_request_body().await {
@@ -504,18 +737,278 @@ impl HygressProxy {
                 }
             }
         }
-
-        Ok(InboundRequest {
-            method,
-            path,
-            query,
-            headers,
-            body: Bytes::from(buf),
-            content_type,
-            client_ip,
-            host,
-        })
+        Ok(Bytes::from(buf))
     }
+}
+
+impl HygressProxy {
+    // -------------------------------------------------------------------
+    // Extension stages (design §4): rate limiting (B2) / guardrail (B4a/B4b).
+    // -------------------------------------------------------------------
+
+    /// Check (or seed + check) a per-key token bucket in the shared
+    /// `DashMap` (design §4.1 / D-6 / D-9 / D-10).
+    ///
+    /// The bucket **parameters** (capacity + rate) come from the current
+    /// policy snapshot at seed time; the per-key state (tokens / last refill)
+    /// lives in the map. An **empty** key skips the dimension (allow) — an
+    /// empty key is never shared as a bucket.
+    fn check_bucket(
+        buckets: &DashMap<String, crate::context::RateLimitEntry>,
+        key: &str,
+        spec: &TokenBucketSpec,
+        now_ms: u64,
+    ) -> bool {
+        if key.is_empty() {
+            return true;
+        }
+        let mut entry = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| crate::context::RateLimitEntry {
+                spec_rps: spec.rps,
+                spec_burst: spec.burst,
+                last_active_ms: now_ms,
+                bucket: hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps),
+            });
+        // Hot-reload detection: if the spec changed since the bucket was
+        // seeded (e.g. policy reload with new rps/burst), reset the bucket
+        // with the new parameters (BLOCK-2: not retain the old spec).
+        if entry.spec_rps != spec.rps || entry.spec_burst != spec.burst {
+            entry.spec_rps = spec.rps;
+            entry.spec_burst = spec.burst;
+            entry.bucket = hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps);
+        }
+        entry.last_active_ms = now_ms;
+        entry.bucket.check(now_ms)
+    }
+
+    /// The `Retry-After` value (seconds) for a token-bucket denial: the time
+    /// until the next token at the spec's fill rate (minimum 1s).
+    fn retry_after(spec: &TokenBucketSpec) -> String {
+        if spec.rps > 0.0 {
+            let secs = (1.0 / spec.rps).ceil();
+            (secs.max(1.0) as u64).to_string()
+        } else {
+            "1".to_string()
+        }
+    }
+
+    /// B2 (design §4.1): `rate_limit_pre` — the **ip** dimension (the **global**
+    /// spec: the route is not known before `route_match`), evaluated **before**
+    /// the body read (early rejection does not drain the body).
+    ///
+    /// Returns the extra response headers (`Retry-After`) on a denial — the
+    /// caller short-circuits 429 `rate_limit_error`. `None` = allow / skip
+    /// (no policy, no ip limit, or an empty client ip — D-9).
+    fn rate_limit_pre(&self, state: &GatewayState, client_ip: &str) -> Option<HeaderMap> {
+        let cfg = state.policy.as_ref()?.shared();
+        let spec = cfg.global.limits.as_ref()?.ip.as_ref()?;
+        if client_ip.is_empty() {
+            return None;
+        }
+        let now = now_millis();
+        let key = format!("ip:{client_ip}");
+        if Self::check_bucket(&state.ratelimit_buckets, &key, spec, now) {
+            None
+        } else {
+            state.metrics.record_rate_limit_denied("ip");
+            let mut h = HeaderMap::new();
+            h.insert("retry-after", Self::retry_after(spec));
+            Some(h)
+        }
+    }
+
+    /// B2 (design §4.1): `rate_limit_post` — the **consumer** dimension (the
+    /// effective global/route spec), after ext-auth (the consumer comes from
+    /// the `X-Mse-Consumer` write-back).
+    ///
+    /// `none` / an absent consumer skips the dimension (D-10, fail-open).
+    /// Returns the extra headers on a denial (the caller short-circuits 429).
+    fn rate_limit_post(
+        &self,
+        state: &GatewayState,
+        merged: Option<&MergedPolicy>,
+        consumer: &str,
+    ) -> Option<HeaderMap> {
+        let spec = merged?.limits.as_ref()?.consumer.as_ref()?;
+        let key = if consumer.is_empty() || consumer.eq_ignore_ascii_case("none") {
+            String::new()
+        } else {
+            consumer.to_string()
+        };
+        if key.is_empty() {
+            return None;
+        }
+        let now = now_millis();
+        let bkey = format!("consumer:{key}");
+        if Self::check_bucket(&state.ratelimit_buckets, &bkey, spec, now) {
+            None
+        } else {
+            state.metrics.record_rate_limit_denied("consumer");
+            let mut h = HeaderMap::new();
+            h.insert("retry-after", Self::retry_after(spec));
+            Some(h)
+        }
+    }
+
+    /// B4a/B4b (design §4.4 / D-14): the **request-side** guardrail, run once
+    /// before the candidate loop (initial dispatch only). The guarded body is
+    /// then carried by the loop — a fallback hop inherits it (D-3); v1 actions
+    /// are `Block`-only, so the body is unchanged on a pass.
+    ///
+    /// - **not configured** (no `guardrail` section) → pass-through (D-14);
+    /// - **B4a static rules** (the effective `global ++ route` set): a `Block`
+    ///   hit → the block reason (the caller 403s `guardrail_blocked`);
+    /// - **B4b LLM verdict** (a `HYGRESS_GUARDRAIL_URL` is required — without
+    ///   it the LLM stage is *not configured* → pass-through, D-14):
+    ///   - `sync`: `Ok(None)` (no verdict) → pass; `Ok(Some(blocked))` → block;
+    ///     `Err` → reject only when **both** knobs agree (`fail_mode` `closed`
+    ///     + `on_error` `reject`) — fail-closed (D-14), else fail-open;
+    ///   - `async`: the verdict is collected in a spawned task (recorded via
+    ///     tracing) and the request proceeds (not on the path).
+    async fn guardrail_in(
+        &self,
+        state: &GatewayState,
+        merged: &MergedPolicy,
+        body: &[u8],
+    ) -> Option<String> {
+        let Some(g) = merged.guardrail.as_ref() else {
+            return None; // not configured → pass-through (D-14)
+        };
+        let text = String::from_utf8_lossy(body);
+
+        // B4a: static rules (the effective `global ++ route` set).
+        if !g.static_rules.is_empty() {
+            match StaticRuleSet::new(&g.static_rules) {
+                Ok(set) => {
+                    if let Some(hit) = set.evaluate(&text) {
+                        if hit.action == GuardAction::Block {
+                            return Some(format!("static rule '{}'", hit.hit_name));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fail-safe: an uncompilable rule must not block every
+                    // request (design §7) — skip the static set.
+                    warn!(error = %e, "guardrail static rule compile failed; static rules skipped");
+                }
+            }
+        }
+
+        // B4b: LLM verdict.
+        let llm = g.llm.as_ref()?;
+        let Some(url) = state.guardrail_url.as_deref() else {
+            // `llm:` configured but no service URL: the LLM stage is not
+            // configured → pass-through (D-14: `fail_mode` never applies then).
+            return None;
+        };
+        let client = self.guardrail_client(state, url, llm);
+        match llm.mode {
+            LlmGuardMode::Sync => match client.classify(&text).await {
+                Ok(None) => None, // no verdict → pass
+                Ok(Some(v)) => {
+                    if v.blocked {
+                        Some(if v.reason.is_empty() {
+                            "llm verdict: blocked".to_string()
+                        } else {
+                            v.reason.clone()
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    // D-14: fail-closed only when the guardrail is enabled AND
+                    // the call failed, and both knobs agree on reject.
+                    let reject = matches!(g.fail_mode, GuardrailFailMode::Closed)
+                        && matches!(llm.on_error, LlmOnError::Reject);
+                    if reject {
+                        warn!(
+                            error = %e,
+                            "llm guardrail verdict failed; rejecting (fail-closed, D-14)"
+                        );
+                        Some("llm guardrail verdict failed (fail-closed)".to_string())
+                    } else {
+                        warn!(error = %e, "llm guardrail verdict failed; allowing (fail-open)");
+                        None
+                    }
+                }
+            },
+            LlmGuardMode::Async => {
+                // Collect the verdict without blocking the request path
+                // (record only — the request proceeds regardless).
+                let client = client.clone();
+                let text = text.into_owned();
+                tokio::spawn(async move {
+                    match client.classify(&text).await {
+                        Ok(Some(v)) => {
+                            if v.blocked {
+                                warn!(
+                                    reason = %v.reason,
+                                    "async guardrail verdict: blocked (recorded only)"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(error = %e, "async guardrail verdict failed (recorded only)");
+                        }
+                    }
+                });
+                None
+            }
+        }
+    }
+
+    /// The cached LLM guardrail client for the (hot-reloadable) spec — one
+    /// process-wide client per distinct parameter set (shared concurrency
+    /// bound + verdict cache, design §4.4 B4b).
+    fn guardrail_client(
+        &self,
+        state: &GatewayState,
+        url: &str,
+        llm: &LlmGuardSpec,
+    ) -> std::sync::Arc<hygress_egress::guardrail::GuardrailClient> {
+        let key = GuardrailClientKey {
+            url: url.to_string(),
+            timeout_ms: llm.timeout_ms,
+            max_rps: llm.max_rps,
+            cache_ttl_secs: llm.cache_ttl_secs,
+        };
+        state
+            .guardrail_clients
+            .entry(key)
+            .or_insert_with(|| {
+                std::sync::Arc::new(hygress_egress::guardrail::GuardrailClient::new(
+                    url,
+                    state.http.clone(),
+                    Duration::from_millis(llm.timeout_ms),
+                    llm.max_rps as usize,
+                    Duration::from_secs(llm.cache_ttl_secs),
+                ))
+            })
+            .value()
+            .clone()
+    }
+}
+
+/// The effective **output-side** static rules (B4c / design §2.2 §4.4): the
+/// merged `guardrail.static_rules` for the hop (`global ++ route`), or the
+/// empty set (the observe pass-through state).
+fn static_rules_of(merged: &Option<MergedPolicy>) -> &[StaticRuleSpec] {
+    static EMPTY: &[StaticRuleSpec] = &[];
+    merged
+        .as_ref()
+        .and_then(|m| m.guardrail.as_ref())
+        .map(|g| g.static_rules.as_slice())
+        .unwrap_or(EMPTY)
+}
+
+/// The D-13 quota estimate: `ceil(request_content_bytes / K)` (`K` ≥ 1).
+fn est_tokens(body_bytes: usize, k: u64) -> u64 {
+    let k = k.max(1);
+    let b = body_bytes as u64;
+    b.div_ceil(k)
 }
 
 /// The final terminal outcome of the candidate failover loop (for ⑭ fallback
@@ -554,6 +1047,12 @@ impl HygressProxy {
         let method = reqwest::Method::from_bytes(outbound.method.as_bytes())
             .unwrap_or(reqwest::Method::POST);
         let mut req = self.client_for(candidate).request(method, url);
+        // Design §4.3: the routing policy's per-request timeout override (the
+        // shared client itself has no read timeout — LLM streams are
+        // long-lived; the override applies to this request only).
+        if let Some(ms) = prepared.override_timeout_ms {
+            req = req.timeout(Duration::from_millis(ms));
+        }
         let names: Vec<&str> = outbound.headers.names().collect();
         for name in names {
             // Pseudo-headers (the core `:path` marker) are internal and are not
@@ -665,6 +1164,10 @@ impl HygressProxy {
         // for a proxied target — D8). The ProviderClient records the provider origin
         // (`url`) + the (key-swapped) headers; the raw body streams byte-for-byte.
         let mut req = self.client_for(candidate).request(upstream.method, upstream.url);
+        // Design §4.3: the routing policy's per-request timeout override.
+        if let Some(ms) = prepared.override_timeout_ms {
+            req = req.timeout(Duration::from_millis(ms));
+        }
         for (name, value) in upstream.headers.iter() {
             // `content-type` is set once, explicitly below (it is already forwarded
             // in `upstream.headers` from the inbound copy — skip it so the header
@@ -736,6 +1239,19 @@ impl HygressProxy {
     /// feeding the usage accumulator, capturing TTFT, and stripping hop-by-hop /
     /// encoding headers. Then ⑫ push the usage record (model-route only) and ⑬
     /// record metrics.
+    ///
+    /// The **response-side skeleton** (design §2.2 / D-1 / B4c) runs between
+    /// `usage.feed(chunk)` and `write_response_body(chunk)`:
+    /// `out_rules` build the per-response [`ResponsePipeline`] (observe
+    /// pass-through when empty; per-chunk judgment otherwise). A hit **stops
+    /// writing and cuts the downstream** (the 2xx header is already sent — it
+    /// cannot be changed), then takes the terminal path: the quota reservation
+    /// is released (D-11) and a `completed=false` usage row is reported.
+    ///
+    /// The 2xx stream-end path **commits** the quota reservation with the
+    /// actual `total_token` (D-11 / D-13). `quota` is settled here on the
+    /// success and guardrail-cut paths; the `Drop` guard covers the remaining
+    /// terminal paths (abort / write-fail) — settlement is idempotent.
     #[allow(clippy::too_many_arguments)] // ⑪ forwards the full prepared + candidate context
     async fn stream_back(
         &self,
@@ -746,6 +1262,8 @@ impl HygressProxy {
         mut resp: reqwest::Response,
         kind: &str,
         started: Instant,
+        quota: &mut Option<QuotaReservation>,
+        out_rules: &[StaticRuleSpec],
     ) -> PingoraResult<()> {
         const SKIP: &[&str] = &[
             "server",
@@ -780,8 +1298,10 @@ impl HygressProxy {
             .write_response_header(Box::new(resp_header), false)
             .await?;
 
-        // ⑪ stream body; count SSE usage + TTFT (first chunk).
+        // ⑪ stream body; count SSE usage + TTFT (first chunk); B4c per-chunk
+        // guardrail between `usage.feed` and `write_response_body`.
         let mut usage = UsageSnapshot::new(UsageSchema::Generic);
+        let mut resp_pipeline = ResponsePipeline::new(out_rules);
         let mut ttft: Option<f64> = None;
         let mut first = true;
         while let Some(chunk) = resp
@@ -794,6 +1314,37 @@ impl HygressProxy {
                 ttft = Some(started.elapsed().as_secs_f64());
             }
             usage.feed(chunk.as_ref());
+            // B4c (design §2.2 / §4.4): per-chunk judgment. A hit = stop
+            // writing + cut the downstream + terminal path (D-11: release the
+            // quota + report a `completed=false` usage row).
+            if let Some(hit) = resp_pipeline.on_chunk(chunk.as_ref()) {
+                self.state.metrics.record_guardrail_blocked("out");
+                // B-11: record the request (the 2xx header was already sent;
+                // the stream was cut). The duration covers the partial stream.
+                self.state
+                    .metrics
+                    .record_request(status, kind);
+                self.state
+                    .metrics
+                    .record_request_duration(kind, started.elapsed().as_secs_f64());
+                // NB-4: set ctx.status for consistency with the normal
+                // stream_end path (line ~1347). The status is the upstream
+                // 2xx (the header was already sent to the client).
+                ctx.status = status;
+                warn!(
+                    rule = %hit.hit_name,
+                    "output guardrail hit; cutting the downstream stream"
+                );
+                if let Some(g) = quota {
+                    g.settle(None);
+                }
+                self.report_incomplete_usage(prepared, &candidate.service_name)
+                    .await;
+                // Cut the downstream connection (no further writes; the
+                // connection is not kept alive).
+                session.as_downstream_mut().set_keepalive(None);
+                return Ok(());
+            }
             session.write_response_body(Some(chunk), false).await?;
         }
         session.write_response_body(None, true).await?;
@@ -827,7 +1378,18 @@ impl HygressProxy {
             // None` → skip).
             let fields = usage_fields(&ut, prepared, &candidate.service_name);
             let metrics = usage.flush(&fields);
+            // D-11 / D-13: 2xx stream end → commit the quota reservation with
+            // the actual `total_token` (the flushed total: the upstream total
+            // when it exceeds `input + output`, else the recomputed sum).
+            if let Some(g) = quota {
+                g.settle(Some(metrics.total_token));
+            }
             let _ = sink.push(&metrics).await;
+        } else if let Some(g) = quota {
+            // Defensive: a reservation without a usage row (mirror traffic
+            // never reserves, so this is unreachable in practice) — settle
+            // with the observed tokens rather than leaking the estimate.
+            g.settle(Some(input.saturating_add(output)));
         }
         Ok(())
     }
@@ -967,14 +1529,48 @@ fn pingora_err<S: Into<String>>(msg: S) -> Box<PingoraError> {
     PingoraError::explain(InternalError, msg.into())
 }
 
-/// Write a short JSON error and return `Ok(true)` (short-circuit the pipeline).
+/// Write a short JSON error and return `Ok(true)` (short-circuit the
+/// pipeline). The existing calls keep the `proxy_error` shape (D-15
+/// compatibility).
 async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> PingoraResult<bool> {
+    short_circuit_typed(session, status, "proxy_error", reason, &HeaderMap::new()).await
+}
+
+/// Write a **typed** JSON error with optional extra response headers (design
+/// §4.1 / D-15) and return `Ok(true)` (short-circuit the pipeline).
+///
+/// The body is `{"error":{"message":<message>,"type":<err_type>}}`; `extra`
+/// carries e.g. the rate-limit `Retry-After` header.
+async fn short_circuit_typed(
+    session: &mut Session,
+    status: u16,
+    err_type: &str,
+    message: &str,
+    extra: &HeaderMap,
+) -> PingoraResult<bool> {
     let body = Bytes::from(format!(
-        "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"proxy_error\"}}}}"
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\"}}}}",
+        json_escape(message),
+        json_escape(err_type)
     ));
+    let mut resp = ResponseHeader::build(status, None)?;
+    let _ = resp.insert_header("content-type", "application/json; charset=utf-8");
+    let pairs: Vec<(String, String)> = extra
+        .names()
+        .filter_map(|name| extra.get(name).map(|v| (name.to_string(), v.to_string())))
+        .collect();
+    for (name, v) in pairs {
+        let _ = resp.insert_header(name, v);
+    }
     session.set_keepalive(None);
-    session.respond_error_with_body(status, body).await?;
+    session.write_response_header(Box::new(resp), false).await?;
+    session.write_response_body(Some(body), true).await?;
     Ok(true)
+}
+
+/// Minimal JSON string escaping (the values here are slugs / controlled text).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Arm a fallback re-dispatch over the **original** inbound request: set
@@ -1134,5 +1730,43 @@ mod tests {
     #[test]
     fn absent_authorization_yields_empty_token() {
         assert_eq!(provider_api_token(&out_with_auth(None)), "");
+    }
+
+    // ----- NB-2: check_bucket spec-fingerprint reset -----
+
+    #[test]
+    fn check_bucket_resets_on_spec_change() {
+        let buckets: DashMap<String, crate::context::RateLimitEntry> =
+            DashMap::new();
+        // Seed with rps=1, burst=1: first check passes, second is denied.
+        let spec1 = TokenBucketSpec { rps: 1.0, burst: 1 };
+        assert!(HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec1, 0));
+        assert!(!HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec1, 1));
+
+        // Hot-reload: the spec changes to burst=5. The bucket must be reset
+        // (not retain the old burst=1), so the next check passes.
+        let spec2 = TokenBucketSpec { rps: 1.0, burst: 5 };
+        assert!(
+            HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec2, 2),
+            "after spec change, the reset bucket (burst=5) must allow"
+        );
+        // The new bucket has burst=5: we can take 4 more tokens.
+        for _ in 0..4 {
+            assert!(HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec2, 3));
+        }
+        // Now the bucket is empty (burst=5 exhausted).
+        assert!(!HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec2, 4));
+    }
+
+    #[test]
+    fn check_bucket_empty_key_is_passthrough() {
+        let buckets: DashMap<String, crate::context::RateLimitEntry> =
+            DashMap::new();
+        let spec = TokenBucketSpec { rps: 1.0, burst: 1 };
+        // An empty key is always allowed (D-10: never share a "" bucket).
+        assert!(HygressProxy::check_bucket(&buckets, "", &spec, 0));
+        assert!(HygressProxy::check_bucket(&buckets, "", &spec, 1));
+        // No entry was created.
+        assert_eq!(buckets.len(), 0);
     }
 }

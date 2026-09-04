@@ -12,7 +12,7 @@
 //!   timeout → FAIL_OPEN path.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,8 +51,14 @@ struct State {
     captured: Mutex<Vec<RecordedRequest>>,
     status: AtomicU16,
     resp_headers: Mutex<Vec<(String, String)>>,
+    /// Response body bytes to emit (default empty → `Content-Length: 0`, as before).
+    resp_body: Mutex<Vec<u8>>,
     delay_ms: AtomicU64,
     blackhole: AtomicBool,
+    /// Currently in-flight (being processed) connections.
+    in_flight: AtomicUsize,
+    /// High-water mark of in-flight connections (for asserting concurrency bounds).
+    max_in_flight: AtomicUsize,
     shutdown: Notify,
 }
 
@@ -72,8 +78,11 @@ impl TestServer {
             captured: Mutex::new(Vec::new()),
             status: AtomicU16::new(200),
             resp_headers: Mutex::new(Vec::new()),
+            resp_body: Mutex::new(Vec::new()),
             delay_ms: AtomicU64::new(0),
             blackhole: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
             shutdown: Notify::new(),
         });
         let accept_state = state.clone();
@@ -111,6 +120,16 @@ impl TestServer {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         *self.state.resp_headers.lock().unwrap() = h;
+    }
+
+    /// Response body bytes to emit (default empty → `Content-Length: 0`).
+    pub fn set_body(&self, body: impl Into<Vec<u8>>) {
+        *self.state.resp_body.lock().unwrap() = body.into();
+    }
+
+    /// High-water mark of concurrently in-flight connections (for asserting concurrency bounds).
+    pub fn max_in_flight(&self) -> usize {
+        self.state.max_in_flight.load(Ordering::SeqCst)
     }
 
     pub fn set_delay_ms(&self, ms: u64) {
@@ -212,6 +231,9 @@ async fn handle_connection(mut sock: TcpStream, state: Arc<State>) {
         body,
     });
 
+    // Track in-flight concurrency (RAII: decremented on drop across all return paths).
+    let _in_flight = InFlightGuard::new(&state);
+
     let is_blackhole = state.blackhole.load(Ordering::SeqCst);
     if is_blackhole {
         // Hold the connection open (no response) until shutdown → client timeout.
@@ -226,6 +248,7 @@ async fn handle_connection(mut sock: TcpStream, state: Arc<State>) {
 
     let status = state.status.load(Ordering::SeqCst);
     let resp_headers = state.resp_headers.lock().unwrap().clone();
+    let resp_body = state.resp_body.lock().unwrap().clone();
     let mut resp = String::new();
     resp.push_str(&format!(
         "HTTP/1.1 {} {}\r\n",
@@ -235,10 +258,13 @@ async fn handle_connection(mut sock: TcpStream, state: Arc<State>) {
     for (k, v) in &resp_headers {
         resp.push_str(&format!("{}: {}\r\n", k, v));
     }
-    resp.push_str("Content-Length: 0\r\n");
+    resp.push_str(&format!("Content-Length: {}\r\n", resp_body.len()));
     resp.push_str("Connection: close\r\n");
     resp.push_str("\r\n");
     let _ = sock.write_all(resp.as_bytes()).await;
+    if !resp_body.is_empty() {
+        let _ = sock.write_all(&resp_body).await;
+    }
     let _ = sock.flush().await;
     let _ = sock.shutdown().await;
 }
@@ -280,6 +306,33 @@ fn parse_request_head(head: &str) -> (String, String, Vec<(String, String)>) {
         }
     }
     (method, target, headers)
+}
+
+/// RAII guard that increments the in-flight counter on creation and decrements it on drop,
+/// recording the high-water mark (so tests can assert a concurrency bound).
+struct InFlightGuard(Arc<State>);
+
+impl InFlightGuard {
+    fn new(state: &Arc<State>) -> Self {
+        let cur = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut max = state.max_in_flight.load(Ordering::SeqCst);
+        while cur > max {
+            match state
+                .max_in_flight
+                .compare_exchange_weak(max, cur, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(m) => max = m,
+            }
+        }
+        Self(state.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn find_subseq(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {

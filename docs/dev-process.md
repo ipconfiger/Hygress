@@ -193,3 +193,51 @@ cargo build --release -p hygress-gateway --features integrations
 - 延迟/资源占用的量化基准（对比基线 Higress 进程数/内存/首 token 延迟）；
 - 多租户隔离的专项验证与文档化；
 - 回滚演练脚本化（`ROLLBACK.md` 已随 pack 提供）。
+
+---
+
+## 10. 升级开发：网关延伸能力（2026-09-04）
+
+> 文档：`docs/extensions-audit.md`（审核分类）、`docs/extensions-design.md`（设计终版 + §10 实现/审核/真机记录）。
+
+### 10.1 缘起与范围
+用户提出四类网关延伸需求：**token 配额 · 限流 · 路由策略 · 安全护栏**。先做深度审核
+（`extensions-audit.md`）：三分类（已实现/需实现/不必实现）+ **配置来源边界**
+（与 GPUStack 控制面有契约的走 CRD 只读；网关自有语义走 `hygress.policy.yaml` 配置文件）。
+
+### 10.2 设计（两轮 oracle 门禁）
+- `extensions-design.md` v1 → @oracle 首轮高精度审核：**5 项阻塞（BLOCK-1~5）** + D-1~D-15 裁决 +
+  代码事实纠错（admin `/reload` 未接线返回 501、SWRR 在 ext-auth **之前**、`client_ip` 三处口径不一、
+  `SharedConfig::store` 无相等短路、响应头先于 body 写出等）；
+- v2 修订并入全部修订 → **二轮复审：无阻塞，可达"可实现前提"**。
+
+### 10.3 实现（三并行 lane，TDD、零 mock/stub）
+- **C1 core**：PolicyConfig（serde+default 全放行）/ RatLimiter / QuotaEngine / RoutePolicy /
+  Guardrail+ChunkScanner（时间全注入 `now_ms` 保证确定性）；`commit` 增加 `est` 做 **per-reservation
+  并发精确结算**（并钳制"幻影结算"防削减已用配额）→ 198 测试；
+- **C2 egress**：`GuardrailClient`（semaphore 并发上限、TTL 判词缓存、`Ok(None)`=无判定、非 2xx=Err）→ 67 测试；
+- **G1 gateway**：`policy_loader`（加载/坏文件 last-known-good/mtime 1s 热更）+ admin `/reload` 接线（原 501）+
+  `QuotaReservation`（RAII + 终端矩阵：2xx commit / 中断 release / 写失败补 `completed=false`）+
+  限流两阶段（IP 早拒不排空 body / consumer 维 `none` 跳过）+ 配额 + 路由策略（override 运行时回退不污染 SWRR）+
+  护栏（请求侧静态+LLM fail-closed / 响应侧 per-chunk 跨块 tail=4096）+ `short_circuit_typed`（`rate_limit_error` 等类型化 + Retry-After）→ 48 测试。
+
+### 10.4 审核闭环（oracle 第二方复核）
+- **ora-2 交叉审核**：BLOCK-1/2/3（fallback 重派后配额永不 commit、`gc_stale` 零调用 + 限流桶无淘汰/不热更、
+  §3 示例键与 serde 不兼容）→ 修复 + 补回归测试 → **复审：BLOCK 全部闭合，目标达成**；
+  残留 NON-BLOCK（NB-1~5）一并清除（含 BLOCK-1 判别性回归测试重写、`evict_idle`/桶指纹单测、release 刷
+  `last_used`、断流指标、文档计数）→ **最终 492 全绿、clippy 0，全部问题消除**。
+
+### 10.5 真机 e2e（升级后构建）
+`policy.yaml` 经 `docker cp` → `/etc/hygress/policy.yaml`，由 **1s mtime 热重载**生效（零重启）：
+- **限流**（路由 `limits.consumer {rps:1,burst:1}`）→ 200 200 **429 `rate_limit_error`** + `Retry-After` ✅
+- **配额**（`hard:60`）→ 200 **429 429 `quota_limit_error`** ✅
+- **输入护栏**（`FORBIDDEN_MARKER`）→ **403 `guardrail_blocked`**；正常 200 ✅
+- **复位**（移除政策）→ `:80/readyz=200`、chat=200、server 稳定 ✅
+- 过程中发现并修复**部署漂移**：真机镜像曾用旧 pack（缺 `/etc/hygress`）致 policy 不生效，重传 pack 重建镜像后与仓库一致。
+
+### 10.6 经验补充
+1. **配置机制是前置缺口**：原 Hygress 无独立配置文件（仅 env + CRD 派生配置），延伸能力全部以
+   `hygress.policy.yaml` 骨架承载（热重载 + `/reload`），先做骨架再长能力；
+2. **审核运行时可替补**：@oracle 运行时偶发不可用 → 以"同方法论自审"替补持进度，恢复后补跑第二方复核
+   （ora-2）闭环；结论一致（目标达成）；若有条件仍建议 oracle 终审兜底。
+

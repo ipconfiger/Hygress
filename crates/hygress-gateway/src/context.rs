@@ -320,6 +320,15 @@ pub struct PreparedRequest {
     pub selected_service: String,
     /// Unix millis at request entry (usage `started_at`).
     pub started_at_ms: u64,
+    /// Per-request timeout override from the routing policy (design §4.3,
+    /// `RoutePolicyActions::timeout_ms`, milliseconds). Applied per outbound
+    /// request via the reqwest `RequestBuilder::timeout` (the shared client
+    /// itself has no read timeout — LLM streams are long-lived).
+    pub override_timeout_ms: Option<u64>,
+    /// Retry-count override from the routing policy (design §4.3,
+    /// `RoutePolicyActions::retries`). Replaces the route's retry `tries`;
+    /// the route's retry **conditions** are kept.
+    pub override_retries: Option<u32>,
 }
 
 /// Shared, long-lived gateway state threaded through every request. Cheap to
@@ -349,12 +358,77 @@ pub struct GatewayState {
     /// (`send_provider_outbound`) invokes
     /// [`hygress_egress::provider::ProviderClient::build_upstream_request`] on
     /// this instance to apply the key-swap (outbound `Authorization` =
-    /// `Bearer <provider apiToken>`) / `Host` / scheme / outbound-proxy. This is
+    /// `Bearer <provider apiToken>`), `Host` / scheme / outbound-proxy. This is
     /// a read on the hot path, not dead weight. Contract:
     /// `hygress_egress::provider::{ProviderClient, build_upstream_request}`.
     pub upstream: std::sync::Arc<hygress_egress::provider::ProviderClient>,
     /// Prometheus metrics.
     pub metrics: std::sync::Arc<crate::metrics::Metrics>,
+    /// The policy handle (design §2.1): `ArcSwap<PolicyConfig>` + mtime poll +
+    /// admin `/reload`. `None` ⇒ no policy (all pass-through; the stage is
+    /// disabled, design §7).
+    pub policy: Option<std::sync::Arc<crate::policy_loader::PolicyHandle>>,
+    /// Live per-key rate-limit token buckets (design §4.1 / D-6 / D-9 / D-10),
+    /// keyed `ip:<client-ip>` / `consumer:<consumer>`. The bucket **parameters**
+    /// come from the current policy snapshot at seed time (hot-reloadable);
+    /// the per-key state (tokens / last) lives here, never in `ConfigData`.
+    /// Each entry carries the spec that seeded it (for hot-reload detection)
+    /// and the last activity timestamp (for idle eviction).
+    pub ratelimit_buckets:
+        std::sync::Arc<dashmap::DashMap<String, RateLimitEntry>>,
+    /// The token-quota engine (design §4.2): fixed-window budgets per
+    /// `(consumer, model)`. In-memory only (D-5: restart = fresh window).
+    pub quota: std::sync::Arc<hygress_core::prelude::QuotaEngine>,
+    /// The quota estimate divisor K (design §4.2 / D-13; `HYGRESS_QUOTA_K`,
+    /// default 4): `est = ceil(request_content_bytes / K)`.
+    pub quota_k: u64,
+    /// Long-lived egress HTTP client (the LLM guardrail verdict calls, design
+    /// §4.4 B4b).
+    pub http: reqwest::Client,
+    /// The LLM guardrail verdict service URL (`HYGRESS_GUARDRAIL_URL`). `None`
+    /// ⇒ the LLM guardrail is not configured (pass-through; D-14).
+    pub guardrail_url: Option<String>,
+    /// Cached LLM guardrail clients, keyed by their (hot-reloadable)
+    /// parameters — one process-wide client (shared concurrency bound +
+    /// verdict cache) per distinct configuration.
+    pub guardrail_clients: std::sync::Arc<
+        dashmap::DashMap<
+            GuardrailClientKey,
+            std::sync::Arc<hygress_egress::guardrail::GuardrailClient>,
+        >,
+    >,
+}
+
+/// The (hot-reloadable) parameters that define one cached
+/// [`hygress_egress::guardrail::GuardrailClient`] (design §4.4 B4b). A policy
+/// reload with new parameters builds a new client; the previous one stays
+/// cached (bounded by the number of distinct configurations ever seen).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GuardrailClientKey {
+    /// The verdict service base URL.
+    pub url: String,
+    /// Per-request verdict timeout (milliseconds).
+    pub timeout_ms: u64,
+    /// Sustained RPS cap for verdict calls.
+    pub max_rps: u32,
+    /// Verdict cache TTL (seconds).
+    pub cache_ttl_secs: u64,
+}
+
+/// One per-key rate-limit bucket entry (design §4.1). Carries the spec that
+/// seeded it (for hot-reload detection: a policy change with different
+/// rps/burst resets the bucket) and the last activity timestamp (for idle
+/// eviction in the bootstrap periodic task).
+#[derive(Debug)]
+pub struct RateLimitEntry {
+    /// The `rps` of the spec that seeded this bucket.
+    pub spec_rps: f64,
+    /// The `burst` of the spec that seeded this bucket.
+    pub spec_burst: u64,
+    /// The last `now_ms` at which this key was checked.
+    pub last_active_ms: u64,
+    /// The token bucket itself.
+    pub bucket: hygress_core::prelude::TokenBucket,
 }
 
 /// A thin `Clone` handle over [`hygress_core::SharedConfig`] so [`GatewayState`]

@@ -12,6 +12,11 @@
 //! - `transform`    — ordered header transformer rules (remove/rename/dedupe/backup original-path)
 //! - `usage`        — `ModelUsageMetrics` payload + `completed` semantics (pure types)
 //! - `config`       — `ConfigData`/`RouteTable` snapshot + validation (arc-swap/dashmap-backed runtime state)
+//! - `policy`       — `PolicyConfig` + limits/quota/guardrail/route-policy config types (pure, serde)
+//! - `ratelimit`    — `RatLimiter` token-bucket rate limiter (ip/consumer; deterministic `now_ms`)
+//! - `quota`        — `QuotaEngine` fixed-window token quota (reserve/commit/release; deterministic `now_ms`)
+//! - `route_policy` — routing-policy action queries (`pin_matches`, `pick_override`)
+//! - `guardrail`    — `StaticRuleSet` + `ChunkScanner` (static rules, cross-chunk scan)
 //! - `error`        — crate error enum
 //!
 //! Contract constraints (see docs/design.md):
@@ -30,12 +35,17 @@
 pub mod config;
 pub mod destination;
 pub mod error;
+pub mod guardrail;
 pub mod matcher;
 pub mod model_mapping;
+pub mod policy;
 pub mod prelude;
+pub mod quota;
+pub mod ratelimit;
 pub mod registry;
 pub mod retry;
 pub mod route;
+pub mod route_policy;
 pub mod swrr;
 pub mod transform;
 pub mod usage;

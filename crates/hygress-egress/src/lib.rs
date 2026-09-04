@@ -1,7 +1,8 @@
 //! hygress-egress — out-of-band HTTP clients to GPUStack (design §7 plugins, §2.1.3 bypass contract).
 //!
-//! This crate is the **out-of-band** counterpart to the data plane: three clients that talk to the
-//! GPUStack server from outside the proxy's request cycle (they never proxy traffic themselves):
+//! This crate is the **out-of-band** counterpart to the data plane: four clients that talk to
+//! upstream services (the GPUStack server and the LLM guardrail service) from outside the proxy's
+//! request cycle (they never proxy traffic themselves):
 //!
 //! - [`token`] — derive the gateway auth token (HMAC-SHA256 of `jwt_secret_key` over
 //!   `gateway-metrics-push`) and resolve `jwt_secret_key` (env → `{data_dir}/jwt_secret_key` file →
@@ -20,6 +21,12 @@
 //!   `rewrite-target`/`$1$3`, `Authorization: Bearer` key swap, `Host` override, per-destination
 //!   model-mapping application for JSON/multipart bodies, forward-safe header copy). Pure enough to
 //!   unit test: no I/O of its own (the gateway dials the upstream).
+//! - [`guardrail`] — [`guardrail::GuardrailClient`]: the LLM guardrail verdict client (design
+//!   §4.4 B4b). `POST {base_url}` with `{"text": …}`; parses a lenient [`guardrail::GuardVerdict`]
+//!   (`{blocked, reason}`). New vs `forward_auth`: a `Semaphore` bounds concurrency and a `DashMap`
+//!   caches verdicts by (whitespace-normalized) text for a TTL. **This client only reports**: a 2xx
+//!   → `Ok(Some(verdict))`; a 4xx/5xx or transport failure → `Err`. It does NOT fail-open/closed —
+//!   that decision is the gateway's `fail_mode` (D-14; not-configured = pass-through).
 //!
 //! Tests may spin up **real** local HTTP servers (hand-rolled `tokio` `TcpListener` in `tests/` or
 //! `#[cfg(test)]`) — test doubles are allowed in test code ONLY, never in implementation code.
@@ -30,9 +37,11 @@
 //! data-plane lane consumes. Do not rename the pinned types/functions:
 //! `token::{derive_gateway_token, resolve_jwt_key}`,
 //! `forward_auth::{Client, ForwardAuthRequest, ForwardAuthVerdict}`,
-//! `usage_sink::GpustackSink`, `provider::ProviderClient`.
+//! `usage_sink::GpustackSink`, `provider::ProviderClient`,
+//! `guardrail::{GuardrailClient, GuardVerdict}`.
 
 pub mod forward_auth;
+pub mod guardrail;
 pub mod provider;
 pub mod token;
 pub mod usage_sink;
@@ -43,8 +52,10 @@ use thiserror::Error as ThisError;
 ///
 /// Transport/HTTP failures that the contract treats as **fail-open** (forward-auth) or
 /// **drop-with-log** (usage push) are NOT surfaced here — they are absorbed by the client and
-/// reported via tracing. `Error` is returned only for genuinely unrecoverable/programming
-/// conditions (missing/empty key, malformed base URL).
+/// reported via tracing. `Error` is otherwise returned for genuinely unrecoverable/programming
+/// conditions (missing/empty key, malformed base URL) **and** for a failed guardrail verdict call
+/// ([`Error::GuardrailCall`]): there the failure is *reported* (not absorbed) so the gateway can
+/// apply its `fail_mode` (D-14).
 #[derive(Debug, ThisError)]
 pub enum Error {
     /// The `jwt_secret_key` has no source (neither env nor the `{data_dir}/jwt_secret_key` file).
@@ -64,6 +75,15 @@ pub enum Error {
     /// shape; surfaced for completeness).
     #[error("serializing usage payload: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// The guardrail LLM verdict call failed — a transport error (connect/DNS/timeout) or a
+    /// non-2xx HTTP status (or a malformed 2xx body).
+    ///
+    /// Per design §4.4 B4b / D-14, **how the caller reacts** (fail-open vs fail-closed) is the
+    /// gateway's job (its `fail_mode`): this crate only reports that the call failed and does NOT
+    /// imply either direction (it does not fail-open like forward-auth, nor fail-closed itself).
+    /// The message carries the cause for logging/diagnostics.
+    #[error("guardrail verdict call failed: {0}")]
+    GuardrailCall(String),
 }
 
 /// Crate result alias (keeps the pinned `Result<T, _>` signatures short and unambiguous).

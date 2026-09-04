@@ -41,6 +41,9 @@ pub mod metrics;
 pub mod pipeline;
 #[cfg(feature = "integrations")]
 pub mod pipe;
+pub mod policy_loader;
+pub mod quota;
+pub mod response_pipeline;
 pub mod stats;
 pub mod tls_store;
 
@@ -49,3 +52,6 @@ pub use context::{
     RouteInfo, SharedConfigHandle, UsageTarget,
 };
 pub use error::GatewayError;
+pub use policy_loader::{MergedPolicy, PolicyHandle, merge_policy};
+pub use quota::QuotaReservation;
+pub use response_pipeline::ResponsePipeline;

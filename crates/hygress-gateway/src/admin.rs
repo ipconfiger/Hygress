@@ -36,9 +36,10 @@ pub struct AdminState {
     pub metrics: Arc<Metrics>,
     /// Admin bearer token. `None` ⇒ the gated endpoints deny (fail-closed).
     pub admin_token: Option<String>,
-    /// Optional reload hook (the control-plane poll swap). `None` ⇒ `/reload`
-    /// reports 501 (reload not wired).
-    pub reloader: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Optional reload hook. Returns `true` on success (new policy swapped),
+    /// `false` on failure (last-known-good kept). `None` ⇒ `/reload` reports
+    /// 501 (reload not wired).
+    pub reloader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl AdminState {
@@ -46,7 +47,7 @@ impl AdminState {
     pub fn new(
         metrics: Arc<Metrics>,
         admin_token: Option<String>,
-        reloader: Option<Arc<dyn Fn() + Send + Sync>>,
+        reloader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
         Self {
             metrics,
@@ -87,8 +88,15 @@ impl AdminState {
                 }
                 match &self.reloader {
                     Some(reload) => {
-                        reload();
-                        AdminResp::json(200, "ok", "config reloaded")
+                        if reload() {
+                            AdminResp::json(200, "ok", "policy reloaded")
+                        } else {
+                            AdminResp::json(
+                                500,
+                                "reload_failed",
+                                "reload failed; last-known-good policy retained",
+                            )
+                        }
                     }
                     None => AdminResp::json(501, "not_implemented", "reload is not wired"),
                 }
@@ -229,9 +237,10 @@ mod tests {
     fn reload_invokes_reloader() {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = counter.clone();
-        let reloader: Arc<dyn Fn() + Send + Sync> =
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> =
             Arc::new(move || {
                 c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
             });
         let s = AdminState::new(
             Arc::new(Metrics::new()),
@@ -242,7 +251,23 @@ mod tests {
         ok.insert("authorization", "Bearer secret");
         let r = s.route("POST", "/reload", &ok);
         assert_eq!(r.status, 200);
+        assert!(r.body.contains("policy reloaded"));
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reload_failure_reports_500() {
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
+        let s = AdminState::new(
+            Arc::new(Metrics::new()),
+            Some("secret".to_string()),
+            Some(reloader),
+        );
+        let mut ok = h();
+        ok.insert("authorization", "Bearer secret");
+        let r = s.route("POST", "/reload", &ok);
+        assert_eq!(r.status, 500);
+        assert!(r.body.contains("last-known-good"));
     }
 
     #[test]

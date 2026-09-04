@@ -45,6 +45,7 @@ pub mod model_mapper;
 pub mod model_router;
 pub mod registry_resolve;
 pub mod route_match;
+pub mod routing_policy;
 pub mod set_pre_route_headers;
 pub mod swrr_select;
 pub mod transformer;
@@ -201,6 +202,11 @@ fn prepare_inner(
         usage,
         selected_service,
         started_at_ms,
+        // Routing-policy overrides (design §4.3) are applied by the pipe after
+        // `route_match` (the pure pipeline cannot know the matched route's
+        // policy); they start absent.
+        override_timeout_ms: None,
+        override_retries: None,
     })
 }
 
@@ -377,6 +383,8 @@ mod tests {
             usage: None,
             selected_service: "model-1-10.static".into(),
             started_at_ms: 0,
+            override_timeout_ms: None,
+            override_retries: None,
         }
     }
 

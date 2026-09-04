@@ -25,6 +25,13 @@ struct Inner {
     fallback_total: IntCounter,
     auth_decisions: IntCounterVec,
     active_requests: IntGauge,
+    // Extension stages (design §4): rate limiting / quota / routing policy /
+    // guardrail counters.
+    rate_limit_denied: IntCounterVec,
+    quota_denied: IntCounter,
+    quota_soft_exceed: IntCounter,
+    policy_applied: IntCounterVec,
+    guardrail_blocked: IntCounterVec,
 }
 
 impl Metrics {
@@ -83,6 +90,40 @@ impl Metrics {
         let active_requests =
             IntGauge::new("hygress_active_requests", "In-flight requests.")
                 .expect("active_requests");
+        let rate_limit_denied = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_rate_limit_denied_total",
+                "Rate-limit denials by dimension (ip/consumer).",
+            ),
+            &["dimension"],
+        )
+        .expect("rate_limit_denied");
+        let quota_denied = IntCounter::new(
+            "hygress_quota_denied_total",
+            "Token-quota hard-limit denials (429).",
+        )
+        .expect("quota_denied");
+        let quota_soft_exceed = IntCounter::new(
+            "hygress_quota_soft_exceed_total",
+            "Token-quota soft-limit exceeds (allowed, warning bit).",
+        )
+        .expect("quota_soft_exceed");
+        let policy_applied = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_policy_applied_total",
+                "Routing-policy application outcomes (applied true/false).",
+            ),
+            &["applied"],
+        )
+        .expect("policy_applied");
+        let guardrail_blocked = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_guardrail_blocked_total",
+                "Guardrail blocks by side (in/out).",
+            ),
+            &["side"],
+        )
+        .expect("guardrail_blocked");
 
         let collectors: Vec<Box<dyn Collector>> = vec![
             Box::new(requests_total.clone()),
@@ -94,6 +135,11 @@ impl Metrics {
             Box::new(fallback_total.clone()),
             Box::new(auth_decisions.clone()),
             Box::new(active_requests.clone()),
+            Box::new(rate_limit_denied.clone()),
+            Box::new(quota_denied.clone()),
+            Box::new(quota_soft_exceed.clone()),
+            Box::new(policy_applied.clone()),
+            Box::new(guardrail_blocked.clone()),
         ];
         for c in collectors {
             registry.register(c).expect("metric registration");
@@ -111,6 +157,11 @@ impl Metrics {
                 fallback_total,
                 auth_decisions,
                 active_requests,
+                rate_limit_denied,
+                quota_denied,
+                quota_soft_exceed,
+                policy_applied,
+                guardrail_blocked,
             }),
         }
     }
@@ -165,6 +216,44 @@ impl Metrics {
 
     pub fn active_requests_dec(&self) {
         self.inner.active_requests.dec();
+    }
+
+    /// A rate-limit denial (design §4.1): `dimension` is `ip` or `consumer`.
+    pub fn record_rate_limit_denied(&self, dimension: &str) {
+        self.inner
+            .rate_limit_denied
+            .with_label_values(&[dimension])
+            .inc();
+    }
+
+    /// A token-quota hard-limit denial (429, design §4.2).
+    pub fn record_quota_denied(&self) {
+        self.inner.quota_denied.inc();
+    }
+
+    /// A token-quota soft-limit exceed (allowed; the warning bit, design §4.2).
+    pub fn record_quota_soft_exceed(&self) {
+        self.inner.quota_soft_exceed.inc();
+    }
+
+    /// A routing-policy application outcome (design §4.3 / D-2): `applied`
+    /// `true` when a policy action took effect, `false` when the policy was
+    /// present but none of its actions did (e.g. an `override_route` miss →
+    /// runtime fallback).
+    pub fn record_policy_applied(&self, applied: bool) {
+        self.inner
+            .policy_applied
+            .with_label_values(&[if applied { "true" } else { "false" }])
+            .inc();
+    }
+
+    /// A guardrail block (design §4.4): `side` is `in` (request side) or `out`
+    /// (response side / B4c).
+    pub fn record_guardrail_blocked(&self, side: &str) {
+        self.inner
+            .guardrail_blocked
+            .with_label_values(&[side])
+            .inc();
     }
 
     /// Render all metrics in Prometheus text exposition format.

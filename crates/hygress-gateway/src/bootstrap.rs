@@ -49,14 +49,18 @@ use crate::metrics::Metrics;
 use crate::stats::{StatsService, StatsState};
 use crate::tls_store::SniStore;
 
-/// The always-available runtime state (control-plane holder + metrics + TLS).
-/// The egress/adapter-wired [`crate::context::GatewayState`] is layered on top of this at
-/// P5 under `integrations`.
+/// The always-available runtime state (control-plane holder + metrics + TLS +
+/// policy). The egress/adapter-wired [`crate::context::GatewayState`] is layered on top of
+/// this at P5 under `integrations`.
 pub struct DataState {
     pub config: GatewayConfig,
     pub shared: SharedConfigHandle,
     pub metrics: Arc<Metrics>,
     pub tls: SniStore,
+    /// The policy handle (design §2.1 / D-7): `ArcSwap<PolicyConfig>` + mtime
+    /// poll + admin `/reload`. Built from `config.policy_path`; a missing
+    /// file is the all-pass default, a malformed file starts all-pass + warn.
+    pub policy: Arc<crate::policy_loader::PolicyHandle>,
 }
 
 impl DataState {
@@ -67,21 +71,33 @@ impl DataState {
     pub fn new(config: GatewayConfig, data: ConfigData) -> Result<Self, GatewayError> {
         let shared = SharedConfig::new(data)
             .map_err(|issues| GatewayError::Other(format!("initial snapshot rejected: {issues:?}")))?;
+        let policy = Arc::new(crate::policy_loader::PolicyHandle::new(
+            config.policy_path.clone(),
+        ));
         Ok(Self {
             config,
             shared: SharedConfigHandle::new(shared),
             metrics: Arc::new(Metrics::new()),
             tls: SniStore::new(),
+            policy,
         })
     }
 
     /// Real admin service state (`/metrics` `/healthz` `/reload` `/stats/usage`).
-    /// The reload hook is wired at P5 to the control-plane poll swap.
+    ///
+    /// The reload hook is wired to the **policy** reload (design §2.1 / D-7):
+    /// the closure captures the [`PolicyHandle`] and forces a reload from the
+    /// configured path. Returns `true` on success (new policy swapped),
+    /// `false` on failure (last-known-good retained; the admin endpoint
+    /// reports 500 so operators can distinguish).
     pub fn admin_state(&self) -> Arc<AdminState> {
+        let policy = self.policy.clone();
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || policy.reload());
         Arc::new(AdminState::new(
             self.metrics.clone(),
             self.config.admin_token.clone(),
-            None,
+            Some(reloader),
         ))
     }
 
@@ -358,6 +374,64 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             sink,
             upstream: Arc::new(ProviderClient),
             metrics: ds.metrics.clone(),
+            // Design §2.1: the policy handle (hot-reloadable `ArcSwap` + mtime
+            // poll + admin `/reload`).
+            policy: Some(ds.policy.clone()),
+            // Design §4.1: per-key rate-limit token buckets (ip:/consumer: keys).
+            ratelimit_buckets: Arc::new(dashmap::DashMap::new()),
+            // Design §4.2: the in-memory token-quota engine.
+            quota: Arc::new(hygress_core::prelude::QuotaEngine::new()),
+            quota_k: config.quota_k,
+            // Design §4.4 B4b: the shared egress client + LLM guardrail
+            // endpoint (a `None` URL = LLM guardrail not configured, D-14).
+            http: http.clone(),
+            guardrail_url: config.guardrail_url.clone(),
+            guardrail_clients: Arc::new(dashmap::DashMap::new()),
+        });
+
+        // 3b. Design §2.1 / D-7: the mtime 1s poll task (the same cadence as
+        //     the adapter poll). A changed `policy.yaml` swaps the live
+        //     `ArcSwap` on the next tick; the admin `POST /reload` forces it.
+        //     Also performs periodic eviction of idle quota counters and
+        //     rate-limit buckets (BLOCK-2: leak prevention).
+        let policy_poll = ds.policy.clone();
+        let poll_interval = config.poll_interval;
+        let quota_evict = gateway_state.quota.clone();
+        let ratelimit_evict = gateway_state.ratelimit_buckets.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(poll_interval);
+            interval.tick().await; // the first tick is immediate
+            // Idle threshold: 5 minutes (hardcoded; not currently
+            // configurable via env).
+            let idle_ms: u64 = 300_000;
+            loop {
+                interval.tick().await;
+                policy_poll.poll();
+                // Evict idle quota counters (BLOCK-2: spec-agnostic leak
+                // prevention; complements the window-based `gc_stale`).
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let evicted = quota_evict.evict_idle(now_ms, idle_ms);
+                if evicted > 0 {
+                    debug!(evicted, "quota: evicted idle counters");
+                }
+                // Evict idle rate-limit buckets (same idle threshold).
+                let cutoff = now_ms.saturating_sub(idle_ms);
+                let mut removed = 0usize;
+                ratelimit_evict.retain(|_, e| {
+                    if e.last_active_ms >= cutoff {
+                        true
+                    } else {
+                        removed += 1;
+                        false
+                    }
+                });
+                if removed > 0 {
+                    debug!(removed, "ratelimit: evicted idle buckets");
+                }
+            }
         });
 
         // 4. Control plane: build the Controller, optionally seed the topology-B IngressClass,

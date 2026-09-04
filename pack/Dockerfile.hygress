@@ -25,6 +25,9 @@ RUN mkdir -p /etc/s6-overlay/s6-rc.d.dist/gateway \
 ARG HYGRESS_BIN=target/release/hygress
 COPY ${HYGRESS_BIN} /usr/local/bin/hygress
 
+# Policy file directory (design §3: /etc/hygress/policy.yaml; missing = all-pass)
+RUN mkdir -p /etc/hygress
+
 # s6 surgery scripts: gateway=hygress launcher; pilot/controller long-sleep no-ops
 # that SIGNAL s6 readiness on notification-fd 3 (required so the s6-rc `change top`
 # transition settles and the main gpustack process starts); supercronic without the

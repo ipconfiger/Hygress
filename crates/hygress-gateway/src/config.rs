@@ -52,6 +52,17 @@ pub struct GatewayConfig {
     /// Max wait for the adapter's FIRST snapshot before binding the data plane
     /// (`HYGRESS_SNAPSHOT_TIMEOUT`, seconds or `300s`/`5000ms`, default 60s).
     pub snapshot_timeout: Duration,
+    /// Policy file path (design §2.1 / D-7; `HYGRESS_POLICY_PATH`, default
+    /// `/etc/hygress/policy.yaml`). A missing file is the all-pass default; a
+    /// malformed file keeps the last-known-good (warn).
+    pub policy_path: String,
+    /// Token-quota estimate divisor (design §4.2 / D-13; `HYGRESS_QUOTA_K`,
+    /// default 4): `est = ceil(request_content_bytes / K)`. Clamped to ≥ 1.
+    pub quota_k: u64,
+    /// The LLM guardrail verdict service URL (design §4.4 B4b / D-14;
+    /// `HYGRESS_GUARDRAIL_URL`). `None` ⇒ the LLM guardrail is not configured
+    /// (pass-through; `fail_mode` never applies — D-14).
+    pub guardrail_url: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -70,6 +81,9 @@ impl Default for GatewayConfig {
             topology_b: false,
             api_ready_timeout: Duration::from_secs(30),
             snapshot_timeout: Duration::from_secs(60),
+            policy_path: "/etc/hygress/policy.yaml".to_string(),
+            quota_k: 4,
+            guardrail_url: None,
         }
     }
 }
@@ -131,6 +145,17 @@ impl GatewayConfig {
         if let Some(v) = clean(get("HYGRESS_SNAPSHOT_TIMEOUT")) {
             c.snapshot_timeout = parse_duration(&v);
         }
+        if let Some(v) = clean(get("HYGRESS_POLICY_PATH")) {
+            c.policy_path = v;
+        }
+        if let Some(v) = clean(get("HYGRESS_QUOTA_K")) {
+            if let Ok(k) = v.parse::<u64>() {
+                c.quota_k = k.max(1);
+            }
+        }
+        if let Some(v) = clean(get("HYGRESS_GUARDRAIL_URL")) {
+            c.guardrail_url = Some(v);
+        }
         c
     }
 
@@ -189,6 +214,9 @@ mod tests {
         assert_eq!(c.pilot_agent_metrics_port, 15020);
         assert_eq!(c.api_ready_timeout, Duration::from_secs(30));
         assert_eq!(c.snapshot_timeout, Duration::from_secs(60));
+        assert_eq!(c.policy_path, "/etc/hygress/policy.yaml");
+        assert_eq!(c.quota_k, 4);
+        assert_eq!(c.guardrail_url, None);
     }
 
     #[test]
@@ -206,6 +234,9 @@ mod tests {
             ("GATEWAY_PILOT_AGENT_METRICS_PORT", "15099"),
             ("HYGRESS_API_READY_TIMEOUT", "300"),
             ("HYGRESS_SNAPSHOT_TIMEOUT", "300s"),
+            ("HYGRESS_POLICY_PATH", "/etc/hygress/custom-policy.yaml"),
+            ("HYGRESS_QUOTA_K", "8"),
+            ("HYGRESS_GUARDRAIL_URL", "http://127.0.0.1:9090/v1/classify"),
         ]);
         assert_eq!(c.http_port, 9000);
         assert_eq!(c.tls_port, 9443);
@@ -219,6 +250,9 @@ mod tests {
         assert_eq!(c.pilot_agent_metrics_port, 15099);
         assert_eq!(c.api_ready_timeout, Duration::from_secs(300));
         assert_eq!(c.snapshot_timeout, Duration::from_secs(300));
+        assert_eq!(c.policy_path, "/etc/hygress/custom-policy.yaml");
+        assert_eq!(c.quota_k, 8);
+        assert_eq!(c.guardrail_url.as_deref(), Some("http://127.0.0.1:9090/v1/classify"));
     }
 
     #[test]
@@ -242,6 +276,14 @@ mod tests {
     fn bad_port_falls_back_to_default() {
         let c = parse(&[("GATEWAY_HTTP_PORT", "not-a-port")]);
         assert_eq!(c.http_port, 80);
+    }
+
+    #[test]
+    fn quota_k_bad_or_zero_falls_back() {
+        // A non-numeric K keeps the default (4); a zero K is clamped to 1.
+        assert_eq!(parse(&[("HYGRESS_QUOTA_K", "not-a-number")]).quota_k, 4);
+        assert_eq!(parse(&[("HYGRESS_QUOTA_K", "0")]).quota_k, 1);
+        assert_eq!(parse(&[("HYGRESS_QUOTA_K", "7")]).quota_k, 7);
     }
 
     #[test]

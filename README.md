@@ -4,12 +4,17 @@
 > 其内嵌 Higress 三进程（pilot / controller / envoy gateway），**不修改 GPUStack 任何一行 Python**。
 > 更强的性能、更小的资源占用、更清晰的可观测性与原生多租户能力。
 
-- 状态：**真机 A/B 验证通过**（live GPUStack v2.2.3 + RTX4090 worker + qwen2.5-0.5b-instruct）
+- 状态：**真机 A/B 验证通过**（live GPUStack v2.2.3 + RTX4090 worker + qwen2.5-0.5b-instruct）；
+  **升级延伸能力已实现并通过真机 e2e**
 - 数据面：Pingora terminate-mode（单二进制，无 Wasm 运行时 / 无 Envoy）
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
-- 质量：368 个测试全绿 · clippy 0 警告 · **零 mock/stub** · 经两轮 oracle 高精度交叉审核（Gate-1 / Gate-2 均 9/10）
+- 质量：**492 个测试全绿**（基线 368 + 延伸能力 124）· clippy 0 警告 · **零 mock/stub** ·
+  经多轮 oracle 高精度交叉审核（Gate-1/Gate-2 9/10；升级设计两轮无阻塞；升级实现二轮 BLOCK 闭环）
+- **延伸能力**：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 1s 热重载 +
+  admin `/reload`；真机验证：限流 429/配额 429/护栏 403 实际生效）
 - 主要文档：`docs/design.md`（设计 v1.5）· `docs/research/plugin-contract-pin.md`（字节级外部契约）
   · `docs/research/gpustack-validation/REPORT.md`（真机验证证据）· `docs/dev-process.md`（开发全过程）
+  · `docs/extensions-audit.md` + `docs/extensions-design.md`（延伸能力审核与设计/实现记录）
 
 ---
 
@@ -215,7 +220,9 @@ docker compose -f compose.yaml up -d gpustack-server
 
 **文档索引**
 - `docs/design.md` — 设计 v1.5（现状分析 / 契约 / 架构 / 相位 / 部署与运维 / 兼容性矩阵）
+- `docs/dev-process.md` — 开发全过程记录（设计→实现→门禁→打包→真机 A/B→修复清单）
+- `docs/extensions-audit.md` — 网关延伸能力审核（token 配额 / 限流 / 路由策略 / 安全护栏的「已实现 / 需实现 / 不必实现」与配置来源边界）
+- `docs/extensions-design.md` — 升级开发设计（终版，经 @oracle 两轮高精度交叉审核，**无阻塞、可开始 M0 实现**）
 - `docs/research/plugin-contract-pin.md` — 字节级外部 wire 契约（9 插件 / ext-auth / usage / 头）
 - `docs/research/gpustack-validation/` — 真机验证（REPORT、CRD fixtures、hygress 日志、usage 行）
-- `docs/dev-process.md` — 开发全过程记录（设计→实现→门禁→打包→真机 A/B→修复清单）
 - `pack/` — 可部署产物（Dockerfile.hygress + s6 手术脚本）

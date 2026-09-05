@@ -92,8 +92,13 @@
   Result.filter→ok().filter、tracing::warn 按 feature 门控导入；pipe.rs while-let 多余括号。
 
 ## 8. 诚实声明（B9.5）
-- 纯静态实施 + 编译/测试/静态审计门禁；**无真机复跑**——ORA3-MAJ-1 的"kill controller 后出现可告警陈旧信号"
-  与 ORA3-M4 的 shutdown drain 属运行时行为，需真机/进程级验证（验收标准已写入 checklist，待下轮真机会话）。
+- 门禁后已补**真机验证 ✅**（镜像 f85cb78e，远端 /root/hygress-b3/b95.log + b95-verdict.txt，回滚点
+  gpustack:hygress-b7）：ORA3-MAJ-1 三项控制面指标活体（watch_error 6 类 1→2 / store 1→2 / last-store 前移）、
+  tick-only ×6、env unparsable=0、启动摘要与收敛模式日志就位、watcher 70s 日志增量 +1690B、chat 基线 200。
+- ORA3-M2 `/reload` 缺文件 500 的**运行时探测未执行**：容器未设 HYGRESS_ADMIN_TOKEN，fail-closed 下 /reload
+  按设计拒绝（无 token 401）；该路径由单测 + 集成 e2e 覆盖。需真机免 token 触发需临时注入 admin token（下轮可选）。
+- M9"中途断连冲刷活快照"与 MAJ-1"kill controller 出可告警信号"为破坏性运行时行为，未在真机演练（需注入故障，
+  由单测/e2e 覆盖并记录验收标准）。
 - 仓库在 rustfmt 默认（max_width=100）下并非全量排版干净（历史风格行宽更宽、未强制 fmt）；本批未做全仓格式化，
   只格式化语义文件会引入噪音，故维持现状并在 checklist 记录。
 - 集成维三项诚实未知维持：AM-2 真实流式引擎判别、拓扑 A ≤30s 收敛对 UI create→infer 流敏感度、默认安装 :443。

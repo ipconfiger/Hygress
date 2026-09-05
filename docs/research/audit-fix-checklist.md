@@ -109,3 +109,14 @@
 门禁（B9.5 后）：**608 tests**（35 integration e2e 全绿）/ clippy `--workspace --all-targets --all-features` 0 /
 `-p hygress-gateway --no-default-features` 0 / 无新依赖（Cargo.lock 未动）。注：本批实施后仓库在 rustfmt
 默认（max_width=100）下非全量排版干净（历史风格更宽、未强制 fmt），未做全仓格式化以免噪音入批。
+
+### B9.5 真机验证 ✅（镜像 f85cb78e，远端 /root/hygress-b3/b95.log + b95-verdict.txt；回滚点 gpustack:hygress-b7）
+- readyz=200@~18s；hygress=1 / envoy·pilot=0；chat 基线 200 `HYGRESS_B95_OK`（usage 35/6）；末次 readyz=200，server 稳定。
+- **ORA3-MAJ-1 活体成立**：`hygress_control_watch_error_total{class="permanent",kind=<6 类>}` 1→2（60s 永久退避周期递增）；
+  `hygress_control_snapshot_store_total` 1→2；`last_store_timestamp_seconds` 前移 ~31s（30s tick 活体）；
+  `fallback_exhausted_total` 0 / `usage_push_dropped_total` 0（真实 chat 后仍 0 = 行未丢）。
+- tick-only 收敛标记 ×6（每 kind 各一次，限速门）；env unparsable=0（ORA3-M1 无误报）；启动脱敏摘要行就位
+  （topology_b=false / admin_token_set=false / ext_auth_fail_mode=closed / ext_auth_timeout_ms=30000）。
+- watcher 节律：70s 日志增量 +1690B（≈6 行，对比修复前 ~2000 行/s）——退避+限速持续成立。
+- ORA3-M2 `/reload` 运行时探测：SKIP——容器未设 HYGRESS_ADMIN_TOKEN，fail-closed 下 /reload 按设计拒绝；
+  缺文件保 LKG 返回 false 的 500 行为由单测 + 35 e2e 覆盖（本机无法免 token 触发）。

@@ -19,6 +19,13 @@
 //!   * `UsageSnapshot::feed` (SSE steady)     -> O(tail sliver),  < 16 KiB
 //!   * linear ratio                            allocs(1MiB) < 4 * allocs(256KiB)
 //!   * wall-time ratio (release only)          t(1MiB) < 6 * t(256KiB)
+//!
+//! AM-6 (header materialization, `am6_*` tests): the pure header stages —
+//! `prepare` end-to-end, `build_outbound` (per-candidate deep copy), and the
+//! dial pair materialization (`HeaderMap::into_pairs`, drain vs shared clone).
+//! The ceilings below are intentionally GENEROUS (the coordinator tightens them
+//! after the first real run); each test prints `AM6 measured ...` with the
+//! bytes + allocation count for that pass.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,9 +33,17 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use bytes::Bytes;
-use hygress_core::prelude::{ModelMapping, UsageSchema, UsageSnapshot};
+use hygress_core::prelude::{
+    ConfigData, Destination, HeaderMap, ModelMapping, ModelRouterConfig, ModelRouterSettings,
+    PathPred, Registry, RouteKind, RouteRule, RouteTable, SharedConfig, UsageSchema, UsageSnapshot,
+};
 use hygress_gateway::body::{extract_model, rewrite_json_model};
+use hygress_gateway::context::{Scheme, hdr};
 use hygress_gateway::pipeline::model_mapper::apply_with_current;
+use hygress_gateway::pipeline::{self, PipelineCtx};
+use hygress_gateway::{
+    CandidateTarget, InboundRequest, OutboundRequest, PreparedRequest, SharedConfigHandle,
+};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -46,6 +61,10 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static MEASURING: AtomicBool = AtomicBool::new(false);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// AM-6: allocation COUNT (one event per alloc/alloc_zeroed/realloc while
+/// measuring) — lets the AM-6 benches print the "small-allocations per request"
+/// figure the charter tracks, alongside the byte total.
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 
@@ -53,12 +72,14 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if MEASURING.load(Ordering::Relaxed) {
             ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if MEASURING.load(Ordering::Relaxed) {
             ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -72,6 +93,7 @@ unsafe impl GlobalAlloc for Counting {
             if new_size > layout.size() {
                 ALLOC_BYTES.fetch_add((new_size - layout.size()) as u64, Ordering::Relaxed);
             }
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -84,10 +106,24 @@ static GLOBAL: Counting = Counting;
 /// Inputs must be built BEFORE the gate so their setup cost is not counted.
 fn measure(f: impl FnOnce()) -> u64 {
     ALLOC_BYTES.store(0, Ordering::Relaxed);
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
     MEASURING.store(true, Ordering::Relaxed);
     f();
     MEASURING.store(false, Ordering::Relaxed);
     ALLOC_BYTES.load(Ordering::Relaxed)
+}
+
+/// Run `f` under the gate; return (allocated bytes, allocation count).
+fn measure_counted(f: impl FnOnce()) -> (u64, u64) {
+    ALLOC_BYTES.store(0, Ordering::Relaxed);
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
+    MEASURING.store(true, Ordering::Relaxed);
+    f();
+    MEASURING.store(false, Ordering::Relaxed);
+    (
+        ALLOC_BYTES.load(Ordering::Relaxed),
+        ALLOC_COUNT.load(Ordering::Relaxed),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -284,5 +320,312 @@ fn assert_scan_ratio(ratio: f64) {
     assert!(
         t_large < ratio * t_small.max(1e-9),
         "scan time not linear: 256KiB={t_small:.6}s x{ITER}, 1MiB={t_large:.6}s x{ITER} (ratio {ratio})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AM-6: header-materialization allocation accounting for the PURE header
+// stages (counting allocator; fixtures built BEFORE each gate).
+// ---------------------------------------------------------------------------
+
+/// A registry-resolved candidate fixture (non-provider: no key-swap).
+fn candidate(service_name: &str) -> CandidateTarget {
+    CandidateTarget {
+        service: format!("{service_name}:80"),
+        service_name: service_name.to_string(),
+        address: "10.0.0.5:8081".into(),
+        proxied: false,
+        scheme: Scheme::Http,
+        proxy: None,
+    }
+}
+
+/// The config/table/shared/SWRR fixtures a `prepare` needs (a Main route keyed
+/// `org1/llama-3-8b` over one registry destination, body-driven model
+/// resolution on `/v1/chat/completions`). Built once per test, BEFORE the gate.
+fn model_route_env() -> (ConfigData, RouteTable, SharedConfigHandle, ModelRouterConfig) {
+    let data = ConfigData {
+        routes: vec![RouteRule::new(
+            "org1/llama-3-8b",
+            RouteKind::Main,
+            vec![PathPred::new(".*")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .expect("route fixture")],
+        registries: vec![
+            Registry::new("model-1-10.static:80", "10.0.0.5:8081").expect("registry fixture"),
+        ],
+        model_router: ModelRouterSettings {
+            enable_on_path_suffix: vec!["/v1/chat/completions".into()],
+            ..Default::default()
+        },
+        ..ConfigData::default()
+    };
+    let router = ModelRouterConfig::from_settings(&data.model_router);
+    let table = RouteTable::rebuild(&data).expect("route-table fixture");
+    let shared = SharedConfigHandle::new(SharedConfig::new(data.clone()).expect("shared fixture"));
+    (data, table, shared, router)
+}
+
+/// A realistic model-route inbound: ~13 headers (host / content-length /
+/// content-type / authorization / x-higress-llm-model / x-organization-id /
+/// cookie / ...) plus the mirrored `:path`, and a JSON chat body whose model
+/// matches the route key (R-5 identity: prepare does NOT splice the body).
+fn realistic_model_route_inbound() -> InboundRequest {
+    let body = br#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("host", "llm.gpustack.local"),
+        ("content-type", "application/json"),
+        ("authorization", "Bearer sk-client-0123456789abcdef"),
+        ("user-agent", "curl/8.4.0"),
+        ("accept", "application/json"),
+        ("x-real-ip", "203.0.113.7"),
+        ("x-forwarded-for", "203.0.113.7"),
+        ("x-request-id", "req-0123456789abcdef"),
+        ("x-higress-llm-model", "org1/llama-3-8b"),
+        ("x-organization-id", "org-42"),
+        ("cookie", "session=abc123"),
+    ] {
+        headers.insert(name, value);
+    }
+    headers.insert("content-length", body.len().to_string());
+    // `read_headers` mirrors `:path` into the map (the transformer backstops it).
+    headers.insert(hdr::PATH, "/v1/chat/completions");
+    InboundRequest {
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        query: String::new(),
+        headers,
+        body: Bytes::from_static(body),
+        content_type: "application/json".into(),
+        client_ip: "203.0.113.7".into(),
+        host: "llm.gpustack.local".into(),
+    }
+}
+
+#[test]
+fn am6_prepare_model_route_end_to_end() {
+    let _g = TEST_LOCK.lock().unwrap();
+    // Fixtures built BEFORE the gate.
+    let inbound = realistic_model_route_inbound();
+    let (data, table, shared, router) = model_route_env();
+    let ctx = PipelineCtx {
+        data: &data,
+        table: &table,
+        config: &shared,
+        router: &router,
+    };
+    let mut prepared: Option<PreparedRequest> = None;
+    let (bytes, allocs) = measure_counted(|| {
+        prepared = Some(pipeline::prepare(&inbound, &ctx).expect("fixture must route"));
+    });
+    eprintln!(
+        "AM6 measured prepare model-route end-to-end: {bytes} bytes / {allocs} allocs"
+    );
+    let p = prepared.expect("prepare succeeded");
+    assert!(p.route.is_model_route);
+    assert_eq!(p.base_headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
+    assert!(
+        bytes < 8 * KIB as u64,
+        "AM6 prepare allocated {bytes} bytes (measured 3018 @ 9784f04; ceiling < 8 KiB)"
+    );
+}
+
+#[test]
+fn am6_build_outbound_single_candidate() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let inbound = realistic_model_route_inbound();
+    let (data, table, shared, router) = model_route_env();
+    let ctx = PipelineCtx {
+        data: &data,
+        table: &table,
+        config: &shared,
+        router: &router,
+    };
+    // Fixture: one prepared request (its own prepare is NOT measured).
+    let p = pipeline::prepare(&inbound, &ctx).expect("fixture routes");
+    let c = candidate("model-1-10.static");
+    let mut out: Option<OutboundRequest> = None;
+    let (bytes, allocs) = measure_counted(|| {
+        out = Some(pipeline::build_outbound(
+            "POST",
+            &p,
+            &c,
+            &HeaderMap::new(),
+            &[],
+        ));
+    });
+    eprintln!(
+        "AM6 measured build_outbound 1 candidate (registry, no token swap): {bytes} bytes / {allocs} allocs"
+    );
+    let out = out.expect("outbound built");
+    assert_eq!(
+        out.headers.get(hdr::MODEL_INSTANCE_OUT),
+        Some("model-1-10.static")
+    );
+    assert_eq!(out.headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
+    assert_eq!(out.headers.get("content-length"), None, "hop-by-hop stripped");
+    assert!(
+        bytes < 8 * KIB as u64,
+        "AM6 build_outbound (1 candidate) allocated {bytes} bytes (measured 3865; ceiling < 8 KiB)"
+    );
+}
+
+#[test]
+fn am6_build_outbound_with_ext_auth_writeback() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let inbound = realistic_model_route_inbound();
+    let (data, table, shared, router) = model_route_env();
+    let ctx = PipelineCtx {
+        data: &data,
+        table: &table,
+        config: &shared,
+        router: &router,
+    };
+    let p = pipeline::prepare(&inbound, &ctx).expect("fixture routes");
+    let c = candidate("model-1-10.static");
+    // Realistic ext-auth write-back (an allowed ai-route verdict replaces the
+    // client credential + adds cookie / consumer / auth-cache).
+    let wb = HeaderMap::from_iter([
+        (hdr::AUTHORIZATION, "Bearer reg-token-abcdefgh".to_string()),
+        (hdr::COOKIE, "session=writeme".to_string()),
+        (hdr::MSE_CONSUMER, "ak.gpustack-7".to_string()),
+        (hdr::AUTH_CACHE, "jwt-cache-value".to_string()),
+    ]);
+    let mut out: Option<OutboundRequest> = None;
+    let (bytes, allocs) = measure_counted(|| {
+        out = Some(pipeline::build_outbound("POST", &p, &c, &wb, &[]));
+    });
+    eprintln!(
+        "AM6 measured build_outbound 1 candidate + ext-auth write-back: {bytes} bytes / {allocs} allocs"
+    );
+    let out = out.expect("outbound built");
+    // The write-back REPLACED the client key (exactly one Authorization).
+    assert_eq!(
+        out.headers.get(hdr::AUTHORIZATION),
+        Some("Bearer reg-token-abcdefgh")
+    );
+    assert_eq!(out.headers.count(hdr::AUTHORIZATION), 1);
+    assert_eq!(out.headers.get(hdr::MSE_CONSUMER), Some("ak.gpustack-7"));
+    assert!(
+        bytes < 8 * KIB as u64,
+        "AM6 build_outbound + write-back allocated {bytes} bytes (measured 4019; ceiling < 8 KiB)"
+    );
+}
+
+#[test]
+fn am6_build_outbound_three_candidates_in_a_row() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let inbound = realistic_model_route_inbound();
+    let (data, table, shared, router) = model_route_env();
+    let ctx = PipelineCtx {
+        data: &data,
+        table: &table,
+        config: &shared,
+        router: &router,
+    };
+    let p = pipeline::prepare(&inbound, &ctx).expect("fixture routes");
+    // The SAME prepared request against 3 candidates in a row (failover shape).
+    let cs = [
+        candidate("model-1-10.static"),
+        candidate("model-1-11.static"),
+        candidate("model-1-12.static"),
+    ];
+    let mut built: usize = 0;
+    let (bytes, allocs) = measure_counted(|| {
+        for cand in &cs {
+            let o = pipeline::build_outbound("POST", &p, cand, &HeaderMap::new(), &[]);
+            std::hint::black_box(&o.headers);
+            built += 1;
+        }
+    });
+    assert_eq!(built, 3);
+    eprintln!(
+        "AM6 measured build_outbound 3 candidates in a row: {bytes} bytes / {allocs} allocs"
+    );
+    assert!(
+        bytes < 24 * KIB as u64,
+        "AM6 build_outbound (3 candidates) allocated {bytes} bytes (measured 11595; ceiling < 24 KiB)"
+    );
+}
+
+#[test]
+fn am6_dial_pairs_exclusive_and_shared() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let inbound = realistic_model_route_inbound();
+    let (data, table, shared, router) = model_route_env();
+    let ctx = PipelineCtx {
+        data: &data,
+        table: &table,
+        config: &shared,
+        router: &router,
+    };
+    let p = pipeline::prepare(&inbound, &ctx).expect("fixture routes");
+
+    // Exclusive map (the per-candidate post-make_mut norm): into_pairs MOVES
+    // every header String — the AM-6 direct-dial cost.
+    let out = pipeline::build_outbound(
+        "POST",
+        &p,
+        &candidate("model-1-10.static"),
+        &HeaderMap::new(),
+        &[],
+    );
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let (bytes, allocs) = measure_counted(|| {
+        pairs = out.headers.into_pairs();
+    });
+    eprintln!(
+        "AM6 measured dial pairs drain (exclusive map): {bytes} bytes / {allocs} allocs"
+    );
+    assert!(
+        pairs
+            .iter()
+            .any(|(n, v)| n == "x-gpustack-model-instance" && v == "model-1-10.static")
+    );
+    assert!(
+        pairs.iter().any(|(n, _)| n == ":path"),
+        "the pseudo header stays in the map; the dial fold drops it"
+    );
+    assert!(
+        pairs.iter().any(|(n, _)| n == "content-type"),
+        "content-type stays in the map; DIAL_SKIP drops it at the fold"
+    );
+    assert!(
+        bytes < 2 * KIB as u64,
+        "AM6 dial drain allocated {bytes} bytes (measured 672 / 1 alloc; ceiling < 2 KiB)"
+    );
+
+    // Shared map (a clone keeps the Arc alive — the no-mutation candidate, whose
+    // map IS `prepared.base_headers`): into_pairs deep-clones, byte-identical
+    // to the historical clone-then-dial cost.
+    let out2 = pipeline::build_outbound(
+        "POST",
+        &p,
+        &candidate("model-1-10.static"),
+        &HeaderMap::new(),
+        &[],
+    );
+    let OutboundRequest {
+        headers: shared_headers,
+        ..
+    } = out2;
+    let _keep = shared_headers.clone(); // strong count 2 while measuring
+    let mut shared_pairs: Vec<(String, String)> = Vec::new();
+    let (bytes_s, allocs_s) = measure_counted(|| {
+        shared_pairs = shared_headers.into_pairs();
+    });
+    eprintln!(
+        "AM6 measured dial pairs clone (shared map): {bytes_s} bytes / {allocs_s} allocs"
+    );
+    assert!(
+        shared_pairs
+            .iter()
+            .any(|(n, v)| n == "x-gpustack-model-instance" && v == "model-1-10.static")
+    );
+    assert!(
+        bytes_s < 4 * KIB as u64,
+        "AM6 dial clone allocated {bytes_s} bytes (measured 1090; ceiling < 4 KiB)"
     );
 }

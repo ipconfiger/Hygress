@@ -619,7 +619,11 @@ impl ProxyHttp for HygressProxy {
                     &auth_writeback,
                     &data.provider_tokens,
                 );
-                match self.send_outbound(&prepared, &outbound, candidate).await {
+                // AM-6: `outbound` is moved into `send_outbound` — after the
+                // dial nothing reads `outbound` (every match arm below uses
+                // `prepared` / `candidate` / `resp` only), so the direct dial
+                // can consume `outbound.headers` and drain-move its Strings.
+                match self.send_outbound(&prepared, outbound, candidate).await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         if (200..=299).contains(&status) {
@@ -1439,19 +1443,35 @@ impl HygressProxy {
     /// A **provider-destined** candidate (`name.type` starts `provider-`) is
     /// assembled and dialed via the frozen `ProviderClient` (the live D6/§7
     /// ai-proxy key-swap); any other candidate is dialed directly.
+    ///
+    /// AM-6: `outbound` arrives **by value** so the direct dial can consume its
+    /// header map (`HeaderMap::into_pairs` — drain-move when the per-candidate
+    /// `make_mut` left the map exclusively owned, deep-clone when it is still
+    /// shared with `prepared.base_headers`). The provider path keeps borrowing
+    /// (`send_provider_outbound` re-reads `outbound.headers` for the key-swap
+    /// extraction + the frozen `inbound_headers` clone).
     async fn send_outbound(
         &self,
         prepared: &PreparedRequest,
-        outbound: &OutboundRequest,
+        outbound: OutboundRequest,
         candidate: &crate::context::CandidateTarget,
     ) -> Result<reqwest::Response, reqwest::Error> {
         // D6 / §7: a provider-destined upstream is assembled by the frozen
         // ProviderClient, then dialed over the long-lived client.
         if candidate.service_name.starts_with("provider-") {
             return self
-                .send_provider_outbound(prepared, outbound, candidate)
+                .send_provider_outbound(prepared, &outbound, candidate)
                 .await;
         }
+
+        let OutboundRequest {
+            method,
+            path,
+            host,
+            headers,
+            body,
+            content_type,
+        } = outbound;
 
         // D8: dial with the candidate's **resolved scheme** (never a
         // hardcoded `http` — a TLS provider endpoint dialed over plain HTTP
@@ -1462,9 +1482,9 @@ impl HygressProxy {
             "{}://{}{}",
             candidate.scheme.as_str(),
             candidate.address,
-            outbound.path
+            path
         );
-        let method = reqwest::Method::from_bytes(outbound.method.as_bytes())
+        let method = reqwest::Method::from_bytes(method.as_bytes())
             .unwrap_or(reqwest::Method::POST);
         let mut req = self.client_for(candidate).request(method, url);
         // Design §4.3: the routing policy's per-request timeout override (the
@@ -1473,41 +1493,33 @@ impl HygressProxy {
         if let Some(ms) = prepared.override_timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
         }
-        // ORA3-M12: ONE header-copy helper for both dial paths. The map values
-        // are core `HeaderMap` strings (always UTF-8 — the decode policy in
-        // `utf8_header_value` does not apply here); `content-type` is skipped
-        // (set once, explicitly below) and pseudo-headers (the internal core
-        // `:path` marker) are dropped before building the request — they are
-        // not valid HTTP request headers. The helper's `FnMut` sink cannot
-        // consume the `RequestBuilder` (it moves per `.header` call), so the
-        // filtered pairs are collected first, then folded into `req`.
-        let src: Vec<(&str, String)> = outbound
-            .headers
-            .names()
-            .filter(|name| !name.starts_with(':'))
-            .flat_map(|name| {
-                outbound
-                    .headers
-                    .get_all(name)
-                    .iter()
-                    .cloned()
-                    .map(move |value| (name, value))
-            })
-            .collect();
-        let mut dial_headers: Vec<(String, String)> = Vec::new();
-        copy_headers_excluding(src, DIAL_SKIP, |name, value| {
-            dial_headers.push((name.to_string(), value));
-        });
-        for (name, value) in dial_headers {
+        // ORA3-M12 + AM-6: ONE header pass into the builder (the old two
+        // intermediate `Vec`s are gone). [`HeaderMap::into_pairs`] emits owned
+        // `(name, value)` pairs — moved out of the exclusively-owned
+        // per-candidate map (no per-header clone), deep-cloned when the map is
+        // still shared with `base_headers` (identical to the pre-AM-6 dial).
+        // The map values are core `HeaderMap` strings (always UTF-8 — the
+        // decode policy in `utf8_header_value` does not apply here);
+        // `content-type` is skipped (`DIAL_SKIP` — it is set once, explicitly,
+        // below from the model-mapper-rewritten `content_type`) and
+        // pseudo-headers (the internal core `:path` marker) are dropped —
+        // they are not valid HTTP request headers.
+        for (name, value) in headers.into_pairs() {
+            if name.starts_with(':') {
+                continue;
+            }
+            if DIAL_SKIP.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+                continue;
+            }
             req = req.header(name, value);
         }
-        if !outbound.host.is_empty() {
-            req = req.header("host", outbound.host.clone());
+        if !host.is_empty() {
+            req = req.header("host", host);
         }
-        if !outbound.content_type.is_empty() {
-            req = req.header("content-type", outbound.content_type.clone());
+        if !content_type.is_empty() {
+            req = req.header("content-type", content_type);
         }
-        req.body(outbound.body.clone()).send().await
+        req.body(body).send().await
     }
 
     /// D6 / §7: build a provider-destined outbound via the frozen

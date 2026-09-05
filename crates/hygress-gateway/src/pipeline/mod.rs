@@ -104,6 +104,12 @@ fn prepare_inner(
     let started_at_ms = now_millis();
 
     // ① strip untrusted inbound (unforgeable-by-client) headers — before anything else.
+    // AM-6: the whole mutation phase below is exactly ONE `make_mut` deep copy.
+    // `clone` is an O(1) Arc bump; the FIRST mutating call (the remove below)
+    // deep-copies while `inbound.headers` still shares the Arc; every later
+    // mutation (`remove` / `insert` / the transformer-in rules) runs in place on
+    // the now-exclusively-owned map — nothing re-shares `base_headers` between
+    // mutations, so no second copy can trigger.
     let mut base_headers = inbound.headers.clone();
     base_headers.remove(crate::context::hdr::GPUSTACK_AUTH_TOKEN);
     base_headers.remove(crate::context::hdr::MODEL_INSTANCE);
@@ -338,7 +344,10 @@ pub fn build_outbound(
     // upstream (B4: appending would leave the client `Authorization` visible
     // to the worker).
     let mut headers = prepared.base_headers.clone();
-    for name in auth_writeback.names().collect::<Vec<&str>>() {
+    // AM-6: iterate `names()` directly (no `Vec<&str>` collect — `auth_writeback`
+    // is only ever borrowed immutably here, so there is no borrow conflict to
+    // work around).
+    for name in auth_writeback.names() {
         for value in auth_writeback.get_all(name) {
             headers.insert(name, value.clone());
         }
@@ -416,8 +425,16 @@ pub fn build_outbound(
     transformer::apply_outbound(&mut headers);
 
     // Strip hop-by-hop / connection-management headers before forwarding.
+    // AM-6: presence-check before each `remove`. `HeaderMap::remove` calls
+    // `make_mut` unconditionally — even for an ABSENT name — so a candidate
+    // whose map carries no hop-by-hop header (and had no other mutation) would
+    // otherwise deep-copy `base_headers` for nothing. With the guard, such a
+    // candidate keeps sharing `base_headers` (O(1)); when a header IS present
+    // the outcome is byte-identical to the unguarded remove.
     for h in HOP_BY_HOP {
-        headers.remove(h);
+        if headers.contains(h) {
+            headers.remove(h);
+        }
     }
 
     // D6 / §7 ai-proxy: a **provider-destined** candidate (`name.type` starts

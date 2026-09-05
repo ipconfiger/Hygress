@@ -114,6 +114,54 @@ impl HeaderMap {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(|k| k.as_str())
     }
+
+    /// AM-6: consume the map into owned `(name, value)` pairs — one pair per
+    /// value, in map iteration order — the dial materialization.
+    ///
+    /// When this map is the **only** reference (the per-candidate norm:
+    /// `build_outbound`'s O(1) clone plus one `make_mut` leave the [`Arc`]
+    /// exclusive), every `String` is **moved** out — no per-header clone, no
+    /// per-name re-allocation. When clones still share the map (a candidate
+    /// whose mutation set was empty, so the map *is* `prepared.base_headers`),
+    /// the pairs are deep-cloned and the shared map is left untouched —
+    /// byte-identical to the historical clone-then-dial path. Callers must not
+    /// use the map after this call (it is consumed).
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        // Total value count (the fold emits one pair per value) so the result
+        // Vec never re-grows.
+        let pair_count: usize = self.map.values().map(|values| values.len()).sum();
+        let mut pairs = Vec::with_capacity(pair_count);
+        match Arc::try_unwrap(self.map) {
+            // Exclusively owned: move the keys + values out.
+            Ok(map) => {
+                for (name, values) in map {
+                    let total = values.len();
+                    let mut iter = values.into_iter();
+                    // Every value except the LAST gets a cloned name (a
+                    // multi-value key needs one name per pair); the last value
+                    // moves the name out. The move sits OUTSIDE the prefix loop
+                    // so `name` is only ever moved once per map entry.
+                    for _ in 0..total.saturating_sub(1) {
+                        let value = iter.next().expect("prefix count == values.len() - 1");
+                        pairs.push((name.clone(), value));
+                    }
+                    if let Some(last_value) = iter.next() {
+                        pairs.push((name, last_value));
+                    }
+                }
+            }
+            // Still shared: deep-clone every pair (the other owners keep the
+            // original untouched).
+            Err(shared) => {
+                for (name, values) in shared.iter() {
+                    for value in values {
+                        pairs.push((name.clone(), value.clone()));
+                    }
+                }
+            }
+        }
+        pairs
+    }
 }
 
 /// `true` when `name` contains no ASCII uppercase byte (the allocation-free

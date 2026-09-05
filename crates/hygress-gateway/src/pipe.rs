@@ -628,7 +628,15 @@ impl ProxyHttp for HygressProxy {
                     if let Some(service) = &last_service {
                         self.report_incomplete_usage(&prepared, service).await;
                     }
-                    let resp_header = ResponseHeader::build(status, None)?;
+                    // P1: frame the buffered non-2xx body (`content-length`) so
+                    // Pingora's body writer is not close-delimited. The body is a
+                    // known size here (it was fully read via `resp.bytes()`), so
+                    // the helper emits `content-length`.
+                    let body_len = body.len() as u64;
+                    let mut resp_header = ResponseHeader::build(status, None)?;
+                    if let Some((name, value)) = response_framing(status, Some(body_len), None) {
+                        let _ = resp_header.append_header(name, value);
+                    }
                     session
                         .write_response_header(Box::new(resp_header), false)
                         .await?;
@@ -1299,15 +1307,27 @@ impl HygressProxy {
         quota: &mut Option<QuotaReservation>,
         compiled_static: Option<&std::sync::Arc<StaticRuleSet>>,
     ) -> PingoraResult<()> {
+        // Hop-by-hop / connection-negotiated headers are not forwarded. Framing
+        // (`content-length`) is handled by `response_framing` below (P1), and
+        // `content-encoding` IS forwarded verbatim (P5): the body is forwarded
+        // byte-for-byte and reqwest has no gzip feature, so stripping it would
+        // hand the client a mislabeled encoded body.
         const SKIP: &[&str] = &[
             "server",
             "via",
             "transfer-encoding",
             "content-length",
             "connection",
-            "content-encoding",
         ];
         let status = resp.status().as_u16();
+        // The upstream `content-length` is trusted for keep-alive framing when
+        // the body passes through unmodified. A streamed upstream (SSE) has no
+        // CL → chunked framing below.
+        let upstream_cl: Option<u64> = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         // Headers are read up front (immutably) so the borrow of `resp` ends
         // before the chunk loop mutates it via `resp.chunk()`.
         let forwarded: Vec<(String, String)> = resp
@@ -1324,6 +1344,13 @@ impl HygressProxy {
 
         let mut resp_header = ResponseHeader::build(status, None)?;
         for (name, value) in forwarded {
+            let _ = resp_header.append_header(name, value);
+        }
+        // P1: give the response explicit framing — the upstream content-length
+        // when the body is forwarded unmodified, else chunked — so Pingora's
+        // body writer is not close-delimited (which would mark the session
+        // un-reusable and close the TCP connection after every response).
+        if let Some((name, value)) = response_framing(status, None, upstream_cl) {
             let _ = resp_header.append_header(name, value);
         }
         // H1: the normal 2xx stream-end keeps the downstream connection alive
@@ -1573,6 +1600,37 @@ async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> Ping
     short_circuit_typed(session, status, "proxy_error", reason, &HeaderMap::new()).await
 }
 
+/// The **framing** header for a response body of known (`known_len` or a
+/// passthrough upstream `content-length`) or unknown (streamed) size (P1).
+///
+/// Pingora 0.8.1 selects the downstream body writer from the response headers
+/// (`init_body_writer_comm`): a `content-length` yields the content-length
+/// writer, a `transfer-encoding: chunked` yields the chunked writer, and
+/// **neither** yields the close-delimited writer plus `set_keepalive(None)` —
+/// which would tear the TCP connection down after every response. So every
+/// body-bearing response must carry exactly one of the two.
+///
+/// Bodyless statuses (1xx / 204 / 304) carry no framing (Pingora emits its
+/// own CL-0 framing for these). A known size (the error JSON or a buffered
+/// non-2xx body) gets `content-length`; otherwise the streamed body gets
+/// `transfer-encoding: chunked` (each `write_response_body` chunk is framed by
+/// the chunked writer, so the session stays reusable).
+///
+/// Never both, and never neither for body-bearing statuses.
+fn response_framing(
+    status: u16,
+    known_len: Option<u64>,
+    upstream_cl: Option<u64>,
+) -> Option<(&'static str, String)> {
+    if (100..200).contains(&status) || status == 204 || status == 304 {
+        return None;
+    }
+    match known_len.or(upstream_cl) {
+        Some(len) => Some(("content-length", len.to_string())),
+        None => Some(("transfer-encoding", "chunked".to_string())),
+    }
+}
+
 /// Write a **typed** JSON error with optional extra response headers (design
 /// §4.1 / D-15) and return `Ok(true)` (short-circuit the pipeline).
 ///
@@ -1604,6 +1662,13 @@ async fn short_circuit_typed(
         .collect();
     for (name, v) in pairs {
         let _ = resp.insert_header(name, v);
+    }
+    // P1: frame the known-size JSON body (`content-length`) so Pingora's body
+    // writer is not close-delimited (which would close the connection after the
+    // response). The helper returns None for bodyless statuses (1xx/204/304),
+    // which cannot occur here (errors are 4xx/5xx), so framing is always set.
+    if let Some((name, value)) = response_framing(status, Some(body.len() as u64), None) {
+        let _ = resp.append_header(name, value);
     }
     session.write_response_header(Box::new(resp), false).await?;
     session.write_response_body(Some(body), true).await?;
@@ -1810,5 +1875,97 @@ mod tests {
         assert!(HygressProxy::check_bucket(&buckets, "", &spec, 1));
         // No entry was created.
         assert_eq!(buckets.len(), 0);
+    }
+
+    // ----- P1: response_framing (explicit body framing for keep-alive) -----
+
+    #[test]
+    fn framing_bodyless_statuses_have_none() {
+        // 1xx / 204 / 304 carry no body → no framing header (Pingora emits its
+        // own CL-0 framing for these).
+        for s in [100u16, 101, 102, 199, 204, 304] {
+            assert_eq!(response_framing(s, Some(5), None), None, "known_len {s}");
+            assert_eq!(response_framing(s, None, Some(5)), None, "upstream_cl {s}");
+        }
+    }
+
+    #[test]
+    fn framing_known_len_is_content_length() {
+        let (name, value) = response_framing(404, Some(123), None).unwrap();
+        assert_eq!(name, "content-length");
+        assert_eq!(value, "123");
+    }
+
+    #[test]
+    fn framing_unknown_size_is_chunked() {
+        // No known size and no upstream CL (a streamed body, e.g. SSE) → chunked.
+        let (name, value) = response_framing(200, None, None).unwrap();
+        assert_eq!(name, "transfer-encoding");
+        assert_eq!(value, "chunked");
+    }
+
+    #[test]
+    fn framing_upstream_cl_passthrough() {
+        // No local known_len, but the upstream supplied a content-length → forward it.
+        let (name, value) = response_framing(200, None, Some(77)).unwrap();
+        assert_eq!(name, "content-length");
+        assert_eq!(value, "77");
+        // A local known_len takes precedence over the upstream CL.
+        let (_, value) = response_framing(200, Some(5), Some(77)).unwrap();
+        assert_eq!(value, "5");
+    }
+
+    #[test]
+    fn framing_never_both_never_neither_for_body() {
+        // For every body-bearing status, framing is present (never neither) and
+        // is exactly one of the two framing headers (never both).
+        for s in [200u16, 201, 206, 301, 302, 400, 401, 403, 404, 500, 502, 503] {
+            for (known, upstream) in [
+                (None, None),
+                (Some(0), None),
+                (Some(10), None),
+                (None, Some(10)),
+                (Some(10), Some(20)),
+            ] {
+                let f = response_framing(s, known, upstream)
+                    .unwrap_or_else(|| panic!("{s} {known:?} {upstream:?} must be framed"));
+                let (name, _) = f;
+                assert!(
+                    name == "content-length" || name == "transfer-encoding",
+                    "{s}: unexpected framing header {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_circuit_error_response_carries_content_length() {
+        // Integration-level: the exact body + status a `short_circuit_typed`
+        // error produces must yield a **present** `content-length` whose value
+        // equals the real on-wire body length (a keep-alive client depends on it
+        // to know the response is complete). The body format mirrors
+        // `short_circuit_typed` verbatim (same JSON + `json_escape`).
+        for (status, err_type, message) in [
+            (404u16, "no_route", "no matching route"),
+            (401u16, "unauthorized", "bad token"),
+            (502u16, "proxy_error", "all_candidates_failed"),
+            (429u16, "rate_limited", "too many requests"),
+        ] {
+            let body = format!(
+                "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\"}}}}",
+                json_escape(message),
+                json_escape(err_type)
+            );
+            let (name, value) =
+                response_framing(status, Some(body.len() as u64), None)
+                    .unwrap_or_else(|| panic!("a {status} error body must be framed"));
+            assert_eq!(name, "content-length", "{status}");
+            assert!(!value.is_empty(), "{status}: content-length must be present, not absent");
+            assert_eq!(
+                value,
+                body.len().to_string(),
+                "{status}: content-length must match the real body length"
+            );
+        }
     }
 }

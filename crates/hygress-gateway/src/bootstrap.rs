@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hygress_core::prelude::{ConfigData, SharedConfig};
-use pingora_core::server::configuration::Opt;
+use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 use pingora_core::Result as PingoraResult;
@@ -170,7 +170,21 @@ pub fn build_server(
     admin: Arc<AdminState>,
     stats: Arc<StatsState>,
 ) -> PingoraResult<Server> {
-    let mut server = Server::new(Some(Opt::default()))?;
+    // P2: run the data plane on as many worker threads as the host has vCPUs.
+    // Pingora 0.8.1 defaults `ServerConf::threads` to **1**, which serializes
+    // every downstream connection onto a single core (the whole gateway's
+    // throughput is then bounded by one CPU). Use the host's vCPU count,
+    // clamped to a sane [2, 32] for small / very large hosts.
+    //
+    // Future item: honour a cgroup CPU-quota (e.g. a container limited to 1
+    // vCPU) instead of the host's physical vCPUs — that is not visible via
+    // `available_parallelism()`, so it is left out of scope here.
+    let n = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(8)
+        .clamp(2, 32);
+    let conf = ServerConf { threads: n, ..Default::default() };
+    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
 
     let mut admin_svc = Service::new("hygress-admin".to_string(), AdminService::new(admin));

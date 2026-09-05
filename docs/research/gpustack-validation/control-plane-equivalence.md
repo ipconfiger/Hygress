@@ -69,7 +69,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | 能力 | Higress | Hygress | 判定 |
 |---|---|---|---|
 | 配置下发状态可见性 | `istioctl proxy-status` / `proxy-config`（NACK/版本可见） | 日志（warn on reject/skip）+ **无**当前生效快照的 introspection 端点 | 🟡 GAP-C4：建议 admin 增 `/config` dump（ArcSwap 快照直接序列化）+ `config_reject_total`/`config_skip_total` 计数器——低成本补齐 |
-| 指标 | envoy stats + prometheus（丰富） | `:15020/stats/prometheus` 浅兼容 + `hygress_*` 家族（requests/duration/tokens/ttft/retries/upstream_errors/fallback/auth/rate_limit/quota/policy/guardrail） | EQUIVALENT-WITHIN-SCOPE（GPUStack 消费的指标面已覆盖；envoy 细粒度 cluster-level stats 无对等——🟢） |
+| 指标 | envoy stats + prometheus（丰富） | `:15020/stats/prometheus` 端点兼容 + `hygress_*` 家族（requests/duration/tokens/ttft/retries/upstream_errors/fallback/auth/rate_limit/quota/policy/guardrail） | EQUIVALENT-WITHIN-SCOPE（GPUStack 消费的指标面已覆盖；envoy 细粒度 cluster-level stats 无对等——🟢） |
 | 健康/就绪 | — | `/healthz`（admin）+ `:80/readyz`（镜像路径）+ 绑定门控 | ✅ |
 | 热更 | xDS 推送 | CRD WATCH + policy.yaml mtime（R-8 后 ≤30s dutycycle）+ admin `/reload`（token 门禁） | ✅（Phase 1.1 后零周期打点） |
 | 日志 | envoy/pilot 分散 | 单进程 Rust tracing 集中 | ✅ |

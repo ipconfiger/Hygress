@@ -413,7 +413,7 @@
     <p class="hero-sub" data-reveal>
       最终同 rig 对比报告——同一 GPUStack 主机、同 wrk、同 <code>:80/readyz</code>，顺序 hygress→higress→hygress 一次会话完成。
       吞吐 <b class="chl">c16 +4.8%、c64 +20.3%</b>，p50 −7.8% / −12.0%、p99 −5.3% / −20.6%，
-      数据面 <b class="chl">1 进程 / ~108MB RSS</b> vs <b class="che">4 进程 / ~2.54GB</b>（≈23×），网关内核下限 <b class="chc">13.6k req/s、p99 6ms 平坦</b>。
+      数据面 <b class="chl">1 进程 / ~108MB RSS</b> vs <b class="che">4 进程 / ~2.54GB</b>（≈23×），不含上游时网关自身可达 <b class="chc">13.6k req/s，p99 6ms 无周期尖峰</b>。
     </p>
     <div class="hero-meta" data-reveal>
       <span class="chip"><span class="k">日期</span>&nbsp;<b>2026-09-05</b></span>
@@ -431,8 +431,8 @@
       </article>
       <article class="tk" data-reveal>
         <div class="tk-no"></div>
-        <h3>内核平坦 · 尾非网关</h3>
-        <p><span class="big">13.6k req/s</span> 下限、p99 <span class="num chc">6ms 平坦</span>（§11 自服务 healthz 判定器）：<code>:80/readyz</code> 的 ~1.1k req/s 与周期性 p99 尾部<b>归因于共享镜像上游</b>，非网关内核——两侧在镜像路径上呈现同款尾部。</p>
+        <h3>网关内核稳定 · 尾与网关无关</h3>
+        <p><span class="big">13.6k req/s</span> 为不含上游时的网关自身吞吐，p99 <span class="num chc">6ms、无周期尖峰</span>（§11 自服务 healthz 判定器）。<code>:80/readyz</code> 的 ~1.1k req/s 与周期性 p99 尾部<b>归因于共享镜像上游</b>，而非网关内核——两侧在镜像路径上呈现同样的周期性尾部。</p>
       </article>
       <article class="tk" data-reveal>
         <div class="tk-no"></div>
@@ -575,7 +575,7 @@
     </div>
 
     <p class="note">
-      hygress 全部四项主指标（吞吐/p50/p99）<b class="chl">均优于原生 envoy</b>；c64 优势（+20.3%）大于 c16（+4.8%），与 c64 更吃单请求 CPU/连接效率一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。两侧在 <code>:80/readyz</code> 上都有周期性 ~300-500ms p99 尾——见 §1.2 的归因判定：<b>非网关内核所致</b>。
+      hygress 全部四项主指标（吞吐/p50/p99）<b class="chl">均优于原生 envoy</b>；c64 优势（+20.3%）大于 c16（+4.8%），与并发提高后单请求 CPU 与连接开销占比上升一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。两侧在 <code>:80/readyz</code> 上都有周期性 ~300-500ms p99 尾部，归因见 §1.2（<b>非网关内核所致</b>）。
     </p>
 
     <!-- charts: req/s & latency -->
@@ -667,7 +667,7 @@
         <div class="stat accent">
           <div class="st-k">c16 吞吐</div>
           <div class="st-v num">13,598.67<span class="unit"> req/s</span></div>
-          <div class="st-d">vs <code>:80/readyz</code> 1,127.4 req/s —— 内核 <b>平坦且快 ~12×</b></div>
+          <div class="st-d">vs <code>:80/readyz</code> 1,127.4 req/s —— 内核 <b>延迟稳定、快 ~12×</b></div>
         </div>
         <div class="stat">
           <div class="st-k">c16 p50</div>
@@ -677,7 +677,7 @@
         <div class="stat">
           <div class="st-k">c16 p99（30s + 重复×3）</div>
           <div class="st-v num">6.07<span class="unit"> ms</span></div>
-          <div class="st-d">重复 5.6–6.9，<b>平坦</b>·无周期尾；vs 385.8 ms（周期性尖峰）</div>
+          <div class="st-d">重复 5.6–6.9，<b>无周期峰</b>·无周期尾；vs 385.8 ms（周期性尖峰）</div>
         </div>
         <div class="stat accent" style="--cyl:var(--cyl)">
           <div class="st-k">c64 吞吐 / p50 / p99</div>
@@ -691,7 +691,7 @@
           <ul>
             <li><span>c16 吞吐</span><b>13,598.67 req/s</b></li>
             <li><span>c16 p50</span><b>0.736 ms</b></li>
-            <li><span>c16 p99（30s + 重复×3）</span><b>6.07 ms（5.6–6.9，平坦）</b></li>
+            <li><span>c16 p99（30s + 重复×3）</span><b>6.07 ms（5.6–6.9，无周期峰）</b></li>
             <li><span>c64 吞吐 / p50 / p99</span><b>14,537 / 2.49 / 24.4 ms</b></li>
           </ul>
         </div>
@@ -706,7 +706,7 @@
         </div>
       </div>
       <p class="note">
-        <b class="chc">判定（决定性）</b>：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）平坦且快 ~12×——p99 个位数毫秒、无周期尾。<code>:80/readyz</code> 的吞吐天花板（~1.1k）与周期性尾部<b>归因于共享镜像上游</b>（GPUStack worker 的 <code>/readyz</code> 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧同等“taily”。回看 §8→§10 的现象链：P1（连接churn）/P2（单线程）/P4（控制面轮询）逐一消除网关侧开销后，<code>:80/readyz</code> 的 p99 只随上游波动。<br>
+        <b class="chc">判定</b>：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）延迟分布稳定、无周期峰，快 ~12×，p99 个位数毫秒。<code>:80/readyz</code> 的吞吐天花板（~1.1k）与周期性尾部<b>归因于共享镜像上游</b>（GPUStack worker 的 <code>/readyz</code> 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧表现一致。§8→§10 期间逐项消除 P1（连接churn）、P2（单线程）、P4（控制面轮询）等网关侧开销后，<code>:80/readyz</code> 的 p99 只随上游波动。<br>
         <b>诚实说明</b>：admin 端点当前仍为 close-delimited 响应（<code>read errors ≈ 全量</code>，P1 nitpick #1）——即 13.6k req/s 是在<b>每请求 TCP 拆建</b>的不利条件下测得的内核下限，只会低估；如需 keep-alive 口径属一行 CL 修复（非热路径、可选）。跨网关“纯内核对纯内核”的正式对比（envoy admin 端点等效测量）留作 Phase 3.2 可选待办。
       </p>
     </div>
@@ -724,13 +724,13 @@
         <span><span class="lg-line"></span> hygress（c16 req/s）</span>
         <span><span class="lg-line en"></span> 原生 envoy 参照（1075.3）</span>
         <span><span class="lg-band"></span> WATCH 阶段区间 1119–1143</span>
-        <span><span class="lg-marker"></span> 内核下限（离域标注 13,598.67）</span>
+        <span><span class="lg-marker"></span> 内核下限（刻度外标注 13,598.67）</span>
       </div>
-      <div id="curveA" class="curve-svg" role="img" aria-label="优化全程曲线：c16 req/s 从修复前 518，经 857d21b 的 1093、5df02f2 的 1099.3、815ebd3 的 1091.7、493dc21 的 1152.3、cf4f6c5 WATCH 区间 1119 至 1143、最终 3b6beabc 的 1127.4；原生 envoy 参照线 1075.3；内核下限 13598.67 离域标注"></div>
+      <div id="curveA" class="curve-svg" role="img" aria-label="优化全程曲线：c16 req/s 从修复前 518，经 857d21b 的 1093、5df02f2 的 1099.3、815ebd3 的 1091.7、493dc21 的 1152.3、cf4f6c5 WATCH 区间 1119 至 1143、最终 3b6beabc 的 1127.4；原生 envoy 参照线 1075.3；内核下限 13598.67 刻度外标注"></div>
       <div id="curveA-labels" class="curve-labels"></div>
       <p class="curve-note">
-        <b>判读链</b>：① P1 根治 read-errors（close-delimited framing 根因，pingora <code>init_close_delimited</code> 实证）；② P2 消除单 worker 串行化（c64 +7.7%）；③ P4 消除控制面周期重建尖峰（p99 −23/−25%）；④ WATCH 后尾未扁平 + §11 内核平坦 → 周期尾最终归因共享上游（非网关）；⑤ 同 rig 下 hygress 全指标 ≥ envoy。<br>
-        <b>离域说明</b>：内核下限 <span class="num">13,598.67 req/s</span>（p50 0.74ms / p99 6.1ms 平坦；c64 14,537）超出本图刻度约 12×，故以离域标记单独标注，不入主纵轴。
+        P1 根治 read-errors（close-delimited framing 根因，pingora <code>init_close_delimited</code> 实证）；P2 消除单 worker 串行化（c64 +7.7%）；P4 消除控制面周期重建尖峰（p99 −23/−25%）；WATCH 后尾部未变平，§11 测得内核无周期峰，周期尾最终归因共享上游（非网关）；同 rig 下 hygress 全指标 ≥ envoy。<br>
+        <b>刻度外标注</b>：内核下限 <span class="num">13,598.67 req/s</span>（p50 0.74ms / p99 6.1ms 无周期峰；c64 14,537）超出本图刻度约 12×，故单独标注，不进入主纵轴。
       </p>
     </div>
 
@@ -801,16 +801,16 @@
             <td><span class="num">824</span></td>
             <td><span class="num">50.0 / 577</span></td>
             <td class="pos">0</td>
-            <td>控制面稳态零 LIST；尾未扁平 → 尾源非控制面</td>
+            <td>控制面稳态零 LIST；尾部未变平 → 与控制面轮询无关</td>
           </tr>
           <tr>
             <td><b>fc25a87</b>（§11 内核下限）</td>
-            <td><span class="num chc">13,598.67</span><br><span style="color:var(--faint);font-size:12px">p50 0.74ms / p99 6.1ms 平坦</span></td>
+            <td><span class="num chc">13,598.67</span><br><span style="color:var(--faint);font-size:12px">p50 0.74ms / p99 6.1ms 无周期峰</span></td>
             <td><span class="num">—</span></td>
             <td><span class="num chc">14,537</span>（c64）</td>
             <td><span class="num">—</span></td>
             <td class="flat">（admin close-delimited）</td>
-            <td>归因判定器：尾源 = 共享上游</td>
+            <td>据此判定：尾部来自共享上游</td>
           </tr>
           <tr>
             <td><b>最终 A/B</b>（本报告，<span class="mono">3b6beabc</span>）</td>
@@ -1015,8 +1015,8 @@
 
       <div class="feat" data-reveal>
         <span class="f-tag">MIRROR · 15020</span>
-        <h4>mirror 透传 · :15020 浅兼容</h4>
-        <p><code>:80/readyz</code> 等 mirror 路由原样转发（本报告全部 wrk 数据的路径）；<code>:15020</code> 浅兼容：GPUStack pilot-agent 的 <code>/stats/prometheus</code>、<code>/stats</code> 探活面等价实现。</p>
+        <h4>mirror 透传 · :15020 端点兼容</h4>
+        <p><code>:80/readyz</code> 等 mirror 路由原样转发（本报告全部 wrk 数据的路径）；<code>:15020</code> 端点兼容：实现 GPUStack pilot-agent 探活所需的 <code>/stats/prometheus</code>、<code>/stats</code> 两个端点。</p>
       </div>
 
       <div class="feat" data-reveal>
@@ -1102,11 +1102,11 @@
       </div>
       <div class="lim" data-reveal>
         <div class="l-no">06</div>
-        <div><h4>:80/readyz 周期尾为上游所致（非网关）</h4><p>§11 内核平坦（p99 6.1ms）+ envoy 同款尾部（407/530ms）已归因共享 GPUStack worker；该尾<b>不在 hygress 可修复范围</b>。</p></div>
+        <div><h4>:80/readyz 的周期尾部来自上游（非网关）</h4><p>§11 测得内核无周期峰（p99 6.1ms），envoy 同路径也有同样的尾部（407/530ms），两者都归因于共享 GPUStack worker；该尾部<b>不在 hygress 可修复范围</b>。</p></div>
       </div>
       <div class="lim" data-reveal>
         <div class="l-no">07</div>
-        <div><h4>跨网关纯内核对比未完成</h4><p>envoy 无等效 admin 基准被测（Phase 3.2 静态 sink 可选待办）。当前内核结论（13.6k req/s、p99 6ms 平坦）仅 hygress 单侧；跨网关内核对比留待需要时补测。</p></div>
+        <div><h4>跨网关纯内核对比未完成</h4><p>envoy 无等效 admin 基准被测（Phase 3.2 静态 sink 可选待办）。当前内核结论（13.6k req/s、p99 6ms 无周期峰）仅 hygress 单侧；跨网关内核对比留待需要时补测。</p></div>
       </div>
       <div class="lim" data-reveal>
         <div class="l-no">08</div>
@@ -1362,7 +1362,7 @@
     kt.setAttribute('x', W - padR); kt.setAttribute('y', padT + 2);
     kt.setAttribute('text-anchor', 'end'); kt.setAttribute('font-family', 'IBM Plex Mono, monospace');
     kt.setAttribute('font-size', '12'); kt.setAttribute('fill', '#6AC6F2'); kt.setAttribute('font-weight', '600');
-    kt.textContent = '内核下限 13,598.67（≈12×，离域）';
+    kt.textContent = '内核下限 13,598.67（≈12×，刻度外）';
     svg.appendChild(kt);
     var kl = document.createElementNS(ns, 'line');
     kl.setAttribute('x1', padL); kl.setAttribute('x2', W - padR);

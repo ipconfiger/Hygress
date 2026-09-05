@@ -183,26 +183,26 @@ Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**�
   每请求 String 克隆——数据面自身）。
 - 证据：`fixtures-hygress/bench_after4_wrk_c{16,64}.txt`、`after4_image.txt`（提交随本报告）。
 
-## 10. Phase 1.1（kube WATCH 事件化）重测（wrk，2026-09-05）：控制面稳态零 LIST，但 p99 尾未扁平 → 尾源非控制面
+## 10. Phase 1.1（kube WATCH 事件化）重测（wrk，2026-09-05）：控制面稳态零 LIST，但 p99 尾部未变平，说明其来源不是控制面
 
 跟进（Phase 1.1 `cf4f6c5`，oracle 复审 PASS）：控制面由 1s 周期轮询改为 **kube WATCH 事件驱动**
 （稳态零 LIST/JSON-decode/重建，仅 30s 安全网 tick；oracle 钉死设计 9 点全过）。同 rig 重测：
 
-| 指标 | P4 build（`b1c82601`） | **WATCH build（`3b6beabc`）** | 判读 |
+| 指标 | P4 build（`b1c82601`） | **WATCH build（`3b6beabc`）** | 结果说明 |
 |---|---|---|---|
 | c16 吞吐 / p50 | 1152 / 13.0 ms | 1119-1143 / 12.6 ms | ≈持平（含抖动） |
 | c16 p99（30s / 重复×3） | 299 / 295-399 ms | 388 / 479-481 ms | **未降（噪声内偏升）** |
 | c64 吞吐 / p50 / p99 | 968 / 51.3 / 403 ms | 824 / 50.0 / 577 ms | 本次偏低（共享主机波动） |
 | Socket errors | 0 | 0 | P1 保持 |
 
-- **诚实结论（关键判读）**：控制面 1s LIST/JSON-decode/重建已从稳态移除（代码审校确认），但周期性
-  ~300-480ms p99 尾**未因此扁平** → **该尾部并非来自控制面轮询**；剩余嫌疑为**共享镜像上游**
+- **诚实结论（关键推论）**：控制面 1s LIST/JSON-decode/重建已从稳态移除（代码审校确认），但周期性
+  ~300-480ms p99 尾**未因此变平** → **该尾部并非来自控制面轮询**；剩余嫌疑为**共享镜像上游**
   （GPUStack worker / `/readyz` 自身）或 wrk rig 环境抖动（本机并发负载，本次 c16/c64 均可见波动）。
 - **下一步判定器**：`perf-tail-plan.md` Phase 3.2——静态 loopback sink + 测试路由，同法测"网关 vs
   envoy 纯内核"，一次性归因"网关内核 vs 上游/rig"；在此之后再无控制面微成本可逐（oracle 预判一致）。
 - 证据：`fixtures-hygress/bench_after5_wrk_c{16,64}.txt`、`after5_image.txt`（提交随本报告）。
 
-## 11. 纯网关内核下限（Phase 3.1，wrk，2026-09-05）：内核平坦 ~14k req/s、p99 个位数毫秒 → 周期尾归因上游
+## 11. 纯网关内核下限（Phase 3.1，wrk，2026-09-05）：网关内核延迟稳定，~14k req/s、p99 个位数毫秒 → 周期尾归因上游
 
 判定器（免改码）：直接对 **hygress 自服务 admin ServeHttp `127.0.0.1:8081/healthz`**（pingora
 ServeHttp：纯 accept+parse+respond，**不经过 `request_filter` 管线、无路由/无上游镜像**）打 wrk：
@@ -210,16 +210,16 @@ ServeHttp：纯 accept+parse+respond，**不经过 `request_filter` 管线、无
 | 指标 | `:8081/healthz`（网关内核下限） | `:80/readyz`（含共享上游，§10） |
 |---|---|---|
 | c16 吞吐 / p50 | **13,643 req/s / 0.74 ms** | 1,119-1,143 / 12.6 ms |
-| c16 p99（30s / 重复×3） | **5.9 ms / 5.6-6.9 ms（平坦）** | 388 / 479-481 ms（周期性） |
+| c16 p99（30s / 重复×3） | **5.9 ms / 5.6-6.9 ms（无周期峰）** | 388 / 479-481 ms（周期性） |
 | c64 吞吐 / p50 / p99 | **14,537 / 2.49 / 24.4 ms** | 824 / 50.0 / 577 ms |
 | Socket errors | 全量（admin 亦 close-delimited） | 0（P1 后 keep-alive） |
 
-- **判定结论（决定性）**：**网关内核本身平坦且快**（~14k req/s、p50 <1ms、p99 个位数毫秒、**无周期性尾**）；
+- **判定结论**：**网关内核本身延迟稳定且快**（~14k req/s、p50 <1ms、p99 个位数毫秒、**无周期性尾**）；
   `:80/readyz` 的 ~1.1k req/s 与周期性 ~300-480ms 尾**几乎全部来自共享镜像上游**（GPUStack worker
-  `/readyz` 往返与抖动），而非网关内核/控制面/数据面管线——这统一解释了 P1/P2/P4/WATCH 逐步移除网关侧
-  开销后 `:80/readyz` 的 p99 只随上游波动的现象（§8/§9/§10）。
+  `/readyz` 往返与抖动），而非网关内核/控制面/数据面管线——P1/P2/P4/WATCH 逐步移除网关侧开销后
+  `:80/readyz` 的 p99 仍只随上游波动，与此一致（§8/§9/§10）。
 - **附带确认**：admin ServeHttp 亦为 close-delimited（oracle P1 nitpick #1）；但逐请求强制断连下仍达
-  13.6k req/s——网关内核能力绰绰有余；如需该端点也开 keep-alive，属 P1 同款一行 CL 修复（非热路径、可选）。
+  13.6k req/s——网关内核能力绰绰有余；如需该端点也开 keep-alive，属与 P1 相同的一行 CL 修复（非热路径、可选）。
 - **Perf-tail-plan 影响**：Phase 3.1 [x]（免改码完成）；Phase 3.2（静态 sink + 测试路由的"网关 vs envoy
   纯内核"形式化对比）由"判定器"降级为**可选形式化佐证**（临时 sink 仍涉 rig 改动）；如无硬性跨网关对比
   需求可收尾。

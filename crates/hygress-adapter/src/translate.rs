@@ -89,7 +89,7 @@ const CUSTOM_RESPONSE_FILTER: &str = "envoy.filters.http.custom_response";
 // ---------------------------------------------------------------------------
 
 /// The kind of a k8s object being translated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObjectKind {
     McpBridge,
     WasmPlugin,

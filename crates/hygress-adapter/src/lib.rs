@@ -59,8 +59,9 @@ mod snapshot;
 pub mod gvr;
 pub mod translate;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use snapshot::SnapshotFingerprint;
 pub use client::Client;
 pub use error::{Error, Result};
 pub use translate::{Object, ObjectKind};
@@ -80,6 +81,10 @@ pub struct Controller {
     mirror_name: String,
     ready: Arc<tokio::sync::Notify>,
     ready_notified: Arc<std::sync::atomic::AtomicBool>,
+    /// Last LISTed snapshot fingerprint (P4 short-circuit). Interior-mutable: the poll loop
+    /// updates it once per tick. A `Mutex` is fine — one short critical section per 1s tick in
+    /// the control-plane runtime (never held across an `.await`).
+    last_fingerprint: Mutex<Option<SnapshotFingerprint>>,
 }
 
 impl Controller {
@@ -123,6 +128,7 @@ impl Controller {
             mirror_name,
             ready: Arc::new(tokio::sync::Notify::new()),
             ready_notified: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_fingerprint: Mutex::new(None),
         })
     }
 
@@ -203,35 +209,68 @@ impl Controller {
         });
     }
 
-    /// One poll iteration: LIST → translate → store; keep last-known-good on failure.
+    /// Lock the last-fingerprint guard, recovering from a poisoned mutex instead of panicking.
+    /// (Poisoning would require a panic while holding the lock — the only holder is the single
+    /// poll loop, and the guarded `clone`/`assign` cannot panic, so this is purely defensive.)
+    fn lock_fingerprint(&self) -> std::sync::MutexGuard<'_, Option<SnapshotFingerprint>> {
+        self.last_fingerprint.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One poll iteration: LIST → fingerprint short-circuit → translate → store; keep
+    /// last-known-good on failure. When the fingerprint is unchanged since the last tick, the
+    /// expensive translate + store (and the downstream RouteTable/regex rebuild) are skipped
+    /// entirely (P4). The fingerprint is always advanced after a successful LIST (changed or
+    /// not); a LIST failure leaves it untouched and retries next tick.
     async fn sync_once(&self, client: &client::Client) {
-        match snapshot::build_snapshot(client, &self.gateway_namespace, &self.mirror_name).await {
-            Ok(data) => match self.shared.store(data) {
-                Ok(()) => {
-                    let notified = self
-                        .ready_notified
-                        .compare_exchange(
-                            false,
-                            true,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_ok();
-                    if notified {
-                        tracing::info!("first snapshot stored; signalling bind-ready");
-                        self.ready.notify_one();
-                    }
-                }
-                Err(issues) => {
-                    // Structural failure: reject the whole snapshot, keep last-known-good.
-                    tracing::warn!(
-                        "snapshot structurally rejected; keeping last-known-good: {issues:?}"
-                    );
-                }
-            },
+        let prev = self.lock_fingerprint().clone();
+        let (fp, data) = match snapshot::build_snapshot(
+            client,
+            &self.gateway_namespace,
+            &self.mirror_name,
+            prev.as_ref(),
+        )
+        .await
+        {
+            Ok(r) => r,
             Err(e) => {
-                // Transport / LIST failure: keep last-known-good, retry next tick.
+                // Transport / LIST failure: keep last-known-good (snapshot AND fingerprint),
+                // retry next tick.
                 tracing::warn!("snapshot LIST failed; keeping last-known-good: {e}");
+                return;
+            }
+        };
+
+        // Always record the fingerprint we just LISTed (changed or not) so the next tick
+        // compares against the latest state.
+        *self.lock_fingerprint() = Some(fp);
+
+        // Unchanged since the last pass: skip the translate + store entirely.
+        let Some(data) = data else {
+            tracing::debug!("snapshot unchanged (fingerprint match); skipping rebuild");
+            return;
+        };
+
+        match self.shared.store(data) {
+            Ok(()) => {
+                let notified = self
+                    .ready_notified
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+                if notified {
+                    tracing::info!("first snapshot stored; signalling bind-ready");
+                    self.ready.notify_one();
+                }
+            }
+            Err(issues) => {
+                // Structural failure: reject the whole snapshot, keep last-known-good.
+                tracing::warn!(
+                    "snapshot structurally rejected; keeping last-known-good: {issues:?}"
+                );
             }
         }
     }

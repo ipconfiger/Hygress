@@ -68,5 +68,10 @@
 | metrics 新家族（config reject/skipped、tls cert×2）在线 | ✅（b5.log） |
 | admin /config 401 fail-closed | ✅（b5.log） |
 | 限流 429 `rate_limit_error`+Retry-After / 护栏 403 `guardrail_blocked` / 复位 | ✅（b6/b8.log） |
-| **B7 新行为真机回归**（SSE include_usage 注入、AM-3 断流、AM-5 计数、AM-1 零写） | ⏸ 未跑（无真机会话；集成层已覆盖，建议下次真机补） |
+| **B7 新行为真机回归**（2026-09-05 b9，镜像 fa37e12a，远端 `/root/hygress-b3/b9.log`+`b9-verdict.txt`） | ✅ |
+| ↳ AM-1 拓扑 A 零写 | ✅ 容器启动 12:42:21 后 hygress.log **零** IngressClass seed 行（最后 seed 11:20:09 属旧启动） |
+| ↳ AM-2 SSE include_usage | ✅ 真机 3/3 请求通过（显式 true/false/裸 stream）：不覆盖显式选项、无双注入；usage 行 270/271/272 全 completed=t、28/4 逐位一致。SSE-chunk 判别在该机 **N/A**（CPU llama-box 后端非流式），注入证据由集成层 35 e2e 提供 |
+| ↳ AM-3 断流不派发 | ✅ 半关闭 → HTTP 400 + Connection: close；metrics `short_circuit status=400` 0→1；无新 usage 行（未派发） |
+| ↳ AM-5 短路计数 | ✅ `requests_total{kind="short_circuit"}` 401×1/403×1/429×2（+400×1）；auth_decisions denied=1；guardrail in=1；rate_limit consumer=2 |
+| ↳ 基线回归 | ✅ readyz=200@2s、hygress×1/envoy·pilot×0、端口 80/30080/8081/15020/18443、chat 200 `HYGRESS_B7_OK` 34/5、限流 200/429/429、护栏 403、复位 200；回滚点 `gpustack:hygress-b5`(e6eb3458)/`hygress-pre`(3b6beabc) |
 > 凭据按需提供；若不可达 → ⏸ 未执行 + 交付可执行套件。

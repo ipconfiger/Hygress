@@ -60,8 +60,17 @@
 
 **门禁（本会话实测）**：`cargo test --workspace --all-features` → **587 passed**（adapter 50 / core 215 / egress 52+8+10+4 / gateway lib 206 / alloc_guard 6 / integration 35 / doc 1，0 failed）；`cargo clippy --workspace --all-targets --all-features -- -D warnings` 与默认模式 → 均 0；rustfmt 无净新增。
 
+## 5b. B7 真机回归（2026-09-05，镜像 fa37e12a = B7 代码，远端 /root/hygress-b3/b9*.log）
+- 换入：cargo-zigbuild 交叉编译 HEAD(3dedb52) linux/x86_64 → ship → docker build（旧镜像备份 `gpustack:hygress-b5`=e6eb3458，回滚点 `hygress-pre`=3b6beabc 保留）→ compose up --force-recreate。
+- **AM-1 零写 ✅**：容器 12:42:21 启动后 hygress.log **零** `IngressClass seed` 行（最后 seed 11:20:09 属上一启动）——拓扑 A 不再尝试向 embedded apiserver 写。
+- **AM-2 ✅（环境受限判别）**：显式 include_usage=true/false 与裸 stream 三类请求全部正常——不覆盖显式选项、无双重注入；usage 行 270/271/272 全 completed=t 且 28/4 与响应逐位一致。**诚实标注**：该测试机 CPU llama-box 后端不实现流式（stream:true 仍返回非流式单块 JSON 含 usage），故"SSE usage chunk 是否由注入触发"无法在此后端判别——注入判定证据由集成层 e2e（35 passed，假上游断言收到注入体）承担。
+- **AM-3 ✅**：半关闭断流（CL=500 只发 150B + SHUT_WR）→ `HTTP/1.1 400 Bad Request` + `Connection: close`；metrics `short_circuit status=400` 0→1；无新 usage 行 = 未派发上游。
+- **AM-5 ✅**：`requests_total{kind="short_circuit"}` 401×1 / 403×1 / 429×2 /（AM-3 后 +400×1）；专用计数器 auth_decisions denied=1、guardrail_blocked in=1、rate_limit_denied consumer=2 均在线。
+- **基线回归 ✅**：readyz=200@2s、hygress×1 / envoy·pilot×0、端口 80/30080/8081/15020/18443、chat 200 `HYGRESS_B7_OK` + usage 34/5 落行、限流 200/429/429 `rate_limit_error`、护栏 403 `guardrail_blocked`、复位 200、server 稳定。
+
 ## 6. 诚实声明（B7）
-- B7 新行为（SSE include_usage 注入、AM-3 断流、AM-5 计数、AM-1 零写）未上真机回归（无真机会话）；集成层 35 项 e2e 已覆盖，建议下次真机补跑（checklist B5 表尾 ⏸ 项）。
+- AM-2 的"SSE usage chunk 由注入触发"真机判别受测试机后端限制（CPU llama-box 非流式），未在此机完成；注入判定由集成层 e2e 提供，真机验证了不覆盖/无双注入/行精确。若需强判别需流式后端（vLLM）环境。
 - connect 超时判别测试以"悬挂上游+reqwest .timeout()"等价实现（同一 `e.is_timeout()` 路径），未单独构造 OS 级 connect timeout。
 - 文档漂移批内 `pack/hygress-s6/README.md` 与 `ROLLBACK.md` 位于 pack/ 下但按文档处理（任务边界注明）；带日期过程记录用 era 注澄清而非篡改档案。
 - MINOR 批个别 warn/恒定时间"时序均匀性"无法在无 tracing-test 依赖下单测断言（语义已钉扎）。
+- 观察项（非本批引入、已记录）：embedded apiserver 对 mcpbridge/envoyfilter/ingress/secret/configmap 等 kind 的 WATCH 持续报 "no metadata.resourceVersion"（09-05 03:10 旧日志即有，7615 万条累积）——事件驱动降级为 30s fallback tick 兜底（R-2 设计内），watch 错误日志量本身偏大，可作为后续可运维优化（降噪/退避）候选。

@@ -1,5 +1,5 @@
 CONTAINER ID   IMAGE                              COMMAND                  CREATED        STATUS        PORTS     NAMES
-f9a5c6b03ef1   67d6829d28c2                       "/usr/bin/entrypoint…"   2 hours ago    Up 2 hours              gpustack-server
-4316b486869e   24c6d20543d6                       "python3 /opt/serve.…"   33 hours ago   Up 33 hours             qwen2.5-0.5b-instruct-kc3nm-run-0
-ab1245a7d385   e9622b01071c                       "/pause"                 33 hours ago   Up 33 hours             qwen2.5-0.5b-instruct-kc3nm-pause
-91758f166f60   quay.io/gpustack/gpustack:latest   "/usr/bin/entrypoint…"   33 hours ago   Up 33 hours             gpustack-worker
+de3e48b842e7   12048b52ea14                       "/usr/bin/entrypoint…"   9 hours ago    Up 9 hours              gpustack-server
+4316b486869e   24c6d20543d6                       "python3 /opt/serve.…"   42 hours ago   Up 42 hours             qwen2.5-0.5b-instruct-kc3nm-run-0
+ab1245a7d385   e9622b01071c                       "/pause"                 42 hours ago   Up 42 hours             qwen2.5-0.5b-instruct-kc3nm-pause
+91758f166f60   quay.io/gpustack/gpustack:latest   "/usr/bin/entrypoint…"   42 hours ago   Up 42 hours             gpustack-worker

@@ -133,3 +133,28 @@ Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**�
 - e2e chat（GPU 受限，非网关判据）：原生 0.60/0.18/0.18s；Hygress 侧功能 e2e 通过（usage 行落库）。
 - 证据：`fixtures-hygress/bench_{after2,higress}_wrk_c{16,64}.txt`、`after2_image.txt`、`higress_image.txt`、
   `higress_ps.txt`（提交随本报告）。
+
+## 8. P1/P2 修复后重测（wrk，2026-09-05）：keep-alive 生效、c64 扩展改善
+
+跟进（oracle P1/P2/P5 落地 `815ebd3`，复审 PASS）：P1 为所有 body 响应恢复 framing（CL/chunked，
+不再 close-delimited）；P2 数据面多线程（threads = vCPU，clamp 2..32）。同 rig 重测（同主机/同 wrk/
+同 `:80/readyz`）：
+
+| 指标 | B1-B4 build（`12048b52`） | **P1/P2 build（`ba0b467b`）** | 变化 |
+|---|---|---|---|
+| c16 (t4·30s) 吞吐 | 1099.3 req/s | 1091.7（重复 ~1155-1169） | ≈持平（共享上游封顶） |
+| c16 **Socket errors: read** | ≈所有请求 | **0（wrk errors 行消失）** | **P1 确定性修复** |
+| c64 (t8·20s) 吞吐 | 834.4 req/s | **898.3 req/s** | **+7.7%** |
+| c64 p50 | 56.6 ms | **53.1 ms** | **−6.3%** |
+| c16 / c64 p99 | 390 / 547 ms | 388 / 539 ms | 尾部未消除（见下） |
+
+- **P1 确认**：响应显式 CL/chunked 后 pingora 不再选 close-delimited 写出器，keep-alive 真实生效——
+  每请求 TCP 拆除与 ~1.1k/s accept/TIME_WAIT churn 消除（此前 `read` 错误 ≈ 全量；既测试均未拦到，
+  因 wrk 把 EOF 定界 body 计为完整响应——这正是 §6/§7 反复出现的 read-errors 谜底的根因）。
+- **P2 确认**：数据面多线程后 c64 +7.7%、p50 −6.3%（此前单 worker 线程串行化）。
+- **c16 封顶未变**（~1100 上下）：瓶颈为共享镜像上游（§3 方法缺口，需静态 loopback sink 才能隔离纯
+  网关内核）。
+- **周期性 p99 尾部仍在**（c16 ~388 / c64 ~539ms）：ora-2 预判与 P1 连接 churn 无关、头号嫌疑为
+  **P4**（adapter 每 1s 全量 kube LIST → 路由表重建 → ArcSwap store，无 resourceVersion 短路）——
+  本表数据佐证该方向（P1 未消尾），其次候选 P6（`read_headers` 每请求 String 克隆）。
+- 证据：`fixtures-hygress/bench_after3_wrk_c{16,64}.txt`、`after3_image.txt`（提交随本报告）。

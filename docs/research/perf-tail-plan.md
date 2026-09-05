@@ -20,15 +20,16 @@ updated: 2026-09-05
 
 ## Phase 1: 控制面尾仓治理 [IN PROGRESS]
 - [x] 0.0 计划评审放行：@oracle APPROVE（无 🔴；🟠1/🟠2 由评审给出必采纳决策并已并入下述实现设计）
-- [ ] **1.1 kube WATCH 事件驱动**（`crates/hygress-adapter`，评审钉死设计）：
-  - 保留**首轮 `sync_once`**（首快照 = 首次成功 6 类 LIST + store，bind-ready 语义不变）
-  - 之后 6 类资源各一个 `kube::runtime::watcher`（3 个 CRD 走现有 `Api<DynamicObject>`，McpBridge `Config::default()`、其余 `Config::default().labels(MANAGED_SELECTOR)`；reconnect/relist/resourceVersion-continuation 由 kube-runtime 内部处理）
-  - 每个 `Ok(_event)` 置**共享 dirty 标志 + `Notify`**；主循环 `select!{ shutdown, dirty.notified(), sleep(fallback_tick) }` → `if dirty.swap(false) { sync_once }`
-  - **保留 30-60s 低频 fallback tick**（watch 流安全网，非 1s）
-  - **保留 rv 指纹短路**（事件突发去抖的幂等护栏，非冗余）+ 已有 rv==0 加固
-  - watcher `Err` 项 → 记日志 + keep last-known-good + **继续观察，绝不退出流任务** ← CURRENT
-- [ ] 1.2 廉价回退（仅当 1.1 受阻）：**纯配置改动零 diff**——`POLL_INTERVAL=5s`（config.rs:132 已环境可解析），配合 rv 指纹；非代码任务
-- [ ] 1.3 验证：同 rig wrk c16/c64 p99（目标：剔除 6×LIST decode 后残余尾收敛）+ 配置热更 e2e（CRD/Secret 改动 ≤ 一个事件周期生效）+ adapter/translate 测试全绿
+- [x] **1.1 kube WATCH 事件驱动**（已实施 `cf4f6c5`，oracle 复审 PASS，9 点钉死设计全过）：
+  - 保留**首轮 `sync_once`**（首快照 = 首次成功 6 类 LIST + store，bind-ready 语义不变）✓
+  - 6 类资源各一 `kube::runtime::watcher`（McpBridge `Config::default()`、其余 managed-selector）✓
+  - 每个 `Ok(_event)` 置共享 dirty + `Notify`；主循环 `select!{shutdown, dirty.notified(), sleep(30s)}` → `if dirty.swap(false) { sync_once }` ✓
+  - 30s 低频 fallback tick（watch 流安全网）✓
+  - rv 指纹短路 + rv==0 加固保留（事件突发幂等护栏）✓
+  - watcher `Err` 保活；意外流结束补 `tracing::error!`（oracle 一处 Minor）✓
+- [x] 1.2 廉价回退（未启用——1.1 成功落地，不适用）
+- [x] 1.3 验证（`§benchmark 10`）：功能 e2e 通过；**c16/c64 p99 未扁平（388/479-481ms 与 §9 同域）→
+  残余尾部非控制面轮询所致**；嫌疑收敛为共享镜像上游 / rig 抖动 → **Phase 3.2 成为判定器**
 
 ## Phase 2: 数据面分配削减（P6） [PENDING]
 - [ ] 2.1 先量化（评审注：`read_headers(&Session)` 主体是 `session.req_header()` 的纯变换——先抽取 `fn build_inbound_head(req: &RequestHeader) -> InboundHead` 纯函数便于 alloc_guard 无 socket 可测，再上"临时计数"量化；若占比可忽略则 P6 如实降级）
@@ -47,3 +48,6 @@ updated: 2026-09-05
 - 2026-09-05: 上一轮（P4 re-bench）负载工具 `-t4 -c16` / `-t8 -c64`（4/8 客户端线程）；hygress 数据面线程 = vCPU16（每服务 16 × 3 服务 + 控制面 ≈ 68 线程/进程，实测 `ps -eLf`）→ `ref:ora-2`、实测
 - 2026-09-05: 残余 ~300ms 尾嫌疑 = 每 1s 6 类 LIST + 全量 JSON decode（控制面 CPU，与数据面争抢）与共享镜像上游抖动；Phase 1 针对前者 → `ref:ora-2`
 - 2026-09-05: 全部实现项保持"不加不经评审的单点改"：先 1.1 落、再按评审回退/并行 P6、P3 为测量口径改动
+- 2026-09-05: **Phase 1 收尾判读**——WATCH 落地后 p99 未扁平 → 控制面轮询不是残余尾源；剩余嫌疑 =
+  共享镜像上游 / rig 抖动（`benchmark.md §10`）。下一步优先 **Phase 3.2**（静态 loopback sink 判定器），
+  在它落地并归因前，不再追逐控制面微成本；Phase 2（P6）与 3.1（`/healthz` 内核下限）可并行/串行推进

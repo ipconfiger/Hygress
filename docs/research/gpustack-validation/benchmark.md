@@ -182,3 +182,22 @@ Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**�
   （§3 口径）。进一步方向：kube WATCH 替代周期 LIST、控制面轮询拉开到 ≤5s、或 P6（`read_headers`
   每请求 String 克隆——数据面自身）。
 - 证据：`fixtures-hygress/bench_after4_wrk_c{16,64}.txt`、`after4_image.txt`（提交随本报告）。
+
+## 10. Phase 1.1（kube WATCH 事件化）重测（wrk，2026-09-05）：控制面稳态零 LIST，但 p99 尾未扁平 → 尾源非控制面
+
+跟进（Phase 1.1 `cf4f6c5`，oracle 复审 PASS）：控制面由 1s 周期轮询改为 **kube WATCH 事件驱动**
+（稳态零 LIST/JSON-decode/重建，仅 30s 安全网 tick；oracle 钉死设计 9 点全过）。同 rig 重测：
+
+| 指标 | P4 build（`b1c82601`） | **WATCH build（`3b6beabc`）** | 判读 |
+|---|---|---|---|
+| c16 吞吐 / p50 | 1152 / 13.0 ms | 1119-1143 / 12.6 ms | ≈持平（含抖动） |
+| c16 p99（30s / 重复×3） | 299 / 295-399 ms | 388 / 479-481 ms | **未降（噪声内偏升）** |
+| c64 吞吐 / p50 / p99 | 968 / 51.3 / 403 ms | 824 / 50.0 / 577 ms | 本次偏低（共享主机波动） |
+| Socket errors | 0 | 0 | P1 保持 |
+
+- **诚实结论（关键判读）**：控制面 1s LIST/JSON-decode/重建已从稳态移除（代码审校确认），但周期性
+  ~300-480ms p99 尾**未因此扁平** → **该尾部并非来自控制面轮询**；剩余嫌疑为**共享镜像上游**
+  （GPUStack worker / `/readyz` 自身）或 wrk rig 环境抖动（本机并发负载，本次 c16/c64 均可见波动）。
+- **下一步判定器**：`perf-tail-plan.md` Phase 3.2——静态 loopback sink + 测试路由，同法测"网关 vs
+  envoy 纯内核"，一次性归因"网关内核 vs 上游/rig"；在此之后再无控制面微成本可逐（oracle 预判一致）。
+- 证据：`fixtures-hygress/bench_after5_wrk_c{16,64}.txt`、`after5_image.txt`（提交随本报告）。

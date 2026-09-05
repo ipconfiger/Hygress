@@ -32,6 +32,29 @@ empty file) — and appends the hygress process output to **`${GPUSTACK_DATA_DIR
 (host-visible under the GPUStack data bind volume, for diagnosis). It does **not** write request logs
 into `access.log`.
 
+## Data-plane TLS (:443) & certificate rotation
+
+- **Default-install delta (ORA3-M19)**: Hygress binds `GATEWAY_TLS_PORT` (443) **only when** the control-plane
+  snapshot carries a managed `gpustack-tls-*` Secret; GPUStack writes those Secrets **only when launched with
+  `--ssl-keyfile`/`--ssl-certfile`**. A default GPUStack install (no `--ssl-*`) therefore has **no :443
+  listener** → `https://host:443` = connection refused, whereas the real embedded Higress serves an auto
+  self-signed cert page there. Remedy: launch GPUStack with `--ssl-keyfile`/`--ssl-certfile` (Hygress's cert
+  name syntax and managed path already match those), or accept plain http on :80.
+- **SNI constraint (OX-9)**: pingora 0.8's file-path listener API serves the default/first host's cert PEM for
+  **all** SNI names (the per-host SniStore is reflected but not wired to the live listener) → deployments with
+  more than one distinct TLS domain get a hostname mismatch beyond the default cert; single-default-cert is a
+  documented constraint.
+- **Rotation runbook (OX-9)**: a TLS content change in the snapshot is detected at runtime (60s poll; log
+  ERROR "TLS certificate content changed in the control-plane snapshot ... a container restart is REQUIRED
+  ...", counters `hygress_tls_cert_change_detected_total` / `hygress_tls_cert_requires_restart_total` bump) —
+  but pingora reads the listener PEM only at bind time, so a **container restart is REQUIRED** for the new
+  certificate to take effect:
+  1. Rotate the GPUStack TLS secret (`gpustack-tls-*`; refresh via GPUStack's cert config);
+  2. within ~60s observe the ERROR log line and the two counters incrementing (the change was absorbed into
+     the snapshot);
+  3. restart the hygress container (s6 longrun restart / container restart) — the new cert PEM is picked up
+     at the next bind.
+
 ## Rollback (DoD 6)
 `pack/Dockerfile.hygress` copies the surgery scripts; pristine upstream `gateway/pilot/controller/run`
 are preserved under `/etc/s6-overlay/s6-rc.d.dist/` in the image. Rollback = copy them back +

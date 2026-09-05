@@ -14,15 +14,20 @@
 //! Under `integrations` ([`run`]) performs the **real container launch sequence**:
 //! 1. `GPUSTACK_API_PORT` **readiness probe** (500 ms poll, ~30 s bounded) — fail-fast on timeout.
 //! 2. `jwt_secret_key` resolution (env → `{data_dir}/jwt_secret_key` → **fail-fast**), derive the
-//!    gateway token (design §9), build the [`forward_auth::Client`] + [`GpustackSink`] (loopback).
-//! 3. Control-plane [`hygress_adapter::Controller`]: build, optional topology-B IngressClass
-//!    seed, spawn the poll loop, and **await `ready()`** (first snapshot — bind-ready).
+//!    gateway token (design §9), build the [`forward_auth::Client`] + [`GpustackSink`] (loopback;
+//!    the sink's `on_drop` counts usage drops on `/metrics` — ORA3-M4).
+//! 3. Control-plane [`hygress_adapter::Controller`]: build (with the ORA3-MAJ-1 metrics hooks),
+//!    optional topology-B IngressClass seed, spawn the controller loop (watch-driven, 30s
+//!    safety-net tick), and **await `ready()`** (first snapshot — bind-ready).
 //! 4. Attach the terminate-mode [`HygressProxy`] data plane (+ TLS when the snapshot has material),
 //!    **only after** `ready()`. admin/stats listeners ride the same Pingora [`Server`].
 //!
 //! The Pingora [`Server`] is returned by [`run`] and driven by [`main`] on the main thread
 //! (`run_forever()`, which installs the SIGTERM/SIGINT handler and exits 0 on a graceful stop).
-//! The read-only `Controller` keeps polling on the process runtime until the process stops.
+//! The read-only `Controller` keeps watching on the process runtime until the process stops.
+//! [`main`] also installs a panic hook that logs + exits(1) (ORA3-MAJ-1: a dead control plane
+//! must restart under s6, never serve a stale snapshot silently) and, after a graceful stop,
+//! grants the usage sink a short drain window before runtime teardown (ORA3-M4).
 //!
 //! ## Port discipline (design §11)
 //!
@@ -39,7 +44,9 @@ use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 use pingora_core::Result as PingoraResult;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
+#[cfg(feature = "integrations")]
+use tracing::warn;
 
 use crate::admin::{AdminService, AdminState};
 use crate::config::GatewayConfig;
@@ -69,15 +76,16 @@ impl DataState {
     /// `data` may be empty on first boot (the adapter's first LIST fills it, and the data plane
     /// binds only after `ready()`); a structurally-invalid snapshot is rejected here.
     pub fn new(config: GatewayConfig, data: ConfigData) -> Result<Self, GatewayError> {
-        let shared = SharedConfig::new(data)
-            .map_err(|issues| GatewayError::Other(format!("initial snapshot rejected: {issues:?}")))?;
+        let shared = SharedConfig::new(data).map_err(|issues| {
+            GatewayError::Other(format!("initial snapshot rejected: {issues:?}"))
+        })?;
         let metrics = Arc::new(Metrics::new());
         let shared_handle = SharedConfigHandle::new(shared);
         // R-4: publish the core control-plane reject/skip counters on /metrics
         // (and the 15020 shallow-compat /stats/prometheus) at scrape time.
-        metrics.add_collector(Box::new(
-            crate::metrics::ConfigSnapshotCollector::new(shared_handle.inner.clone()),
-        ));
+        metrics.add_collector(Box::new(crate::metrics::ConfigSnapshotCollector::new(
+            shared_handle.inner.clone(),
+        )));
         let policy = Arc::new(crate::policy_loader::PolicyHandle::new(
             config.policy_path.clone(),
         ));
@@ -99,8 +107,7 @@ impl DataState {
     /// reports 500 so operators can distinguish).
     pub fn admin_state(&self) -> Arc<AdminState> {
         let policy = self.policy.clone();
-        let reloader: Arc<dyn Fn() -> bool + Send + Sync> =
-            Arc::new(move || policy.reload());
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || policy.reload());
         let admin = AdminState::new(
             self.metrics.clone(),
             self.config.admin_token.clone(),
@@ -129,7 +136,11 @@ pub async fn readiness_wait(
     interval: Duration,
     timeout: Duration,
 ) -> Result<(), GatewayError> {
-    info!(addr, timeout = timeout.as_millis(), "readiness: waiting for target");
+    info!(
+        addr,
+        timeout = timeout.as_millis(),
+        "readiness: waiting for target"
+    );
     let deadline = Instant::now() + timeout;
     let mut attempt = 0u32;
     loop {
@@ -150,7 +161,10 @@ pub async fn readiness_wait(
                 "readiness: {addr} not reachable within {timeout:?} after {attempt} attempts (fail-fast)"
             )));
         }
-        debug!(addr, attempt, "readiness: not up yet; retrying in {interval:?}");
+        debug!(
+            addr,
+            attempt, "readiness: not up yet; retrying in {interval:?}"
+        );
         tokio::time::sleep(interval).await;
     }
 }
@@ -162,7 +176,10 @@ pub async fn readiness_wait(
 /// Compiled under `integrations` or `test` (it calls the frozen `hygress-egress::token`
 /// contract); excluded from the pure default build so that build stays free of egress.
 #[cfg(any(test, feature = "integrations"))]
-pub fn resolve_gateway_credentials(jwt_env: Option<&str>, data_dir: &std::path::Path) -> Result<String, String> {
+pub fn resolve_gateway_credentials(
+    jwt_env: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<String, String> {
     let key = hygress_egress::token::resolve_jwt_key(jwt_env, data_dir)
         .map_err(|e| format!("fail-fast: jwt_secret_key unresolved: {e}"))?;
     Ok(hygress_egress::token::derive_gateway_token(&key))
@@ -192,7 +209,10 @@ pub fn build_server(
         .map(|x| x.get())
         .unwrap_or(8)
         .clamp(2, 32);
-    let conf = ServerConf { threads: n, ..Default::default() };
+    let conf = ServerConf {
+        threads: n,
+        ..Default::default()
+    };
     let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
 
@@ -237,7 +257,9 @@ fn attach_data_plane(
             Ok((cert, key)) => data_svc
                 .add_tls(&tls_addr, &cert, &key)
                 .map_err(|e| GatewayError::Other(format!("TLS listener on {tls_addr}: {e}")))?,
-            Err(e) => warn!(error = %e, "TLS material present but not exportable; plain HTTP only on {tls_addr}"),
+            Err(e) => {
+                warn!(error = %e, "TLS material present but not exportable; plain HTTP only on {tls_addr}")
+            }
         }
         // R-9⑤ (minimal wiring): reflect the snapshot into the SniStore so the
         // (future) SNI resolver / integration tests see the same cert table.
@@ -250,10 +272,14 @@ fn attach_data_plane(
             "data plane TLS listener bound (default cert PEM); SniStore reflected (0.8 file-path API)"
         );
     }
-    // R-9③ (honest degradation): `higress-config` timing values are parsed into
-    // the snapshot but NOT enforced by the data plane (enforcing an upstream
-    // idle timeout risks killing long SSE streams); warn once at bind so the
-    // gap is discoverable.
+    // ORA3-M16 (documented downgrade): the embedded topology does NOT consume
+    // the unlabeled `higress-config` timing ConfigMap — the snapshot's
+    // label-selector listing never sees it (see adapter snapshot.rs) — so
+    // `data.timing` here is the built-in seed (downstream 1800s / upstream 10s)
+    // unless a managed timing source ever appears. Timing is additionally never
+    // *enforced* by the data plane (enforcing an upstream idle timeout risks
+    // killing long SSE streams — R-9③); keep the warn below for the day a
+    // managed timing source exists, so the gap stays discoverable.
     let t = &data.timing;
     if t.downstream_idle_timeout_secs != 1800
         || t.upstream_idle_timeout_secs != 10
@@ -263,7 +289,7 @@ fn attach_data_plane(
             downstream_idle_timeout_secs = t.downstream_idle_timeout_secs,
             upstream_idle_timeout_secs = t.upstream_idle_timeout_secs,
             max_request_headers_kb = ?t.max_request_headers_kb,
-            "higress-config timing parsed but NOT enforced by the data plane (R-9③; recorded for observability only)"
+            "higress-config timing present but NOT enforced by the data plane (R-9③; recorded for observability only)"
         );
     }
 
@@ -276,13 +302,17 @@ fn attach_data_plane(
 /// file paths (single cert), so per-host SNI multi-cert selection is served with the default cert
 /// (a documented limitation); the plain-HTTP / port-discipline behaviour is unaffected.
 #[cfg(feature = "integrations")]
-fn write_default_tls_pem(tls: &hygress_core::prelude::TlsConfig) -> std::io::Result<(String, String)> {
+fn write_default_tls_pem(
+    tls: &hygress_core::prelude::TlsConfig,
+) -> std::io::Result<(String, String)> {
     let host = tls
         .hosts
         .iter()
         .find(|h| h.is_default)
         .or_else(|| tls.hosts.first())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no TLS host configured"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no TLS host configured")
+        })?;
     let dir = std::env::temp_dir().join(format!("hygress-gateway-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let cert = dir.join("cert.pem");
@@ -296,7 +326,10 @@ fn write_default_tls_pem(tls: &hygress_core::prelude::TlsConfig) -> std::io::Res
         let _ = std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600));
     }
-    Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()))
+    Ok((
+        cert.to_string_lossy().into_owned(),
+        key.to_string_lossy().into_owned(),
+    ))
 }
 
 /// Deterministic content fingerprint of the TLS table (sorted by host): used by
@@ -325,23 +358,26 @@ fn resolve_kubeconfig(config: &GatewayConfig) -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(kc));
         }
     }
-    let fallback = std::path::Path::new(&config.data_dir).join("higress").join("kubeconfig");
+    let fallback = std::path::Path::new(&config.data_dir)
+        .join("higress")
+        .join("kubeconfig");
     fallback.is_file().then_some(fallback)
 }
 
-/// Process shutdown signal (SIGTERM/SIGINT). The `Controller`'s poll loop awaits this so a stop
+/// Process shutdown signal (SIGTERM/SIGINT). The `Controller`'s run loop awaits this so a stop
 /// is clean; Pingora's own handler drives the data-plane graceful stop.
 #[cfg(feature = "integrations")]
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(h) => h,
-            Err(e) => {
-                error!("install SIGTERM handler: {e}");
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("install SIGTERM handler: {e}");
+                    return;
+                }
+            };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => info!("SIGINT received; shutting down"),
             _ = term.recv() => info!("SIGTERM received; shutting down"),
@@ -354,6 +390,27 @@ async fn shutdown_signal() {
     }
 }
 
+/// Effective ext-auth request timeout (ms) for the ORA3-M1 startup summary.
+///
+/// The egress `forward_auth::Client` honors `HIGRESS_EXT_AUTH_TIMEOUT_MS` (a
+/// strictly-positive ms integer) at construction and otherwise applies its 30s
+/// default (ORA3-M6, `DEFAULT_TIMEOUT_SECS`). This mirrors the same env read
+/// purely so the summary line reports the value that will apply — it is NEVER
+/// a control knob here (the client's own read at `forward_auth::Client::new` is
+/// authoritative).
+fn ext_auth_timeout_ms() -> u64 {
+    const DEFAULT_MS: u64 = 30_000;
+    match std::env::var("HIGRESS_EXT_AUTH_TIMEOUT_MS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_MS),
+        Err(_) => DEFAULT_MS,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Process entry
 // ---------------------------------------------------------------------------
@@ -363,6 +420,11 @@ async fn shutdown_signal() {
 /// timeout, jwt fail-fast, control-plane init) is a logged **non-zero** exit.
 pub fn main() {
     init_tracing();
+    // ORA3-MAJ-1: a panicking runtime task (e.g. the control-plane Controller
+    // loop) must never leave the process serving a stale snapshot with green
+    // health checks: log the panic (payload + location) at ERROR, then exit(1)
+    // so the s6 supervisor restarts the container.
+    install_panic_hook();
     let config = GatewayConfig::from_env();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -378,9 +440,45 @@ pub fn main() {
         }
     };
 
-    info!("hygress-gateway: all pre-conditions met; starting server (blocking until SIGTERM/SIGINT)");
-    // Blocks until a graceful stop (SIGTERM/SIGINT); never returns on the normal path.
+    info!(
+        "hygress-gateway: all pre-conditions met; starting server (blocking until SIGTERM/SIGINT)"
+    );
+    // ORA3-M4 (shutdown drain): pingora's graceful stop (`Server::run_forever` →
+    // `run()`) waits for its services to finish, and dropping the data-plane's
+    // `GpustackSink` handles during that stop closes the sink's bounded channel.
+    // The flusher — on the still-alive main runtime, which is only torn down at
+    // `process::exit(0)` after `run()` returns — then drains the queued usage
+    // rows by itself (tokio mpsc delivers queued items before `recv()` returns
+    // `None`), bounded by the egress `POST_TIMEOUT`/`MAX_ATTEMPTS` budget.
+    // No extra window is needed here (and none is reachable after
+    // `run_forever()`, which never returns).
     server.run_forever();
+}
+
+/// ORA3-MAJ-1: install a process-level panic hook that logs the panic payload +
+/// location at ERROR via tracing, then exits(1) so the s6 supervisor restarts
+/// the process. (The default hook only prints to stderr; a panicking background
+/// task would otherwise be invisible to /healthz and /metrics.)
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        error!(
+            location = %location,
+            payload = %payload,
+            "panic; exiting(1) so s6 restarts the process"
+        );
+        std::process::exit(1);
+    }));
 }
 
 /// Build the pure state, run the readiness probe, and (under `integrations`) the full
@@ -392,24 +490,43 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
     let ds = DataState::new(config.clone(), ConfigData::default())?;
     let admin = ds.admin_state();
     let stats = ds.stats_state();
+    // ORA3-M1: startup prints the REDACTED effective-config summary — every
+    // secret (admin token / jwt key) is a boolean presence flag only, never a
+    // value. A malformed env that fell back to a default was already warned
+    // about per-key by `GatewayConfig::parse`.
     info!(
         http_port = config.http_port,
         tls_port = config.tls_port,
         admin = config.admin_addr.as_str(),
+        admin_token_set = config.admin_token.is_some(),
         stats_port = config.pilot_agent_metrics_port,
-        "hygress-gateway bootstrap: state built (admin + stats listeners)"
+        quota_k = config.quota_k,
+        topology_b = config.topology_b,
+        policy_path = config.policy_path.as_str(),
+        ext_auth_fail_mode = if config.ext_auth_fail_closed {
+            "closed"
+        } else {
+            "open"
+        },
+        ext_auth_timeout_ms = ext_auth_timeout_ms(),
+        poll_interval_ms = config.poll_interval.as_millis() as u64,
+        "hygress-gateway bootstrap: state built (admin + stats listeners); effective config summary"
     );
 
     // 1. Readiness probe (design §11.2): GPUSTACK_API_PORT must be up before the data plane
     //    listens, so the gateway fails fast instead of eating GPUStack's readiness window.
     //    Returns an error (main() → non-zero exit) on timeout — never a silent degrade.
     let api_addr = format!("127.0.0.1:{}", config.gpustack_api_port);
-    readiness_wait(&api_addr, Duration::from_millis(500), config.api_ready_timeout)
-        .await?;
+    readiness_wait(
+        &api_addr,
+        Duration::from_millis(500),
+        config.api_ready_timeout,
+    )
+    .await?;
 
     #[cfg(feature = "integrations")]
     {
-        use hygress_adapter::Controller;
+        use hygress_adapter::{Controller, ControllerHooks};
         use hygress_egress::forward_auth;
         use hygress_egress::provider::ProviderClient;
         use hygress_egress::usage_sink::GpustackSink;
@@ -418,11 +535,14 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         use crate::context::GatewayState;
 
         // 2. jwt_secret_key fail-fast (design §9) + derived gateway token.
-        let token = resolve_gateway_credentials(config.jwt_secret_key.as_deref(), Path::new(&config.data_dir))
-            .map_err(|e| {
-                error!("{e}");
-                e
-            })?;
+        let token = resolve_gateway_credentials(
+            config.jwt_secret_key.as_deref(),
+            Path::new(&config.data_dir),
+        )
+        .map_err(|e| {
+            error!("{e}");
+            e
+        })?;
         debug!("gateway token derived");
 
         // 3. Egress clients (all loopback to GPUSTACK_API_PORT) + the data-plane state.
@@ -434,10 +554,21 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         let auth = Some(Arc::new(
             forward_auth::Client::new(&base_url, http.clone()).with_auth_token(token.clone()),
         ));
+        // ORA3-M4: the egress sink invokes `on_drop` at its three drop sites
+        // (queue full / sink task gone / final push failure) — count every
+        // dropped usage row on /metrics (hygress_usage_push_dropped_total).
+        // The sink itself stops cleanly on channel close (all senders dropped
+        // during pingora's graceful stop → the flusher drains the bounded queue
+        // and exits); the shutdown grace window in `main` protects that drain
+        // from runtime teardown.
+        let usage_drop_metrics = ds.metrics.clone();
         let sink = Some(Arc::new(GpustackSink::new(
             &format!("{base_url}/v2/usage/gateway-metrics"),
             http.clone(),
             token.clone(),
+            Some(Arc::new(move || {
+                usage_drop_metrics.record_usage_push_dropped()
+            })),
         )));
         let gateway_state = Arc::new(GatewayState {
             config: Arc::new(ds.shared.clone()),
@@ -462,11 +593,12 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             guardrail_clients: Arc::new(dashmap::DashMap::new()),
         });
 
-        // 3b. Design §2.1 / D-7: the mtime 1s poll task (the same cadence as
-        //     the adapter poll). A changed `policy.yaml` swaps the live
-        //     `ArcSwap` on the next tick; the admin `POST /reload` forces it.
-        //     Also performs periodic eviction of idle quota counters and
-        //     rate-limit buckets (BLOCK-2: leak prevention).
+        // 3b. Design §2.1 / D-7: the mtime poll task on the gateway's 30s
+        //     dutycycle (the same cadence as the adapter's 30s safety-net
+        //     tick). A changed `policy.yaml` swaps the live `ArcSwap` on the
+        //     next tick; the admin `POST /reload` forces it. Also performs
+        //     periodic eviction of idle quota counters and rate-limit buckets
+        //     (BLOCK-2: leak prevention).
         let policy_poll = ds.policy.clone();
         let quota_evict = gateway_state.quota.clone();
         let ratelimit_evict = gateway_state.ratelimit_buckets.clone();
@@ -476,18 +608,16 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             // idle threshold is 5 minutes).
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.tick().await; // the first tick is immediate
-            // Idle threshold: 5 minutes (hardcoded; not currently
-            // configurable via env).
+                                   // Idle threshold: 5 minutes (hardcoded; not currently
+                                   // configurable via env).
             let idle_ms: u64 = 300_000;
             loop {
                 interval.tick().await;
                 // L10: the policy poll does synchronous fs metadata + (on a
                 // change) a YAML parse — run the sync work on the blocking
-                // pool so the 1s tick never blocks a runtime worker.
+                // pool so the 30s tick never blocks a runtime worker.
                 let owner = policy_poll.clone();
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || owner.poll()).await
-                {
+                if let Err(e) = tokio::task::spawn_blocking(move || owner.poll()).await {
                     debug!(error = %e, "policy poll task failed");
                 }
                 // Evict idle quota counters (BLOCK-2: spec-agnostic leak
@@ -517,9 +647,30 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             }
         });
 
-        // 4. Control plane: build the Controller (gating the topology-B IngressClass seed on
-        //    `config.topology_b` — the seed runs once inside `Controller::run`, AM-1) and run
-        //    the 1s poll loop as a task (stopped on shutdown_signal()).
+        // 4. Control plane: build the Controller (gating the topology-B
+        //    IngressClass seed on `config.topology_b` — the seed runs once
+        //    inside `Controller::run`, AM-1) and run the controller loop as a
+        //    task (watch-driven; 30s safety-net tick; stopped on
+        //    shutdown_signal()).
+        //
+        //    ORA3-MAJ-1: wire the adapter's observability hooks to the gateway
+        //    metrics — watch errors (kind + permanent/transient class) land on
+        //    hygress_control_watch_error_total, and the single
+        //    on_snapshot_store signal (one clean mechanism; never double
+        //    counted) both bumps hygress_control_snapshot_store_total and
+        //    stamps the hygress_control_last_store_timestamp_seconds staleness
+        //    gauge.
+        let watch_metrics = ds.metrics.clone();
+        let store_metrics = ds.metrics.clone();
+        let hooks = ControllerHooks {
+            on_watch_error: Some(Arc::new(move |kind: &'static str, class: &'static str| {
+                watch_metrics.record_control_watch_error(kind, class);
+            })),
+            on_snapshot_store: Some(Arc::new(move || {
+                store_metrics.record_control_snapshot_store();
+                store_metrics.record_control_last_store_timestamp();
+            })),
+        };
         let controller = Controller::new(
             ds.shared.inner.clone(),
             resolve_kubeconfig(config),
@@ -527,8 +678,11 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             "higress".to_string(),
             config.poll_interval,
             config.topology_b, // seed_ingress_class: single seed site is inside `Controller::run`
+            hooks,
         )
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("control plane init: {e}")))?;
+        .map_err(|e| {
+            Box::<dyn std::error::Error + Send + Sync>::from(format!("control plane init: {e}"))
+        })?;
         let ready = controller.ready();
         tokio::spawn(controller.run(shutdown_signal()));
 
@@ -542,7 +696,19 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
                 "control plane produced no first snapshot within {bound:?}; refusing to bind the data plane (fail-fast)"
             )));
         }
-        info!("controller ready: first snapshot stored; binding data plane");
+        // ORA3-MAJ-1: log the effective convergence mode once at bind-ready
+        // (best-effort: a first permanent watcher error can only surface after
+        // this point — the adapter then logs "convergence degraded to
+        // tick-only (embedded apiserver)" once and the metric counts it).
+        info!(
+            topology_b = config.topology_b,
+            convergence_mode = if config.topology_b {
+                "watch-driven (topology B: external apiserver serves watch resource-versions)"
+            } else {
+                "tick-driven (topology A / embedded: apiserver serves no watch resource-versions; ~30s safety-net tick)"
+            },
+            "controller ready: first snapshot stored; binding data plane"
+        );
 
         // 6. Build the server (admin + stats) and attach the terminate-mode data plane (+ TLS) —
         //    all bound only now, after ready().
@@ -589,10 +755,15 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
 
     #[cfg(not(feature = "integrations"))]
     {
-        warn!(
-            "the `integrations` feature is disabled: the Pingora data plane, the egress \
-             (forward-auth / usage / provider) clients, and the control-plane Controller are not \
-             compiled (P5-pending). The admin + 15020 listeners are served; the data plane is not."
+        // ORA3-M20: the default feature set now includes `integrations`, so a
+        // build that reaches this branch was explicitly compiled with
+        // `--no-default-features` (the pure compile-split). Fail LOUDLY at
+        // startup: this binary has no data plane at all.
+        error!(
+            "the `integrations` feature is disabled (--no-default-features compile-split): \
+             the Pingora data plane, the egress (forward-auth / usage / provider) clients, and \
+             the control-plane Controller are NOT compiled. Only the admin + 15020 listeners are \
+             served — the data plane is absent; do not ship this binary."
         );
         let server = build_server(config, admin, stats)?;
         Ok(server)
@@ -619,7 +790,8 @@ mod tests {
     /// A throwaway empty dir (unique per call — safe under parallel test threads).
     fn tempdir() -> std::path::PathBuf {
         let n = STATIC_TMP.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("hygress-gateway-test-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hygress-gateway-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -665,7 +837,10 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert!(res.is_ok(), "a live target must pass the readiness probe: {res:?}");
+        assert!(
+            res.is_ok(),
+            "a live target must pass the readiness probe: {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -679,11 +854,17 @@ mod tests {
             Duration::from_millis(150),
         )
         .await;
-        assert!(res.is_err(), "a dead target must fail the readiness probe: {res:?}");
+        assert!(
+            res.is_err(),
+            "a dead target must fail the readiness probe: {res:?}"
+        );
         // Bounded: returns promptly, well under an unbounded hang.
         assert!(start.elapsed() < Duration::from_secs(5));
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("readiness"), "error should mention readiness: {msg}");
+        assert!(
+            msg.contains("readiness"),
+            "error should mention readiness: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -708,7 +889,9 @@ mod tests {
         let dir = tempdir();
         let token = resolve_gateway_credentials(Some("my-secret-key"), &dir).unwrap();
         assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -728,8 +911,14 @@ mod tests {
         // Neither env nor the {data_dir}/jwt_secret_key file → fail-fast Err (never silent).
         let dir = tempdir(); // empty dir, no jwt_secret_key
         let err = resolve_gateway_credentials(None, &dir).expect_err("absent key must fail");
-        assert!(err.contains("jwt_secret_key"), "error should name the key: {err}");
-        assert!(err.contains("fail-fast"), "error should mark fail-fast: {err}");
+        assert!(
+            err.contains("jwt_secret_key"),
+            "error should name the key: {err}"
+        );
+        assert!(
+            err.contains("fail-fast"),
+            "error should mark fail-fast: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -809,7 +998,16 @@ mod tests {
         ds.metrics.record_request(200, "model_route");
         assert!(ds.metrics.encode().contains("hygress_requests_total"));
         let admin = ds.admin_state();
-        assert_eq!(admin.route("GET", "/healthz", &hygress_core::transform::HeaderMap::new()).status, 200);
+        assert_eq!(
+            admin
+                .route(
+                    "GET",
+                    "/healthz",
+                    &hygress_core::transform::HeaderMap::new()
+                )
+                .status,
+            200
+        );
         let stats = ds.stats_state();
         assert_eq!(stats.route("GET", "/stats/prometheus").status, 200);
         // Empty SNI store (no certs yet).
@@ -820,17 +1018,15 @@ mod tests {
     fn data_state_rejects_structurally_invalid_snapshot() {
         // A route with a malformed path regex is a structural failure that rejects the
         // whole snapshot (SharedConfig::new returns the issues).
-        use hygress_core::prelude::{PathPred, RouteKind, RouteRule, Destination};
+        use hygress_core::prelude::{Destination, PathPred, RouteKind, RouteRule};
         let bad = ConfigData {
-            routes: vec![
-                RouteRule::new(
-                    "m",
-                    RouteKind::Main,
-                    vec![PathPred::new("([unclosed")],
-                    vec![Destination::new("a.static:80")],
-                )
-                .unwrap(),
-            ],
+            routes: vec![RouteRule::new(
+                "m",
+                RouteKind::Main,
+                vec![PathPred::new("([unclosed")],
+                vec![Destination::new("a.static:80")],
+            )
+            .unwrap()],
             ..Default::default()
         };
         let cfg = GatewayConfig::default();

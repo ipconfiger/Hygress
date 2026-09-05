@@ -21,7 +21,8 @@ pub struct ConfigSnapshotCollector {
 }
 
 const REJECT_NAME: &str = "hygress_config_reject_total";
-const REJECT_HELP: &str = "Control-plane snapshots rejected as a whole (structural, keep-last-known-good).";
+const REJECT_HELP: &str =
+    "Control-plane snapshots rejected as a whole (structural, keep-last-known-good).";
 const SKIPPED_NAME: &str = "hygress_config_object_skipped_total";
 const SKIPPED_HELP: &str = "Control-plane objects skipped by per-object validation.";
 
@@ -102,6 +103,15 @@ struct Inner {
     retries_total: IntCounter,
     upstream_errors_total: IntCounter,
     fallback_total: IntCounter,
+    fallback_exhausted_total: IntCounter,
+    usage_push_dropped_total: IntCounter,
+    // ORA3-MAJ-1: control-plane health — watcher errors by kind/class, new
+    // snapshot stores, and the last-store staleness gauge (the round's only
+    // MAJOR: control-plane death / permanent degradation was otherwise a black
+    // box behind rate-limited logs).
+    control_watch_error_total: IntCounterVec,
+    control_snapshot_store_total: IntCounter,
+    control_last_store_timestamp_seconds: IntGauge,
     auth_decisions: IntCounterVec,
     active_requests: IntGauge,
     // Extension stages (design §4): rate limiting / quota / routing policy /
@@ -148,33 +158,61 @@ impl Metrics {
         )
         .expect("tokens_total");
         let ttft = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "hygress_ttft_seconds",
-                "Time to first response chunk.",
-            )
-            .buckets(vec![
-                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ]),
+            prometheus::HistogramOpts::new("hygress_ttft_seconds", "Time to first response chunk.")
+                .buckets(vec![
+                    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+                ]),
             &["kind"],
         )
         .expect("ttft");
-        let retries_total =
-            IntCounter::new("hygress_retries_total", "Failover retries across candidates.")
-                .expect("retries_total");
-        let upstream_errors_total =
-            IntCounter::new("hygress_upstream_errors_total", "Upstream attempt failures.")
-                .expect("upstream_errors");
-        let fallback_total =
-            IntCounter::new("hygress_fallback_total", "Fallback redirects taken.")
-                .expect("fallback_total");
+        let retries_total = IntCounter::new(
+            "hygress_retries_total",
+            "Failover retries across candidates.",
+        )
+        .expect("retries_total");
+        let upstream_errors_total = IntCounter::new(
+            "hygress_upstream_errors_total",
+            "Upstream attempt failures.",
+        )
+        .expect("upstream_errors");
+        let fallback_total = IntCounter::new("hygress_fallback_total", "Fallback redirects taken.")
+            .expect("fallback_total");
+        let fallback_exhausted_total = IntCounter::new(
+            "hygress_fallback_exhausted_total",
+            "Fallback chains that terminated without a successful hop (budget exhausted or chain end without dispatch).",
+        )
+        .expect("fallback_exhausted_total");
+        let usage_push_dropped_total = IntCounter::new(
+            "hygress_usage_push_dropped_total",
+            "Usage rows dropped without reaching the usage sink (queue-full / sink task gone / final push failure).",
+        )
+        .expect("usage_push_dropped_total");
+        // ORA3-MAJ-1: control-plane observability families (see `Inner`).
+        let control_watch_error_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_control_watch_error_total",
+                "Control-plane watcher errors by kind and class (permanent: watch unsupported by the apiserver, convergence degraded to the tick; transient: recoverable watch failure).",
+            ),
+            &["kind", "class"],
+        )
+        .expect("control_watch_error_total");
+        let control_snapshot_store_total = IntCounter::new(
+            "hygress_control_snapshot_store_total",
+            "Control-plane snapshots successfully stored (new content).",
+        )
+        .expect("control_snapshot_store_total");
+        let control_last_store_timestamp_seconds = IntGauge::new(
+            "hygress_control_last_store_timestamp_seconds",
+            "Unix time (seconds) of the last successful control-plane snapshot store; 0 before the first store.",
+        )
+        .expect("control_last_store_timestamp_seconds");
         let auth_decisions = IntCounterVec::new(
             prometheus::Opts::new("hygress_auth_decisions_total", "Auth decisions."),
             &["result"],
         )
         .expect("auth_decisions");
-        let active_requests =
-            IntGauge::new("hygress_active_requests", "In-flight requests.")
-                .expect("active_requests");
+        let active_requests = IntGauge::new("hygress_active_requests", "In-flight requests.")
+            .expect("active_requests");
         let rate_limit_denied = IntCounterVec::new(
             prometheus::Opts::new(
                 "hygress_rate_limit_denied_total",
@@ -229,6 +267,11 @@ impl Metrics {
             Box::new(retries_total.clone()),
             Box::new(upstream_errors_total.clone()),
             Box::new(fallback_total.clone()),
+            Box::new(fallback_exhausted_total.clone()),
+            Box::new(usage_push_dropped_total.clone()),
+            Box::new(control_watch_error_total.clone()),
+            Box::new(control_snapshot_store_total.clone()),
+            Box::new(control_last_store_timestamp_seconds.clone()),
             Box::new(auth_decisions.clone()),
             Box::new(active_requests.clone()),
             Box::new(rate_limit_denied.clone()),
@@ -253,6 +296,11 @@ impl Metrics {
                 retries_total,
                 upstream_errors_total,
                 fallback_total,
+                fallback_exhausted_total,
+                usage_push_dropped_total,
+                control_watch_error_total,
+                control_snapshot_store_total,
+                control_last_store_timestamp_seconds,
                 auth_decisions,
                 active_requests,
                 rate_limit_denied,
@@ -318,11 +366,49 @@ impl Metrics {
         self.inner.fallback_total.inc();
     }
 
-    pub fn record_auth(&self, result: &str) {
+    /// ORA3-M3: a fallback chain ended without a successful hop (10-hop budget
+    /// exhausted, or the chain terminated with no dispatch). Distinct from
+    /// [`Metrics::record_fallback`], which counts *armed* redirect hops.
+    pub fn record_fallback_exhausted(&self) {
+        self.inner.fallback_exhausted_total.inc();
+    }
+
+    /// ORA3-M4: a usage row was dropped before the usage sink accepted it
+    /// (bounded queue full / sink task gone / final push failure). The egress
+    /// sink invokes this through the `on_drop` callback wired in bootstrap.
+    pub fn record_usage_push_dropped(&self) {
+        self.inner.usage_push_dropped_total.inc();
+    }
+
+    /// ORA3-MAJ-1: a control-plane watcher error was classified. `kind` is the
+    /// watched resource kind (configmap / ingress / secret / …); `class` is
+    /// `permanent` (watch unsupported by the apiserver → convergence degraded
+    /// to the 30s safety-net tick) or `transient` (recoverable watch failure).
+    pub fn record_control_watch_error(&self, kind: &str, class: &str) {
         self.inner
-            .auth_decisions
-            .with_label_values(&[result])
+            .control_watch_error_total
+            .with_label_values(&[kind, class])
             .inc();
+    }
+
+    /// ORA3-MAJ-1: a new control-plane snapshot was successfully stored.
+    pub fn record_control_snapshot_store(&self) {
+        self.inner.control_snapshot_store_total.inc();
+    }
+
+    /// ORA3-MAJ-1: stamp the last-store staleness gauge with the current wall
+    /// clock (unix seconds). Kept separate from the store counter so bootstrap
+    /// wires both from the single adapter `on_snapshot_store` hook.
+    pub fn record_control_last_store_timestamp(&self) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner.control_last_store_timestamp_seconds.set(secs);
+    }
+
+    pub fn record_auth(&self, result: &str) {
+        self.inner.auth_decisions.with_label_values(&[result]).inc();
     }
 
     pub fn active_requests_inc(&self) {
@@ -459,7 +545,8 @@ mod tests {
     fn config_snapshot_collector_exposes_core_counters() {
         use hygress_core::prelude::{Destination, PathPred, RouteKind, RouteRule};
         // Bump the core counters through real store calls.
-        let shared = Arc::new(hygress_core::SharedConfig::new(hygress_core::ConfigData::default()).unwrap());
+        let shared =
+            Arc::new(hygress_core::SharedConfig::new(hygress_core::ConfigData::default()).unwrap());
         // Per-object skips (bad empty-key route dropped, good kept).
         let skipped = shared
             .store(hygress_core::ConfigData {
@@ -506,7 +593,63 @@ mod tests {
         assert!(out.contains("hygress_config_object_skipped_total"));
         // The prometheus text lines carry the values: NAME 1 / NAME 2 pattern
         // (unlabeled counters: "NAME 1" or "NAME 2").
-        assert!(out.lines().any(|l| l.starts_with("hygress_config_reject_total") && l.ends_with('1')));
-        assert!(out.lines().any(|l| l.starts_with("hygress_config_object_skipped_total") && l.ends_with('1')));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with("hygress_config_reject_total") && l.ends_with('1')));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with("hygress_config_object_skipped_total") && l.ends_with('1')));
+    }
+
+    /// ORA3-MAJ-1: the control-plane health families record per (kind, class)
+    /// watcher errors, count new snapshot stores, and stamp the last-store
+    /// staleness gauge — all on `/metrics` like the other real counters.
+    #[test]
+    fn control_plane_metrics_record_and_render() {
+        let m = Metrics::new();
+        // Two permanent configmap watcher errors + one transient ingress error.
+        m.record_control_watch_error("configmap", "permanent");
+        m.record_control_watch_error("configmap", "permanent");
+        m.record_control_watch_error("ingress", "transient");
+        // Two new-snapshot stores; the last one stamps the staleness gauge.
+        m.record_control_snapshot_store();
+        m.record_control_snapshot_store();
+        m.record_control_last_store_timestamp();
+
+        let out = m.encode();
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_control_watch_error_total{")
+                    && l.contains("kind=\"configmap\"")
+                    && l.contains("class=\"permanent\"")
+                    && l.ends_with(" 2")
+            }),
+            "permanent configmap watch errors (x2) missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_control_watch_error_total{")
+                    && l.contains("kind=\"ingress\"")
+                    && l.contains("class=\"transient\"")
+                    && l.ends_with(" 1")
+            }),
+            "transient ingress watch error missing:\n{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("hygress_control_snapshot_store_total") && l.ends_with(" 2")),
+            "snapshot store counter (x2) missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_control_last_store_timestamp_seconds")
+                    && l.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|v| v > 0.0)
+                        .unwrap_or(false)
+            }),
+            "last-store timestamp gauge must be set to a positive unix time:\n{out}"
+        );
     }
 }

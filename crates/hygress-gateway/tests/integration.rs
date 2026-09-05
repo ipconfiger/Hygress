@@ -346,6 +346,7 @@ fn build_state_ext(
             usage_url,
             http.clone(),
             token.clone(),
+            None, // B9.5 ORA3-M4: on_drop usage-drop hook (metrics wiring is bootstrap-side)
         ))),
         upstream: Arc::new(ProviderClient),
         metrics: Arc::new(Metrics::new()),

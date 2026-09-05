@@ -102,23 +102,30 @@ impl GatewayConfig {
     }
 
     /// Parse from an arbitrary key lookup (pure; testable).
+    ///
+    /// Every numeric / duration / bool / enum env that fails to parse logs a
+    /// warning naming the key and the attempted value and keeps its documented
+    /// default (ORA3-M1: no silent env fallback).
     pub fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
         let mut c = Self::default();
 
         if let Some(v) = clean(get("GATEWAY_HTTP_PORT")) {
-            if let Ok(p) = v.parse() {
-                c.http_port = p;
-            }
+            c.http_port = match v.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => warn_unparsable("GATEWAY_HTTP_PORT", &v, c.http_port),
+            };
         }
         if let Some(v) = clean(get("GATEWAY_TLS_PORT")) {
-            if let Ok(p) = v.parse() {
-                c.tls_port = p;
-            }
+            c.tls_port = match v.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => warn_unparsable("GATEWAY_TLS_PORT", &v, c.tls_port),
+            };
         }
         if let Some(v) = clean(get("GPUSTACK_API_PORT")) {
-            if let Ok(p) = v.parse() {
-                c.gpustack_api_port = p;
-            }
+            c.gpustack_api_port = match v.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => warn_unparsable("GPUSTACK_API_PORT", &v, c.gpustack_api_port),
+            };
         }
         if let Some(v) = clean(get("HYGRESS_ADMIN_ADDR")) {
             c.admin_addr = v;
@@ -136,37 +143,53 @@ impl GatewayConfig {
             c.gateway_namespace = v;
         }
         if let Some(v) = clean(get("POLL_INTERVAL")) {
-            c.poll_interval = parse_duration(&v);
+            c.poll_interval = parse_duration_env("POLL_INTERVAL", &v, c.poll_interval);
         }
         if let Some(v) = clean(get("GATEWAY_PILOT_AGENT_METRICS_PORT")) {
-            if let Ok(p) = v.parse() {
-                c.pilot_agent_metrics_port = p;
-            }
+            c.pilot_agent_metrics_port = match v.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => warn_unparsable(
+                    "GATEWAY_PILOT_AGENT_METRICS_PORT",
+                    &v,
+                    c.pilot_agent_metrics_port,
+                ),
+            };
         }
         if let Some(v) = clean(get("HYGRESS_TOPOLOGY_B")) {
-            c.topology_b = parse_bool(&v);
+            c.topology_b = parse_bool_env("HYGRESS_TOPOLOGY_B", &v);
         }
         if let Some(v) = clean(get("HYGRESS_API_READY_TIMEOUT")) {
-            c.api_ready_timeout = parse_duration(&v);
+            c.api_ready_timeout =
+                parse_duration_env("HYGRESS_API_READY_TIMEOUT", &v, c.api_ready_timeout);
         }
         if let Some(v) = clean(get("HYGRESS_SNAPSHOT_TIMEOUT")) {
-            c.snapshot_timeout = parse_duration(&v);
+            c.snapshot_timeout =
+                parse_duration_env("HYGRESS_SNAPSHOT_TIMEOUT", &v, c.snapshot_timeout);
         }
         if let Some(v) = clean(get("HYGRESS_POLICY_PATH")) {
             c.policy_path = v;
         }
         if let Some(v) = clean(get("HYGRESS_QUOTA_K")) {
-            if let Ok(k) = v.parse::<u64>() {
-                c.quota_k = k.max(1);
-            }
+            c.quota_k = match v.parse::<u64>() {
+                Ok(k) => k.max(1),
+                Err(_) => warn_unparsable("HYGRESS_QUOTA_K", &v, c.quota_k),
+            };
         }
         if let Some(v) = clean(get("HYGRESS_GUARDRAIL_URL")) {
             c.guardrail_url = Some(v);
         }
         if let Some(v) = clean(get("HYGRESS_EXT_AUTH_FAIL_MODE")) {
-            // `open` → fail-open; anything else (incl. `closed`) → fail-closed
-            // (the safe default matching the GPUStack/Higress baseline).
-            c.ext_auth_fail_closed = !v.eq_ignore_ascii_case("open");
+            // `open` → fail-open; `closed` → fail-closed (the safe default
+            // matching the GPUStack/Higress baseline). Anything else is a typo:
+            // warn (ORA3-M1) and stay fail-closed — never silent, never
+            // misinterpreted as `open`.
+            match v.to_ascii_lowercase().as_str() {
+                "open" => c.ext_auth_fail_closed = false,
+                "closed" => c.ext_auth_fail_closed = true,
+                _ => {
+                    warn_unparsable("HYGRESS_EXT_AUTH_FAIL_MODE", &v, c.ext_auth_fail_closed);
+                }
+            }
         }
         c
     }
@@ -183,24 +206,58 @@ fn clean(v: Option<String>) -> Option<String> {
     Some(v)
 }
 
-/// Accept common truthy forms (`true`/`1`/`yes`/`on`, case-insensitive) as `true`.
-fn parse_bool(s: &str) -> bool {
-    matches!(
-        s.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// ORA3-M1: an env value failed to parse — log a warning naming the key, the
+/// attempted value and the applied default, then return the default. This is
+/// the single warn channel for every silent-env-fallback fix in [`parse`].
+fn warn_unparsable<T: std::fmt::Debug>(key: &str, value: &str, default: T) -> T {
+    tracing::warn!(
+        "{}; using default {:?}",
+        unparsable_env_msg(key, value),
+        default
+    );
+    default
 }
 
-/// Accept a bare integer (seconds) or a `1s` / `500ms` duration string.
-fn parse_duration(s: &str) -> Duration {
-    let s = s.trim().to_ascii_lowercase();
+/// The ORA3-M1 warning prefix naming the env key and the attempted value
+/// (pure, so the message contract is unit-testable without a tracing
+/// subscriber).
+fn unparsable_env_msg(key: &str, value: &str) -> String {
+    format!("env {key}={value:?} unparsable")
+}
+
+/// Accept `true`/`1`/`yes`/`on` as `true` and `false`/`0`/`no`/`off` as
+/// `false` (case-insensitive). Any other value is malformed: warn (ORA3-M1)
+/// and fall back to `false` (the field default) — never a silent misinterpret
+/// of a typo like `HYGRESS_TOPOLOGY_B=treu`.
+fn parse_bool_env(key: &str, v: &str) -> bool {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => warn_unparsable(key, v, false),
+    }
+}
+
+/// Accept a bare integer (seconds) or a `1s` / `500ms` duration string for the
+/// env `key`. A malformed value logs a warning (ORA3-M1) and falls back to
+/// `default` — that key's documented default — instead of the old silent 1s.
+fn parse_duration_env(key: &str, v: &str, default: Duration) -> Duration {
+    let s = v.trim().to_ascii_lowercase();
     if let Some(ms) = s.strip_suffix("ms") {
-        return Duration::from_millis(ms.parse().unwrap_or(1_000));
+        return match ms.parse::<u64>() {
+            Ok(n) => Duration::from_millis(n),
+            Err(_) => warn_unparsable(key, v, default),
+        };
     }
     if let Some(secs) = s.strip_suffix('s') {
-        return Duration::from_secs(secs.parse().unwrap_or(1));
+        return match secs.parse::<u64>() {
+            Ok(n) => Duration::from_secs(n),
+            Err(_) => warn_unparsable(key, v, default),
+        };
     }
-    Duration::from_secs(s.parse().unwrap_or(1))
+    match s.parse::<u64>() {
+        Ok(n) => Duration::from_secs(n),
+        Err(_) => warn_unparsable(key, v, default),
+    }
 }
 
 #[cfg(test)]
@@ -264,22 +321,31 @@ mod tests {
         assert_eq!(c.snapshot_timeout, Duration::from_secs(300));
         assert_eq!(c.policy_path, "/etc/hygress/custom-policy.yaml");
         assert_eq!(c.quota_k, 8);
-        assert_eq!(c.guardrail_url.as_deref(), Some("http://127.0.0.1:9090/v1/classify"));
+        assert_eq!(
+            c.guardrail_url.as_deref(),
+            Some("http://127.0.0.1:9090/v1/classify")
+        );
     }
 
     #[test]
     fn poll_interval_forms() {
-        assert_eq!(parse(&[("POLL_INTERVAL", "3")]).poll_interval, Duration::from_secs(3));
-        assert_eq!(parse(&[("POLL_INTERVAL", "1500ms")]).poll_interval, Duration::from_millis(1500));
-        assert_eq!(parse(&[("POLL_INTERVAL", "0bad")]).poll_interval, Duration::from_secs(1));
+        assert_eq!(
+            parse(&[("POLL_INTERVAL", "3")]).poll_interval,
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            parse(&[("POLL_INTERVAL", "1500ms")]).poll_interval,
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            parse(&[("POLL_INTERVAL", "0bad")]).poll_interval,
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
     fn blank_is_ignored() {
-        let c = parse(&[
-            ("GATEWAY_HTTP_PORT", "  "),
-            ("HYGRESS_ADMIN_TOKEN", ""),
-        ]);
+        let c = parse(&[("GATEWAY_HTTP_PORT", "  "), ("HYGRESS_ADMIN_TOKEN", "")]);
         assert_eq!(c.http_port, 80);
         assert_eq!(c.admin_token, None);
     }
@@ -311,12 +377,91 @@ mod tests {
     #[test]
     fn ext_auth_fail_mode_env() {
         // R-12: default fail-closed (matches GPUStack/Higress
-        // `failure_mode_allow=false`); `open` flips to fail-open; anything else
-        // (incl. `closed`) stays fail-closed.
+        // `failure_mode_allow=false`); `open` flips to fail-open; `closed`
+        // stays fail-closed; anything else is a typo — warned (ORA3-M1) and
+        // kept fail-closed (the safe default).
         assert!(parse(&[]).ext_auth_fail_closed, "default must be closed");
         assert!(!parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "open")]).ext_auth_fail_closed);
         assert!(!parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "OPEN")]).ext_auth_fail_closed);
         assert!(parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "closed")]).ext_auth_fail_closed);
-        assert!(parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "bogus")]).ext_auth_fail_closed, "unknown value stays closed");
+        assert!(
+            parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "bogus")]).ext_auth_fail_closed,
+            "unknown value stays closed"
+        );
+    }
+
+    // ----- ORA3-M1: malformed env values warn and keep their OWN default -----
+
+    #[test]
+    fn malformed_numeric_env_keeps_each_default() {
+        // Every invalid numeric env silently kept its default before ORA3-M1;
+        // it still does (fail-safe), now with a warn naming key + value.
+        let c = parse(&[
+            ("GATEWAY_HTTP_PORT", "not-a-port"),
+            ("GATEWAY_TLS_PORT", "abc"),
+            ("GPUSTACK_API_PORT", "12x"),
+            ("GATEWAY_PILOT_AGENT_METRICS_PORT", "no"),
+        ]);
+        assert_eq!(c.http_port, 80);
+        assert_eq!(c.tls_port, 443);
+        assert_eq!(c.gpustack_api_port, 80);
+        assert_eq!(c.pilot_agent_metrics_port, 15020);
+    }
+
+    #[test]
+    fn malformed_duration_env_keeps_each_keys_default() {
+        // ORA3-M1: previously ANY malformed duration silently collapsed to 1s
+        // (a typo'd HYGRESS_SNAPSHOT_TIMEOUT shrank the boot budget to 1s!).
+        // Each malformed value now warns and keeps that key's documented
+        // default (poll 1s / api-ready 30s / snapshot 60s).
+        assert_eq!(
+            parse(&[("POLL_INTERVAL", "0bad")]).poll_interval,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse(&[("HYGRESS_API_READY_TIMEOUT", "forever")]).api_ready_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse(&[("HYGRESS_SNAPSHOT_TIMEOUT", "garbage")]).snapshot_timeout,
+            Duration::from_secs(60)
+        );
+        // Valid forms are unaffected (bare seconds / ms / s suffixes).
+        assert_eq!(
+            parse(&[("HYGRESS_API_READY_TIMEOUT", "5")]).api_ready_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse(&[("HYGRESS_SNAPSHOT_TIMEOUT", "2500ms")]).snapshot_timeout,
+            Duration::from_millis(2500)
+        );
+    }
+
+    #[test]
+    fn malformed_bool_env_warns_and_keeps_default() {
+        // `treu` (a real-world typo the audit found) must not silently seed
+        // topology B; the falsy forms stay silent/valid.
+        assert!(!parse(&[("HYGRESS_TOPOLOGY_B", "treu")]).topology_b);
+        assert!(!parse(&[("HYGRESS_TOPOLOGY_B", "false")]).topology_b);
+        assert!(!parse(&[("HYGRESS_TOPOLOGY_B", "off")]).topology_b);
+    }
+
+    /// The warn message itself names the env key and the attempted value, so an
+    /// operator can find the typo (ORA3-M1 message contract; the tracing event
+    /// is dropped in unit tests without a subscriber, so the pure prefix is
+    /// what gets pinned here).
+    #[test]
+    fn warn_message_names_key_and_value() {
+        let msg = unparsable_env_msg("HYGRESS_TOPOLOGY_B", "treu");
+        assert!(
+            msg.contains("HYGRESS_TOPOLOGY_B"),
+            "must name the key: {msg}"
+        );
+        assert!(msg.contains("treu"), "must echo the attempted value: {msg}");
+        let msg = unparsable_env_msg("POLL_INTERVAL", "0bad");
+        assert!(
+            msg.contains("POLL_INTERVAL") && msg.contains("0bad"),
+            "{msg}"
+        );
     }
 }

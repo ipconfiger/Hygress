@@ -14,7 +14,11 @@
 //!    `Bytes` clone). Enforce the body cap → 413.
 //! 2. Run the **pure** pipeline stages ①–⑦ via [`crate::pipeline::prepare`]
 //!    (strip / model-router / transformer-in / route match / SWRR / registry).
-//! 3. Stage ⑤ ext-auth (origin-ingress `ai-route-route-` scope, FAIL_OPEN).
+//! 3. Stage ⑤ ext-auth (origin-ingress `ai-route-route-` scope). R-12: the
+//!    default fail mode is **closed** — an unavailable / 5xx auth service is
+//!    rejected 403 (the GPUStack/Higress `failure_mode_allow=false` baseline);
+//!    fail-**open** requires the explicit `HYGRESS_EXT_AUTH_FAIL_MODE=open`
+//!    configuration.
 //! 4. **Failover loop** (⑩): for each SWRR-ordered candidate, build the outbound
 //!    (⑧ model-mapper + ⑨ set-instance/route-name + Host) via
 //!    [`crate::pipeline::build_outbound`] and send it over a long-lived
@@ -51,13 +55,13 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 use hygress_core::prelude::{
-    GuardAction, GuardrailFailMode, GuardrailSpec, LlmGuardSpec, LlmGuardMode, LlmOnError,
+    GuardAction, GuardrailFailMode, GuardrailSpec, LlmGuardMode, LlmGuardSpec, LlmOnError,
     MatchKind, QuotaDecision, RouteTable, StaticRuleSet, TokenBucketSpec, UsageSchema,
 };
-use hygress_core::usage::{FlushFields, UsageSnapshot};
 use hygress_core::transform::HeaderMap;
-use pingora_core::server::Server;
+use hygress_core::usage::{FlushFields, UsageSnapshot};
 use pingora_core::server::configuration::Opt;
+use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Error as PingoraError;
 use pingora_core::ErrorType::InternalError;
@@ -71,7 +75,7 @@ use crate::context::{
 };
 use crate::pipeline;
 use crate::pipeline::PipelineCtx;
-use crate::policy_loader::{MergedEntry, MergedPolicy, bare_ingress_name};
+use crate::policy_loader::{bare_ingress_name, MergedEntry, MergedPolicy};
 use crate::quota::QuotaReservation;
 use crate::response_pipeline::ResponsePipeline;
 
@@ -119,35 +123,30 @@ impl HygressProxy {
         match &candidate.proxy {
             None => self.http.clone(),
             Some(proxy) => {
-                let entry = self
-                    .proxy_clients
-                    .entry(proxy.clone())
-                    .or_insert_with(|| {
-                        let proxy_url = if proxy.contains("://") {
-                            proxy.clone()
-                        } else {
-                            format!("http://{proxy}")
-                        };
-                        let mut builder = reqwest::Client::builder()
-                            .connect_timeout(Duration::from_secs(10))
-                            .pool_max_idle_per_host(128);
-                        // `all` covers both origin schemes for the egress: `http://` origins
-                        // proxy absolute-form; `https://` origins open a `CONNECT` tunnel.
-                        // `http`-only would skip the tunnel and dial `https` origins direct.
-                        match reqwest::Proxy::all(&proxy_url) {
-                            Ok(p) => builder = builder.proxy(p),
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    proxy = %proxy,
-                                    "invalid outbound proxy; dialing direct"
-                                )
-                            }
+                let entry = self.proxy_clients.entry(proxy.clone()).or_insert_with(|| {
+                    let proxy_url = if proxy.contains("://") {
+                        proxy.clone()
+                    } else {
+                        format!("http://{proxy}")
+                    };
+                    let mut builder = reqwest::Client::builder()
+                        .connect_timeout(Duration::from_secs(10))
+                        .pool_max_idle_per_host(128);
+                    // `all` covers both origin schemes for the egress: `http://` origins
+                    // proxy absolute-form; `https://` origins open a `CONNECT` tunnel.
+                    // `http`-only would skip the tunnel and dial `https` origins direct.
+                    match reqwest::Proxy::all(&proxy_url) {
+                        Ok(p) => builder = builder.proxy(p),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                proxy = %proxy,
+                                "invalid outbound proxy; dialing direct"
+                            )
                         }
-                        builder
-                            .build()
-                            .unwrap_or_else(|_| reqwest::Client::new())
-                    });
+                    }
+                    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+                });
                 entry.value().clone()
             }
         }
@@ -199,11 +198,7 @@ impl ProxyHttp for HygressProxy {
     // -------------------------------------------------------------------
     // request_filter — the full terminate-mode data path (①–⑭).
     // -------------------------------------------------------------------
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut ReqCtx,
-    ) -> PingoraResult<bool>
+    async fn request_filter(&self, session: &mut Session, ctx: &mut ReqCtx) -> PingoraResult<bool>
     where
         Self::CTX: Send + Sync,
     {
@@ -352,19 +347,17 @@ impl ProxyHttp for HygressProxy {
                 "mirror"
             };
             // A POST/PUT/PATCH inference request is non-idempotent (retry gate).
-            let non_idempotent =
-                matches!(method.as_str(), "POST" | "PUT" | "PATCH");
+            let non_idempotent = matches!(method.as_str(), "POST" | "PUT" | "PATCH");
 
             // The effective policy for this hop (route key known after
             // `route_match`; design §3 / D-12). `None` when no policy is loaded
             // (all pass-through, design §7). The merged spec + its compiled
             // static rules were precomputed at load/reload (H3) — per hop this
             // is one `Arc` load (`PolicyHandle::merged_for`).
-            let merged: Option<std::sync::Arc<MergedEntry>> =
-                state
-                    .policy
-                    .as_ref()
-                    .map(|h| h.merged_for(bare_ingress_name(&prepared.route.ingress_name)));
+            let merged: Option<std::sync::Arc<MergedEntry>> = state
+                .policy
+                .as_ref()
+                .map(|h| h.merged_for(bare_ingress_name(&prepared.route.ingress_name)));
 
             // ④' routing-policy override layer (design §4.3 / D-2 / D-3):
             // decorate the matched **Main** route only, initial dispatch only
@@ -436,6 +429,14 @@ impl ProxyHttp for HygressProxy {
                                 // downstream → request-level total (only the
                                 // denied branch; fail-open proceeds without
                                 // writing and is not a terminal short-circuit).
+                                // ORA3-M6: the deny itself logs an outcome line
+                                // (the egress side logs the fail mode it would
+                                // have applied, which is misleading here — the
+                                // default fail mode is closed, not open).
+                                debug!(
+                                    route = %prepared.route.ingress_name,
+                                    "external auth service unavailable; rejecting 403 (fail mode closed, R-12)"
+                                );
                                 state
                                     .metrics
                                     .record_short_circuit(403, started.elapsed().as_secs_f64());
@@ -461,7 +462,10 @@ impl ProxyHttp for HygressProxy {
             // comes from the `X-Mse-Consumer` write-back), initial dispatch
             // only (D-3). `none` / absent consumer skips (D-10).
             if redirect_count == 0 {
-                let consumer = auth_writeback.get(hdr::MSE_CONSUMER).unwrap_or("").to_string();
+                let consumer = auth_writeback
+                    .get(hdr::MSE_CONSUMER)
+                    .unwrap_or("")
+                    .to_string();
                 let rate_policy = merged.as_ref().map(|e| &e.policy);
                 if let Some(extra) = self.rate_limit_post(&state, rate_policy, &consumer) {
                     // AM-5: terminal 429 → request-level total.
@@ -487,13 +491,18 @@ impl ProxyHttp for HygressProxy {
             // true terminal commits/releases exactly once.
             if redirect_count == 0 {
                 if let (Some(entry), Some(ut)) = (merged.as_ref(), prepared.usage.as_ref()) {
-                    if let Some(spec) =
-                        entry.policy.quota.as_ref().and_then(|q| q.by_model_tokens.as_ref())
+                    if let Some(spec) = entry
+                        .policy
+                        .quota
+                        .as_ref()
+                        .and_then(|q| q.by_model_tokens.as_ref())
                     {
                         let est = est_tokens(prepared.body.len(), state.quota_k);
                         let now = now_millis();
                         let decision =
-                            state.quota.reserve(now, &ut.mse_consumer, &ut.model, spec, est);
+                            state
+                                .quota
+                                .reserve(now, &ut.mse_consumer, &ut.model, spec, est);
                         match decision {
                             QuotaDecision::HardDeny => {
                                 state.metrics.record_quota_denied();
@@ -554,7 +563,7 @@ impl ProxyHttp for HygressProxy {
                         .await
                     {
                         state.metrics.record_guardrail_blocked("in");
-                        self.report_incomplete_usage(&prepared, &prepared.selected_service)
+                        self.report_incomplete_usage(&prepared, &prepared.selected_service, None)
                             .await;
                         // AM-5: terminal 403 → request-level total.
                         state
@@ -597,8 +606,13 @@ impl ProxyHttp for HygressProxy {
                 // `data.provider_tokens` feeds the D6/§7 provider key-swap: a
                 // `provider-<id>.<type>` destination gets its `Authorization`
                 // swapped to the provider `apiToken` (see `build_outbound`).
-                let outbound =
-                    pipeline::build_outbound(&method, &prepared, candidate, &auth_writeback, &data.provider_tokens);
+                let outbound = pipeline::build_outbound(
+                    &method,
+                    &prepared,
+                    candidate,
+                    &auth_writeback,
+                    &data.provider_tokens,
+                );
                 match self.send_outbound(&prepared, &outbound, candidate).await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
@@ -606,6 +620,11 @@ impl ProxyHttp for HygressProxy {
                             // ⑪/⑫/⑬ success: stream back + usage + metrics. The
                             // outbound static rules come precompiled from the
                             // merged policy (H3).
+                            // ORA3-M9: the live usage accumulator is carried out
+                            // of `stream_back` here when a mid-stream break ends
+                            // the response, so this terminal can flush the tokens
+                            // absorbed before the break (not a fresh empty row).
+                            let mut retained_usage: Option<UsageSnapshot> = None;
                             if let Err(e) = self
                                 .stream_back(
                                     session,
@@ -616,6 +635,7 @@ impl ProxyHttp for HygressProxy {
                                     kind,
                                     started,
                                     &mut quota,
+                                    &mut retained_usage,
                                     merged.as_ref().and_then(|m| m.static_set.as_ref()),
                                 )
                                 .await
@@ -628,12 +648,29 @@ impl ProxyHttp for HygressProxy {
                                 // disabled only here, not on the normal end).
                                 warn!(error = %e, "downstream stream write failed; closing");
                                 session.as_downstream_mut().set_keepalive(None);
+                                // ORA3-M9 (a): mirror the B4c guardrail-cut
+                                // accounting — the 2xx header was already sent, so
+                                // this terminal is recorded under the same route
+                                // kind with the duration; `hygress_requests_total`
+                                // must cover it (previously it did not).
+                                ctx.status = status;
+                                state.metrics.record_request(status, kind);
+                                state
+                                    .metrics
+                                    .record_request_duration(kind, started.elapsed().as_secs_f64());
                                 // D-11: downstream write-fail abort → release the
-                                // quota (the guard drops at the return) + report a
-                                // `completed=false` usage row (previously: no usage
-                                // at all).
-                                self.report_incomplete_usage(&prepared, &candidate.service_name)
-                                    .await;
+                                // quota (the guard drops at the return).
+                                // ORA3-M9 (b): flush the LIVE retained snapshot —
+                                // the tokens already absorbed from the upstream
+                                // stream stay on the row with `completed` =
+                                // "usage observed", instead of being discarded for
+                                // a fresh empty (`completed=false`, 0-token) one.
+                                self.report_incomplete_usage(
+                                    &prepared,
+                                    &candidate.service_name,
+                                    retained_usage.as_ref(),
+                                )
+                                .await;
                                 return Ok(true);
                             }
                             ctx.status = status;
@@ -672,7 +709,9 @@ impl ProxyHttp for HygressProxy {
                             debug!(error = %e, candidate = %candidate.service_name, "transport failure; trying next candidate");
                             continue;
                         }
-                        last = Some(Final::Transport { detail: e.to_string() });
+                        last = Some(Final::Transport {
+                            detail: e.to_string(),
+                        });
                         break;
                     }
                 }
@@ -706,13 +745,30 @@ impl ProxyHttp for HygressProxy {
                 }
             }
 
+            // ORA3-M3: the request's fallback chain just ended WITHOUT a
+            // successful hop — [`pipeline::fallback::plan`] returned `None`
+            // above (the `max_redirects` hop budget is exhausted) or the
+            // failing route has no further fallback link. Signal it exactly
+            // once, distinct from [`Metrics::record_fallback`] (which counts
+            // every *armed* hop), so operators can tell "direct failure" from
+            // "failed after N fallback hops". Only fires when the fallback
+            // machinery actually engaged (`redirect_count > 0`, i.e. at least
+            // one hop was armed): a zero-hop direct failure is a plain forward
+            // below with no exhaustion signal.
+            if redirect_count > 0 {
+                state.metrics.record_fallback_exhausted();
+                warn!(
+                    route = %prepared.route.ingress_name,
+                    redirects = redirect_count,
+                    "fallback chain ended without a successful hop; forwarding the final response"
+                );
+            }
+
             // Forward the final result (no fallback, or budget exhausted).
             match last {
                 Some(Final::Http { status, body }) => {
                     ctx.status = status;
-                    state
-                        .metrics
-                        .record_request(status, kind);
+                    state.metrics.record_request(status, kind);
                     state
                         .metrics
                         .record_request_duration(kind, started.elapsed().as_secs_f64());
@@ -725,7 +781,7 @@ impl ProxyHttp for HygressProxy {
                     // candidate loop) or a total transport failure (no upstream
                     // was reached).
                     if let Some(service) = &last_service {
-                        self.report_incomplete_usage(&prepared, service).await;
+                        self.report_incomplete_usage(&prepared, service, None).await;
                     }
                     // P1: frame the buffered non-2xx body (`content-length`) so
                     // Pingora's body writer is not close-delimited. The body is a
@@ -988,9 +1044,9 @@ impl HygressProxy {
         // can never bypass the cap below — the per-chunk `extend_from_slice`
         // + the `> max_body` check are the enforcement.
         let mut buf: Vec<u8> = match content_length {
-            Some(len) if has_body => Vec::with_capacity(
-                usize::try_from(len).unwrap_or(max_body).min(max_body),
-            ),
+            Some(len) if has_body => {
+                Vec::with_capacity(usize::try_from(len).unwrap_or(max_body).min(max_body))
+            }
             _ => Vec::new(),
         };
         if has_body {
@@ -1054,14 +1110,15 @@ impl HygressProxy {
         if key.is_empty() {
             return true;
         }
-        let mut entry = buckets
-            .entry(key.to_string())
-            .or_insert_with(|| crate::context::RateLimitEntry {
-                spec_rps: spec.rps,
-                spec_burst: spec.burst,
-                last_active_ms: now_ms,
-                bucket: hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps),
-            });
+        let mut entry =
+            buckets
+                .entry(key.to_string())
+                .or_insert_with(|| crate::context::RateLimitEntry {
+                    spec_rps: spec.rps,
+                    spec_burst: spec.burst,
+                    last_active_ms: now_ms,
+                    bucket: hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps),
+                });
         // Hot-reload detection: if the spec changed since the bucket was
         // seeded (e.g. policy reload with new rps/burst), reset the bucket
         // with the new parameters (BLOCK-2: not retain the old spec).
@@ -1310,7 +1367,9 @@ impl HygressProxy {
         // D6 / §7: a provider-destined upstream is assembled by the frozen
         // ProviderClient, then dialed over the long-lived client.
         if candidate.service_name.starts_with("provider-") {
-            return self.send_provider_outbound(prepared, outbound, candidate).await;
+            return self
+                .send_provider_outbound(prepared, outbound, candidate)
+                .await;
         }
 
         // D8: dial with the candidate's **resolved scheme** (never a
@@ -1318,7 +1377,12 @@ impl HygressProxy {
         // would get a garbage response) and, for a proxied target, route the
         // request **through the outbound forward proxy** (HTTP-proxy
         // semantics: absolute-form for `http`, `CONNECT` tunnel for `https`).
-        let url = format!("{}://{}{}", candidate.scheme.as_str(), candidate.address, outbound.path);
+        let url = format!(
+            "{}://{}{}",
+            candidate.scheme.as_str(),
+            candidate.address,
+            outbound.path
+        );
         let method = reqwest::Method::from_bytes(outbound.method.as_bytes())
             .unwrap_or(reqwest::Method::POST);
         let mut req = self.client_for(candidate).request(method, url);
@@ -1396,8 +1460,8 @@ impl HygressProxy {
         // header is left verbatim (never re-prefixed as `Bearer <raw>`).
         let api_token = provider_api_token(outbound);
 
-        let method = http::Method::from_bytes(outbound.method.as_bytes())
-            .unwrap_or(http::Method::POST);
+        let method =
+            http::Method::from_bytes(outbound.method.as_bytes()).unwrap_or(http::Method::POST);
         let opts = hygress_egress::provider::UpstreamOptions {
             method,
             // `prepared.upstream_path` is already `rewrite-target`-applied; do not
@@ -1438,7 +1502,9 @@ impl HygressProxy {
         // Dial through the candidate's client (direct, or the outbound forward proxy
         // for a proxied target — D8). The ProviderClient records the provider origin
         // (`url`) + the (key-swapped) headers; the raw body streams byte-for-byte.
-        let mut req = self.client_for(candidate).request(upstream.method, upstream.url);
+        let mut req = self
+            .client_for(candidate)
+            .request(upstream.method, upstream.url);
         // Design §4.3: the routing policy's per-request timeout override.
         if let Some(ms) = prepared.override_timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
@@ -1528,6 +1594,12 @@ impl HygressProxy {
     /// actual `total_token` (D-11 / D-13). `quota` is settled here on the
     /// success and guardrail-cut paths; the `Drop` guard covers the remaining
     /// terminal paths (abort / write-fail) — settlement is idempotent.
+    ///
+    /// ORA3-M9: on a **mid-stream break** (the upstream read or the downstream
+    /// write fails after the 2xx header was sent), the live accumulator is
+    /// moved into `retained` before the `Err` propagates, so the caller's
+    /// write-fail terminal flushes the tokens absorbed before the break instead
+    /// of a fresh empty snapshot.
     #[allow(clippy::too_many_arguments)] // ⑪ forwards the full prepared + candidate context
     async fn stream_back(
         &self,
@@ -1539,6 +1611,7 @@ impl HygressProxy {
         kind: &str,
         started: Instant,
         quota: &mut Option<QuotaReservation>,
+        retained: &mut Option<UsageSnapshot>,
         compiled_static: Option<&std::sync::Arc<StaticRuleSet>>,
     ) -> PingoraResult<()> {
         // Hop-by-hop / connection-negotiated headers are not forwarded. Framing
@@ -1602,11 +1675,16 @@ impl HygressProxy {
         let mut resp_pipeline = ResponsePipeline::from_compiled(compiled_static);
         let mut ttft: Option<f64> = None;
         let mut first = true;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| pingora_err(format!("upstream stream read: {e}")))?
-        {
+        // ORA3-M9: the upstream read is matched explicitly (not via `?`) so a
+        // mid-stream read failure can retain the live accumulator in `retained`
+        // before the `Err` propagates to the caller's write-fail terminal.
+        while let Some(chunk) = match resp.chunk().await {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                *retained = Some(usage);
+                return Err(pingora_err(format!("upstream stream read: {e}")));
+            }
+        } {
             if first {
                 first = false;
                 ttft = Some(started.elapsed().as_secs_f64());
@@ -1619,9 +1697,7 @@ impl HygressProxy {
                 self.state.metrics.record_guardrail_blocked("out");
                 // B-11: record the request (the 2xx header was already sent;
                 // the stream was cut). The duration covers the partial stream.
-                self.state
-                    .metrics
-                    .record_request(status, kind);
+                self.state.metrics.record_request(status, kind);
                 self.state
                     .metrics
                     .record_request_duration(kind, started.elapsed().as_secs_f64());
@@ -1636,16 +1712,28 @@ impl HygressProxy {
                 if let Some(g) = quota {
                     g.settle(None);
                 }
-                self.report_incomplete_usage(prepared, &candidate.service_name)
+                self.report_incomplete_usage(prepared, &candidate.service_name, None)
                     .await;
                 // Cut the downstream connection (no further writes; the
                 // connection is not kept alive).
                 session.as_downstream_mut().set_keepalive(None);
                 return Ok(());
             }
-            session.write_response_body(Some(chunk), false).await?;
+            if let Err(e) = session.write_response_body(Some(chunk), false).await {
+                // ORA3-M9: the downstream died mid-stream — retain the live
+                // accumulator (tokens already fed) for the caller's write-fail
+                // terminal, which records this terminal + flushes the row.
+                *retained = Some(usage);
+                return Err(e);
+            }
         }
-        session.write_response_body(None, true).await?;
+        // ORA3-M9: the end-of-stream write failed → the downstream died on the
+        // final chunk; treat it as the mid-stream write-fail terminal (retain
+        // the live accumulator — the usage object may already be complete).
+        if let Err(e) = session.write_response_body(None, true).await {
+            *retained = Some(usage);
+            return Err(e);
+        }
         ctx.status = status;
 
         // ⑬ metrics.
@@ -1692,23 +1780,48 @@ impl HygressProxy {
         Ok(())
     }
 
-    /// NB7: report usage for a terminal non-2xx that **reached an upstream**.
-    ///
-    /// The request ran to completion (an upstream answered) but carried no
-    /// usage object: `completed=false`, zero tokens, `request_content_bytes`
+    /// Report usage for an incomplete terminal that **reached an upstream**: a
+    /// forwarded final non-2xx, or (ORA3-M9) a 2xx stream cut mid-flight.
+    /// Unless the mid-stream terminal retained the live accumulator via
+    /// `observed`, no usage object was seen before the terminal, so the row is
+    /// `completed=false` with zero tokens; `request_content_bytes`
     /// set, full attribution (model / model_id / provider_id / model_route_id /
     /// user / org). Not called for auth-denied / 404-no-route (the pipeline
     /// short-circuits before any upstream) or a total transport failure (no
     /// upstream was reached). Model-route traffic only (`usage` is `None` for
     /// the mirror / passthrough).
-    async fn report_incomplete_usage(&self, prepared: &PreparedRequest, service_name: &str) {
+    ///
+    /// ORA3-M9: when a **mid-stream** terminal (the downstream write / upstream
+    /// read failed after the 2xx header was sent) retains the live accumulator
+    /// via `observed`, the row flushes THAT state instead of a fresh empty
+    /// snapshot: the tokens absorbed before the break stay on the row and
+    /// `completed` reflects that a usage object was observed (`seen_any`).
+    /// `None` (guardrail-in / guardrail-cut / forwarded-terminal-non-2xx) keeps
+    /// the historical empty row — `completed=false`, zero tokens — which stays
+    /// correct when nothing was observed.
+    async fn report_incomplete_usage(
+        &self,
+        prepared: &PreparedRequest,
+        service_name: &str,
+        observed: Option<&UsageSnapshot>,
+    ) {
         if let (Some(sink), Some(ut)) = (self.state.sink.as_ref(), prepared.usage.clone()) {
             let fields = usage_fields(&ut, prepared, service_name);
-            // A fresh, empty snapshot: no usage object observed → `completed`
-            // is `false` and every token field is zero.
-            let metrics =
-                hygress_core::usage::UsageSnapshot::new(hygress_core::usage::UsageSchema::Generic)
-                    .flush(&fields);
+            // `Some` (ORA3-M9): flush the LIVE retained accumulator — the
+            // tokens absorbed before the break stay on the row and `completed`
+            // reflects that a usage object was observed (`seen_any`). `None`:
+            // no upstream bytes were absorbed before this terminal — the empty
+            // snapshot row (`completed=false`, every token field zero) remains
+            // correct there.
+            let metrics = observed.map_or_else(
+                || {
+                    hygress_core::usage::UsageSnapshot::new(
+                        hygress_core::usage::UsageSchema::Generic,
+                    )
+                    .flush(&fields)
+                },
+                |s| s.flush(&fields),
+            );
             let _ = sink.push(&metrics).await;
         }
     }
@@ -1721,7 +1834,11 @@ impl HygressProxy {
 /// selected service name, `model_route_id` from the route name, `user_id` /
 /// `access_key` from the forward-auth write-back consumer, and the
 /// `X-Organization-Id` attribution.
-fn usage_fields(ut: &crate::context::UsageTarget, prepared: &PreparedRequest, service_name: &str) -> FlushFields {
+fn usage_fields(
+    ut: &crate::context::UsageTarget,
+    prepared: &PreparedRequest,
+    service_name: &str,
+) -> FlushFields {
     let (user_id, access_key) = parse_consumer(&ut.mse_consumer);
     let organization_id = prepared
         .base_headers
@@ -1926,7 +2043,10 @@ fn json_escape(s: &str) -> String {
 /// `x-gpustack-fallback-path` (= the restored original path). The `:path`
 /// restored by the transformer-in (stage ③) is the same original path, so the
 /// Fallback route's full-match predicate lines up.
-fn arm_fallback(current: &InboundRequest, plan: &pipeline::fallback::FallbackPlan) -> InboundRequest {
+fn arm_fallback(
+    current: &InboundRequest,
+    plan: &pipeline::fallback::FallbackPlan,
+) -> InboundRequest {
     let mut next = current.clone();
     // Carry the armed fallback markers through (the inbound transform will fold
     // `x-gpustack-fallback-path` back onto `:path`).
@@ -1945,7 +2065,10 @@ mod tests {
     #[test]
     fn consumer_parses_key_dot_user_form() {
         // `access_key.gpustack-<user.id>` (API-key auth).
-        assert_eq!(parse_consumer("sk-ak.gpustack-7"), (Some(7), Some("sk-ak".to_string())));
+        assert_eq!(
+            parse_consumer("sk-ak.gpustack-7"),
+            (Some(7), Some("sk-ak".to_string()))
+        );
         assert_eq!(
             parse_consumer("123.gpustack-42"),
             (Some(42), Some("123".to_string()))
@@ -1967,9 +2090,15 @@ mod tests {
         assert_eq!(parse_consumer("none"), (None, None));
         assert_eq!(parse_consumer("NONE"), (None, None));
         // No marker: the whole value is treated as an access key.
-        assert_eq!(parse_consumer("raw-key"), (None, Some("raw-key".to_string())));
+        assert_eq!(
+            parse_consumer("raw-key"),
+            (None, Some("raw-key".to_string()))
+        );
         // A non-numeric user id yields user_id None but keeps the access key.
-        assert_eq!(parse_consumer("ak.gpustack-x"), (None, Some("ak".to_string())));
+        assert_eq!(
+            parse_consumer("ak.gpustack-x"),
+            (None, Some("ak".to_string()))
+        );
     }
 
     #[test]
@@ -1997,10 +2126,7 @@ mod tests {
         assert_eq!(parse_instance_ids("provider-12.proxy"), (None, Some(12)));
         // The provider egress proxy name (`provider-<id>-proxy`) still yields
         // the provider id.
-        assert_eq!(
-            parse_instance_ids("provider-3-proxy.dns"),
-            (None, Some(3))
-        );
+        assert_eq!(parse_instance_ids("provider-3-proxy.dns"), (None, Some(3)));
     }
 
     #[test]
@@ -2063,7 +2189,10 @@ mod tests {
         // `ai-route-route-` with no digits (e.g. a malformed name) → None.
         assert_eq!(parse_model_route_id("ai-route-route-.internal"), None);
         // Legacy pattern must not match.
-        assert_eq!(parse_model_route_id("higress-system/ai-route-model-3"), None);
+        assert_eq!(
+            parse_model_route_id("higress-system/ai-route-model-3"),
+            None
+        );
     }
 
     // ----- D6/§7: provider bearer re-assert (provider_api_token) -----
@@ -2116,12 +2245,21 @@ mod tests {
 
     #[test]
     fn check_bucket_resets_on_spec_change() {
-        let buckets: DashMap<String, crate::context::RateLimitEntry> =
-            DashMap::new();
+        let buckets: DashMap<String, crate::context::RateLimitEntry> = DashMap::new();
         // Seed with rps=1, burst=1: first check passes, second is denied.
         let spec1 = TokenBucketSpec { rps: 1.0, burst: 1 };
-        assert!(HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec1, 0));
-        assert!(!HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec1, 1));
+        assert!(HygressProxy::check_bucket(
+            &buckets,
+            "ip:1.2.3.4",
+            &spec1,
+            0
+        ));
+        assert!(!HygressProxy::check_bucket(
+            &buckets,
+            "ip:1.2.3.4",
+            &spec1,
+            1
+        ));
 
         // Hot-reload: the spec changes to burst=5. The bucket must be reset
         // (not retain the old burst=1), so the next check passes.
@@ -2132,16 +2270,25 @@ mod tests {
         );
         // The new bucket has burst=5: we can take 4 more tokens.
         for _ in 0..4 {
-            assert!(HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec2, 3));
+            assert!(HygressProxy::check_bucket(
+                &buckets,
+                "ip:1.2.3.4",
+                &spec2,
+                3
+            ));
         }
         // Now the bucket is empty (burst=5 exhausted).
-        assert!(!HygressProxy::check_bucket(&buckets, "ip:1.2.3.4", &spec2, 4));
+        assert!(!HygressProxy::check_bucket(
+            &buckets,
+            "ip:1.2.3.4",
+            &spec2,
+            4
+        ));
     }
 
     #[test]
     fn check_bucket_empty_key_is_passthrough() {
-        let buckets: DashMap<String, crate::context::RateLimitEntry> =
-            DashMap::new();
+        let buckets: DashMap<String, crate::context::RateLimitEntry> = DashMap::new();
         let spec = TokenBucketSpec { rps: 1.0, burst: 1 };
         // An empty key is always allowed (D-10: never share a "" bucket).
         assert!(HygressProxy::check_bucket(&buckets, "", &spec, 0));
@@ -2192,7 +2339,9 @@ mod tests {
     fn framing_never_both_never_neither_for_body() {
         // For every body-bearing status, framing is present (never neither) and
         // is exactly one of the two framing headers (never both).
-        for s in [200u16, 201, 206, 301, 302, 400, 401, 403, 404, 500, 502, 503] {
+        for s in [
+            200u16, 201, 206, 301, 302, 400, 401, 403, 404, 500, 502, 503,
+        ] {
             for (known, upstream) in [
                 (None, None),
                 (Some(0), None),
@@ -2229,11 +2378,13 @@ mod tests {
                 json_escape(message),
                 json_escape(err_type)
             );
-            let (name, value) =
-                response_framing(status, Some(body.len() as u64), None)
-                    .unwrap_or_else(|| panic!("a {status} error body must be framed"));
+            let (name, value) = response_framing(status, Some(body.len() as u64), None)
+                .unwrap_or_else(|| panic!("a {status} error body must be framed"));
             assert_eq!(name, "content-length", "{status}");
-            assert!(!value.is_empty(), "{status}: content-length must be present, not absent");
+            assert!(
+                !value.is_empty(),
+                "{status}: content-length must be present, not absent"
+            );
             assert_eq!(
                 value,
                 body.len().to_string(),

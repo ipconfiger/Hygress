@@ -9,12 +9,13 @@
 //! ## Change short-circuit (P4)
 //!
 //! Each LIST pass produces a cheap [`SnapshotFingerprint`] — one `(kind, namespace, name,
-//! resource_version)` per object, sorted. The poll loop hands in the previous tick's
-//! fingerprint; when the new one matches, the expensive `build_config_data` translate (and the
-//! downstream RouteTable rebuild / regex recompile / ArcSwap swap that [`hygress_core`] performs
-//! on `store`) is skipped entirely, so a steady-state cluster no longer triggers a full-rebuild
-//! CPU spike every 1s. Any k8s mutation bumps `resource_version`, which always changes the
-//! fingerprint.
+//! resource_version)` per object, sorted. The controller's run loop hands in the previous
+//! pass's fingerprint (it reconciles on watch events or the low-frequency safety-net tick);
+//! when the new one matches, the expensive `build_config_data` translate (and the
+//! downstream RouteTable rebuild / regex recompile / ArcSwap swap that [`hygress_core`]
+//! performs on `store`) is skipped entirely, so a steady-state cluster never re-triggers a
+//! full rebuild on a pass where nothing changed. Any k8s mutation bumps `resource_version`,
+//! which always changes the fingerprint.
 
 use kube::core::ResourceExt;
 
@@ -47,7 +48,11 @@ fn fingerprint_of<T: kube::core::Resource + serde::Serialize>(
 }
 
 /// Convert one listed resource (typed or dynamic) into an [`Object`].
-fn to_object<T: kube::core::Resource + serde::Serialize>(kind: ObjectKind, item: &T, ns: &str) -> Object {
+fn to_object<T: kube::core::Resource + serde::Serialize>(
+    kind: ObjectKind,
+    item: &T,
+    ns: &str,
+) -> Object {
     let name = item.name_any();
     let namespace = item.namespace().unwrap_or_else(|| ns.to_string());
     let uid = item.uid().unwrap_or_default();
@@ -81,11 +86,23 @@ pub(crate) async fn build_snapshot(
     // live v2.2.3 baseline), so a labeled LIST returns nothing and `config.registries` ends up
     // empty (every destination fail-resolves with `registry_resolve_failed`). The gateway
     // namespace holds only GPUStack's `default` bridge, so a plain list is safe.
-    let mcpbridges = client.mcpbridges().list(&ListParams::default()).await?.items;
+    let mcpbridges = client
+        .mcpbridges()
+        .list(&ListParams::default())
+        .await?
+        .items;
     let wasmplugins = client.wasmplugins().list(&lp).await?.items;
     let envoyfilters = client.envoyfilters().list(&lp).await?.items;
     let ingresses = client.ingresses().list(&lp).await?.items;
     let secrets = client.secrets().list(&lp).await?.items;
+    // ConfigMaps: the managed-label selector only — intentional (ORA3-M16,
+    // documented downgrade). GPUStack writes `higress-config` (gateway timing)
+    // / `higress-https` / `higress-ca-root-cert` WITHOUT the managed label, so
+    // they are never listed here: the embedded topology does NOT consume the
+    // `higress-config` timing values, and `config.timing` stays at the built-in
+    // seed defaults (downstream 1800s / upstream 10s). `configmap_to_timing`
+    // (translate.rs) is therefore unreachable on the embedded topology — it
+    // could only fire for a managed, name-matching timing ConfigMap.
     let configmaps = client.configmaps().list(&lp).await?.items;
 
     // Cheap fingerprint pass: identity only (no `to_value`, no `Object` build).
@@ -149,7 +166,10 @@ pub(crate) async fn build_snapshot(
         objects.push(to_object(ObjectKind::ConfigMap, it, ns));
     }
 
-    Ok((fp, Some(build_config_data(&objects, gateway_namespace, mirror_name))))
+    Ok((
+        fp,
+        Some(build_config_data(&objects, gateway_namespace, mirror_name)),
+    ))
 }
 
 #[cfg(test)]
@@ -201,14 +221,34 @@ mod tests {
         // Two passes that list the same objects in a different order yield equal fingerprints
         // once sorted (LIST order is not guaranteed to be stable across ticks).
         let mut a: SnapshotFingerprint = vec![
-            (ObjectKind::Ingress, "ns".into(), "ai-route-route-5.internal".into(), 1),
-            (ObjectKind::Secret, "ns".into(), "gpustack-tls-default".into(), 2),
+            (
+                ObjectKind::Ingress,
+                "ns".into(),
+                "ai-route-route-5.internal".into(),
+                1,
+            ),
+            (
+                ObjectKind::Secret,
+                "ns".into(),
+                "gpustack-tls-default".into(),
+                2,
+            ),
             (ObjectKind::McpBridge, "ns".into(), "default".into(), 3),
         ];
         let mut b: SnapshotFingerprint = vec![
             (ObjectKind::McpBridge, "ns".into(), "default".into(), 3),
-            (ObjectKind::Ingress, "ns".into(), "ai-route-route-5.internal".into(), 1),
-            (ObjectKind::Secret, "ns".into(), "gpustack-tls-default".into(), 2),
+            (
+                ObjectKind::Ingress,
+                "ns".into(),
+                "ai-route-route-5.internal".into(),
+                1,
+            ),
+            (
+                ObjectKind::Secret,
+                "ns".into(),
+                "gpustack-tls-default".into(),
+                2,
+            ),
         ];
         a.sort();
         b.sort();
@@ -218,13 +258,27 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_a_resource_version_bumps() {
         let mut fp: SnapshotFingerprint = vec![
-            (ObjectKind::Ingress, "ns".into(), "ai-route-route-5.internal".into(), 1),
-            (ObjectKind::Secret, "ns".into(), "gpustack-tls-default".into(), 2),
+            (
+                ObjectKind::Ingress,
+                "ns".into(),
+                "ai-route-route-5.internal".into(),
+                1,
+            ),
+            (
+                ObjectKind::Secret,
+                "ns".into(),
+                "gpustack-tls-default".into(),
+                2,
+            ),
         ];
         fp.sort();
         // Bumping any one object's resource_version (a k8s mutation) changes the fingerprint.
         let mut bumped = fp.clone();
-        bumped.iter_mut().find(|e| e.2 == "gpustack-tls-default").unwrap().3 = 3;
+        bumped
+            .iter_mut()
+            .find(|e| e.2 == "gpustack-tls-default")
+            .unwrap()
+            .3 = 3;
         assert_ne!(fp, bumped);
         // A removal (object count change) also changes it.
         let mut removed = fp.clone();

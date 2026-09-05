@@ -72,13 +72,15 @@ env `APISERVER_PORT`）做 CRUD reconcile。**不存在 Higress 私有 API 契�
 | `networking.k8s.io/v1` | `Ingress` | `gpustack`（mirror），`ai-route-route-<id>.internal`（主），`ai-route-route-<id>.fallback.internal`；`ai-route-model-<id>` 系**遗留/清理专用**（`_cleanup_orphaned_gateway_data` 只删不建） | 路由规则来源 |
 | `networking.istio.io/v1alpha3` | `EnvoyFilter` | `ai-route-route-<id>.internal` | 4xx/5xx → fallback 内部重定向 |
 | `v1` | `Secret` | `gpustack-tls-<host>` / `gpustack-tls-default` | 数据面 TLS 证书 |
-| `v1` | `ConfigMap` | `higress-config` | 超时/限制配置（种子 `downstream.idleTimeout=1800, upstream.idleTimeout=10`，`ensure_gateway_timeout` 会重写为 env `GPUSTACK_PROXY_UPSTREAM_IDLE_TIMEOUT_SECONDS` 默认 **3**）—— **Hygress 读 ConfigMap 生效，不硬编码** |
+| `v1` | `ConfigMap` | `higress-config` | 超时/限制配置（种子 `downstream.idleTimeout=1800, upstream.idleTimeout=10`，`ensure_gateway_timeout` 会重写为 env `GPUSTACK_PROXY_UPSTREAM_IDLE_TIMEOUT_SECONDS` 默认 **3**）—— **真机不被消费（ORA3-M16 修正）**：GPUStack 写入不带 `gpustack.ai/managed` 标签 → 标签选择器 LIST/WATCH 永不列出，超时保持种子默认（1800/10）；即使列出数据面也不强制（R-9③ 诚实降级） |
 | `networking.k8s.io/v1` | `IngressClass` | `higress` | `is_supported_higress` 探测点（`read_ingress_class(name="higress")`，404 即判不支持；external 模式下探测失败直接 **raise**） |
 
 要点：
 - **没有** Higress 的 `Gateway` / `ExtensionPolicy` / `ApiKey` / `Consumer` CRD——鉴权完全委托给
   GPUStack 自己的 `/token-auth`（ext-auth 插件 forward-auth）。
 - 所有受管对象都带标签 `gpustack.ai/managed=true`；`match_labels` 只更新 GPUStack 拥有的对象。
+  **例外（ORA3-M16）**：GPUStack 写入 `higress-config`（及其 `higress-https`/`higress-ca-root-cert`）
+  不带 managed 标签 —— Hygress 按标签选择器 LIST/WATCH 因而不会消费它们（见上表 ConfigMap 行）。
 - 种子全局 EnvoyFilter `higress-gateway-global-custom-response.yaml`（INSERT_FIRST）**无 managed 标签**
   ——Hygress 的 label-selector list 不应期望遇到它（辅导性说明）。
 - 响应形状要求：`apiVersion/kind/metadata.resourceVersion`、list 的 `items: []`、合法的
@@ -240,7 +242,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 │  ┌──────────────────────────────── HYC ────────────────────────────────────┐ │  │
 │  │  Hygress 二进制（s6 服务: hygress, 依赖 GPUSTACK_API_PORT 就绪）         │ │  │
 │  │  ┌─ 控制面适配器 gateway-adapter ─────────────────────────────────────┐  │ │  │
-│  │  │ kube-rs 启动全量 LIST(managed=true) → 快照 → 1s poll/watch diff   │  │ │  │
+│  │  │ kube-rs 启动全量 LIST(managed=true) → 快照 → WATCH 事件/30s tick   │  │ │  │
 │  │  │ → Ingress/McpBridge/WasmPlugin/EnvoyFilter/ConfigMap/Secret       │  │ │  │
 │  │  │ → 路由表快照 ArcSwap<ConfigData>（无本地持久化）                    │  │ │  │
 │  │  └───────────────────────────────────────────────────────────────────┘  │ │  │
@@ -265,8 +267,10 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 
 分层职责：
 - **控制面适配层（`gateway-adapter`）**：唯一与 k8s/apiserver 打交道的模块。启动 api-resources
-  discovery → 全量 LIST（label selector `gpustack.ai/managed=true`）建初始快照 → 1s 轮询（或 watch）
-  增量 → diff → `ConfigStore::reload_all()`。**纯只读消费者，不实现 k8s API**（策略 2）；无本地写库。
+  discovery → 全量 LIST（label selector `gpustack.ai/managed=true`）建初始快照 → 后续收敛由 WATCH 事件
+  （拓扑 B/external）或 **30s 兜底 tick**（拓扑 A：GPUStack 内嵌 apiserver 不支持 WATCH，tick-only 收敛）
+  驱动；每次唤醒全量重译（rv 指纹幂等短路）→ `ConfigStore::reload_all()`。**纯只读消费者，不实现 k8s
+  API**（策略 2）；无本地写库。
 - **路由引擎（route engine）**：Ingress 注解 → 路由规则，McpBridge registry 解析，SWRR 目标组 + 动态
   刷新 + 逐目的地 model 改写。
 - **数据面（Pingora）**：请求周期串联插件等价模块 + 路由 + failover + fallback + 计量。
@@ -282,7 +286,8 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 - 启动序列：`wait_for_apiserver_ready`（GET `/api`，60s 内 5s 重试）→ 逐资源 discovery
   (McpBridge/WasmPlugin/Ingress/EnvoyFilter/IngressClass) → 全量 LIST（label selector）建初始快照 →
   **首快照完成后才绑定数据面 80/443**（避免 GPUStack 300×2s 就绪窗口被慢同步耗尽而在 10 分钟才判定
-  失败）→ 进入 1s 轮询（或 kube-rs watch）增量更新 → diff → swap。
+  失败）→ 进入收敛循环：WATCH 事件驱动（拓扑 B/external）或 **30s 兜底 tick**（拓扑 A：embedded
+  apiserver 不支持 WATCH）→ 全量重译 + rv 指纹幂等短路 → swap。
 - **只读消费，不实现写路径**。策略 1 假 apiserver 时才有写接口（§5.4）。CPU 上无「所有 CRUD 返回
   成功」语义，那属于策略 1。
 - 与 GPUStack 生命周期对齐：崩溃重启后全量重 LIST（GPUStack 会重跑 `initialize_gateway` 与孤儿清理，
@@ -297,8 +302,11 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 - kubeconfig：embedded 时 **文件** `{data_dir}/higress/kubeconfig`（prerun 写入，
   `https://127.0.0.1:18443`，`insecure-skip-tls-verify:true`，user `higress-admin` 无 token）；
   external 时用户 `gateway_kubeconfig`。
-- **拓扑 B 需要播种 IngressClass `higress`**（写入保留的 apiserver 或 external 集群，GPUStack 不创建）；
-  embedded（拓扑 A）不检查 IngressClass，无需播种，但播种无副作用、推荐统一做，以备 external 切换。
+- **拓扑 B 需要播种 IngressClass `higress`**（external 集群；GPUStack 不创建）；播种**仅**在
+  `HYGRESS_TOPOLOGY_B=true`（AM-1 门控，默认 false）时于 `Controller::run` 内执行一次。
+- **拓扑 A（embedded）从不探测 IngressClass，必须保持该 flag 关闭**（零 apiserver 写；内嵌 apiserver 也
+  不支持写 IngressClass，405）。漏设 flag 的 external 部署会在 GPUStack 侧启动即 raise
+  （"cluster does not support Higress"）——见 README §4.3 env 表说明。
 
 ### 5.3 k8s 对象 → 内部模型映射
 
@@ -313,7 +321,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 | `WasmPlugin`×其余 | `GatewayFeatureConfig` | 见 §7 逐插件映射；记录 `defaultConfigDisable` 不可变 |
 | `EnvoyFilter ai-route-route-<id>` | `FallbackSpec` | 4xx/5xx → fallback，max 10，`use_original_request_body/uri` |
 | `Secret gpustack-tls-*` | TLS 证书表（→ `tls.rs` SNI store） | `tls.crt/key`；`gpustack-tls-default` 兜底；管理标签外不碰其他 Secret |
-| `ConfigMap higress-config` | 超时/限制配置 | `idleTimeout`（种子 1800/10，patch 后 3）、`maxRequestHeadersKb` 等 |
+| `ConfigMap higress-config` | 超时/限制配置 | `idleTimeout`（种子 1800/10，patch 后 3）、`maxRequestHeadersKb` 等（**真机不消费**：GPUStack 写入不带 managed 标签 → 按标签 LIST 不列出，timing 保持种子默认；见 §2.1.1 注） |
 | **种子全局 custom-response EnvoyFilter** | **忽略**（无 managed 标签） | 适配器 list 时跳过/容忍 |
 
 注：`ai-route-model-<id>` Ingress 不应出现在列表中（仅清理专用），若出现按 GPUStack 语义视为 legacy
@@ -479,8 +487,8 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 ## 8. 数据模型与持久化
 
 **策略 2（MVP）下不新增本地持久化**：CRD（file-storage apiserver）= 持久真相源；GPUStack 是唯一写者，
-孤儿清理由其自身完成。Hygress 启动 L0 = 全量 LIST → 快照；运行时 = poll diff → ArcSwap swap；
-重启 = 重 LIST。无迁移、无发散、无恢复逻辑。
+孤儿清理由其自身完成。Hygress 启动 L0 = 全量 LIST → 快照；运行时 = WATCH（拓扑 B）/30s 兜底 tick
+（拓扑 A）触发全量重译 → ArcSwap swap；重启 = 重 LIST。无迁移、无发散、无恢复逻辑。
 
 仅**策略 1（假 apiserver，全量替换后期）**启用本地 SQLite（沿用 Hydra sqlx）+ 新表 `k8s_object`
 (group,version,plural,namespace,name,body_json,rv)。数据面始终只读 `ConfigStore` 快照（ArcSwap），
@@ -594,8 +602,8 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 
 | 阶段 | 内容 | 依赖 | 估算（人周） |
 |---|---|---|---|
-| L0 | 控制面适配器：kube-rs 启动全量 LIST → 快照 → 1s poll diff → ArcSwap swap；label selector/孤儿容忍；**(拓扑 B) IngressClass 播种**；Response-shape/就绪时序（首快照后绑端口） | D4 | 1–2 |
-| L0-2 | **路由引擎（核心）**：RouteRule 数据模型（含 model_mapping）、header+path 匹配、registry(static/dns/proxy/tunnel) 解析、SWRR 目标组、动态 1s 刷新、mirror 直连、rewrite/别名 | L0 | 3–4 |
+| L0 | 控制面适配器：kube-rs 启动全量 LIST → 快照 → WATCH/30s tick 收敛 → ArcSwap swap；label selector/孤儿容忍；**(拓扑 B) IngressClass 播种**；Response-shape/就绪时序（首快照后绑端口） | D4 | 1–2 |
+| L0-2 | **路由引擎（核心）**：RouteRule 数据模型（含 model_mapping）、header+path 匹配、registry(static/dns/proxy/tunnel) 解析、SWRR 目标组、动态实例刷新（WATCH/30s tick 收敛）、mirror 直连、rewrite/别名 | L0 | 3–4 |
 | L1 | forward-auth(/token-auth, 路由名作用域, cookie 写回)、`GpustackSink`(HMAC jwt key 解析、完整字段、completed)、model-router 等价(multipart/别名/body 改写/maxBodyBytes) | L0-2 | 1–1.5 |
 | L2 | transformer 规则、fallback(含空目标特例)、ai-proxy v1(OpenAI 子集+优雅透传)、worker-proxy 寻址、TLS Secret→SNI、model-mapper 逐目的地 | L1 | **4–6**（=deep-dive 逐项之和，不再乐观压缩） |
 | L3 | 可观测性：15020(env 端口) /stats/prometheus 浅兼容 + envoy 指标名映射；Grafana 重画（可选） | L2 | ~1 |

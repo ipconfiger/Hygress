@@ -7,28 +7,27 @@ rust-version.workspace = true
 license.workspace = true
 
 # ---------------------------------------------------------------------------
-# Feature split (P5 reconciliation)
+# Feature split (P5 reconciliation — resolved; ORA3-M20)
 # ---------------------------------------------------------------------------
 # `integrations` gates the egress/adapter-wired surfaces: the Pingora data-plane
 # proxy (`pipe`), the forward-auth / usage / provider callsites, the control-plane
-# `Controller` bootstrap loop, and the container server launch. It is OFF by
-# default so the **pure pipeline + its unit tests** build and run before the two
-# dependency crates (`hygress-egress` / `hygress-adapter`, implemented by parallel
-# lanes) land with their frozen public API. Enabling it (P5) compiles the full
-# gateway against the frozen contracts.
+# `Controller` bootstrap loop, and the container server launch. It is the
+# **default** (ORA3-M20): a plain `cargo build -p hygress-gateway` must produce
+# the FULL data-plane gateway — the old `default = []` silently shipped a binary
+# with no data plane at all. The flag itself stays intact so the pure
+# compile-split (`--no-default-features`, pipeline + admin/stats only, no egress/
+# adapter deps) remains available for fast unit builds; a binary built that way
+# logs a loud ERROR at startup that the data plane is absent.
 [features]
-default = []
+default = ["integrations"]
 integrations = ["dep:hygress-egress", "dep:hygress-adapter"]
 
 [dependencies]
 hygress-core = { path = "../hygress-core" }
-# Frozen contracts (their concrete `Controller` / `forward_auth::Client` /
-# `usage_sink::GpustackSink` / `provider::ProviderClient` symbols are implemented
-# by their own lanes and reconciled at P5). OPTIONAL + `integrations`-gated so the
-# default build compiles the PURE gateway (pipeline + admin/stats/tls/config)
-# WITHOUT pulling in the two parallel-lane dependency crates (which may still be
-# landing). Enabling `integrations` (P5) compiles the full egress/adapter-wired
-# gateway against the frozen contracts.
+# Egress/adapter contracts. OPTIONAL + `integrations`-gated: the pure
+# compile-split (`--no-default-features`, for fast unit builds) drops these two
+# crates; the default build pulls them in (ORA3-M20 — the default must be the
+# full data-plane gateway).
 hygress-egress = { path = "../hygress-egress", optional = true }
 hygress-adapter = { path = "../hygress-adapter", optional = true }
 serde = { workspace = true }

@@ -81,3 +81,31 @@
 | 观察项 1：AM-2 SSE-chunk 真机判别 | 根因：该机后端为 GPUStack 测试用**手写最小 OpenAI 兼容服务器**（`serve.py`，llama-cpp-python CPU），`_chat` 忽略 `stream` 字段、恒非流式单块返回——非流式是**测试替身特性**，与 Hygress 无关；真实 llama-box/vLLM 才流式。SSE-chunk 判别证据由集成层 35 e2e 承担（假上游断言收到注入体）；如需真机强判别须流式后端（llama-box/vLLM）环境 | ✅（文档固化，无需改代码或 serve.py） |
 | 观察项 2：embedded apiserver WATCH 刷屏 | 根因：embedded apiserver LIST 无 resourceVersion → 6 类 watcher 均 `NoResourceVersion`，kube-runtime 无自退避 → 热循环（实测 ~2000 行/s、日志 17.6GB）。修复：`spawn_watcher` Err 分支**分类退避**（永久错误 60s / 瞬时 5s）+ **30s 日志限速**（adapter lib.rs）；收敛仍由 30s 安全网 tick 保证（R-2，每唤醒无条件 sync_once + 指纹短路） | ✅（587 tests / clippy 双模式 0；待真机验证日志降噪，见 equivalence §A3 注） |
 > 凭据按需提供；若不可达 → ⏸ 未执行 + 交付可执行套件。
+
+## B9.5 — ora-3 终审修复批（audit-oracle-review-ora3.md §3/§4/§6，2026 实施）
+
+> ora-3 五维加权 ≈8.0/10 CONDITIONAL-APPROVE，唯一 MAJOR=ORA3-MAJ-1（控制面健康黑盒）。本批收口
+> §6 条件清单第 1-4 组 + 部分第 5/7 组；结构/性能批（ORA3-M10..M15）与 AM-6 按约定并入扩容轮。
+
+| id | 修复 | 状态 |
+|---|---|---|
+| ORA3-MAJ-1 | 控制面可观测：metrics.rs 新增 `hygress_control_watch_error_total{kind,class}`/`snapshot_store_total`/`last_store_timestamp_seconds`；adapter 依赖无关 `ControllerHooks`（on_watch_error/on_snapshot_store，Fn 回调）；bootstrap 接线 + `install_panic_hook()`（记录后 exit(1)，s6 重启）+ 启动收敛模式日志 | ✅ 单测 3（含 hook 接线）+ 指标渲染测试 |
+| ORA3-M1 | env 解析失败逐键 `warn!`（config.rs `warn_unparsable`/`parse_duration_env`/`parse_bool_env`；畸形时长回落该键文档默认而非旧 1s）；bootstrap 启动脱敏配置摘要（token 仅布尔） | ✅ 单测 4 |
+| ORA3-M2 | 策略文件缺失 boot `warn!` 一次；reload 遇缺失=失败（有 last-known-good 则保留并返回 false，永不静默换全放行）；admin /reload 500 文案诚实（两情形） | ✅ 单测 3（loader 2 + admin e2e 1） |
+| ORA3-M3 | fallback 链无成功跳终止（预算耗尽/链尽）→ `record_fallback_exhausted` + warn（pipe.rs，redirect_count>0 守卫，不双计） | ✅ 依赖既有 max_ten_guard 单测 |
+| ORA3-M4 | usage 行丢弃可计数：egress `GpustackSink::new` 增 `on_drop` 尾参（三丢弃点+4xx 点触发）；bootstrap 接 `hygress_usage_push_dropped_total`；flusher 通道关闭即排空（recv 语义 + 文档）；shutdown drain 由 pingora run() 优雅停止期主 runtime 存活自然保证（run_forever `-> !`，无死代码） | ✅ egress 单测 4 + drain 回归；gateway 集成编译就位 |
+| ORA3-M5 | 码内注释 1s→30s（policy_loader/bootstrap/adapter lib/snapshot）；README/design.md 收敛节律按拓扑限定（docs 代理） | ✅ |
+| ORA3-M6 | FAIL_OPEN 残留收口：forward_auth 文案改"无裁决，网关按 fail mode 裁决"；`HIGRESS_EXT_AUTH_TIMEOUT_MS` 实际接线（Client::new 读 env，非法回落 30s）；pipe.rs:17 头改 fail-closed 默认 + 拒绝分支 debug 日志；P5 标记清除 | ✅ egress 单测 2 |
+| ORA3-M7 | AM-4 重检改不动点循环（每遍重算 accepted 集，N+1 界有证明）；链式悬空全解链 | ✅ 单测 2（含失败于旧代码的级联用例） |
+| ORA3-M8 | 入站剥离 `x-gpustack-original-path`（transform 规则 3，先于 backstop 追加；防客户端伪造 :path） | ✅ 单测 1（含混合大小写/无 :path 用例） |
+| ORA3-M9 | 中途写失败终止记账（镜像 B4c 截断分支：record_request+duration，kind 不新增）+ `report_incomplete_usage` 冲刷活快照（retained 透传，观测到 usage → completed=true 带 token；未观测保持空行语义） | ✅ core 单测 2 |
+| ORA3-M16 | higress-config 不消费=文档化降级（equivalence A1:30 EQUIVALENT→NOT-CONSUMED；snapshot.rs/bootstrap 注释更正；R-9③ warn 保留待未来 managed 源） | ✅ 文档+注释 |
+| ORA3-M17 | topology-B 种子仅 env：README/design 醒目提示（external raise 行为 + 需 HYGRESS_TOPOLOGY_B=true 或预建类） | ✅ 文档 |
+| ORA3-M18 | AM-2 注入超集=文档化（代码注释 + README；不改变行为，GPUStack 目标均 OpenAI 协议） | ✅ 注释+文档 |
+| ORA3-M19/OX-9/OX-11 | 默认安装 :443 差异、SNI 单默认证书、轮换需重启 runbook、15020/ADMIN_ADDR 注记 → pack/README + README 块 | ✅ 文档 |
+| ORA3-M20 | gateway `default = ["integrations"]`（普通 build 即含数据面）；无 integrations 分支 error!；feature 保留供 --no-default-features 拆分 | ✅ 双模式编译 |
+| 协调项 | integration.rs 构造补第 4 参；metrics.rs 契约计数器预置；bootstrap 死代码/Result.filter/多余括号修复 | ✅ |
+
+门禁（B9.5 后）：**608 tests**（35 integration e2e 全绿）/ clippy `--workspace --all-targets --all-features` 0 /
+`-p hygress-gateway --no-default-features` 0 / 无新依赖（Cargo.lock 未动）。注：本批实施后仓库在 rustfmt
+默认（max_width=100）下非全量排版干净（历史风格更宽、未强制 fmt），未做全仓格式化以免噪音入批。

@@ -68,9 +68,10 @@ impl AdminState {
 
     /// Extract the `Authorization: Bearer <token>` value, if present.
     pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-        headers
-            .get("authorization")
-            .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        headers.get("authorization").and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
     }
 
     /// Token gate: `true` when the request's bearer matches the configured
@@ -120,10 +121,14 @@ impl AdminState {
                         if reload() {
                             AdminResp::json(200, "ok", "policy reloaded")
                         } else {
+                            // ORA3-M2: a false reload is NEVER reported as a
+                            // success. The loader logs the precise cause (missing
+                            // file / malformed file); the message below stays
+                            // honest for both LKG cases.
                             AdminResp::json(
                                 500,
                                 "reload_failed",
-                                "reload failed; last-known-good policy retained",
+                                "reload failed; no new policy applied — keeping the last-known-good policy (the built-in all-pass default when none was ever loaded)",
                             )
                         }
                     }
@@ -152,7 +157,9 @@ impl AdminState {
                         "application/json; charset=utf-8",
                         config_summary_json(shared),
                     ),
-                    None => AdminResp::json(503, "config_unavailable", "config introspection not wired"),
+                    None => {
+                        AdminResp::json(503, "config_unavailable", "config introspection not wired")
+                    }
                 }
             }
             _ => AdminResp::json(404, "not_found", "unknown path"),
@@ -400,7 +407,10 @@ mod tests {
         // Equal length (6), every byte wrong / one byte wrong → false.
         let mut all_wrong = h();
         all_wrong.insert("authorization", "Bearer xxxxxx");
-        assert!(!s.authorized(&all_wrong), "equal-length wrong token must fail");
+        assert!(
+            !s.authorized(&all_wrong),
+            "equal-length wrong token must fail"
+        );
         let mut one_wrong = h();
         one_wrong.insert("authorization", "Bearer secerX");
         assert!(!s.authorized(&one_wrong), "single-byte mismatch must fail");
@@ -440,11 +450,10 @@ mod tests {
     fn reload_invokes_reloader() {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = counter.clone();
-        let reloader: Arc<dyn Fn() -> bool + Send + Sync> =
-            Arc::new(move || {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                true
-            });
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        });
         let s = AdminState::new(
             Arc::new(Metrics::new()),
             Some("secret".to_string()),
@@ -471,6 +480,56 @@ mod tests {
         let r = s.route("POST", "/reload", &ok);
         assert_eq!(r.status, 500);
         assert!(r.body.contains("last-known-good"));
+        // ORA3-M2: the message is explicit that NOTHING was applied.
+        assert!(r.body.contains("no new policy applied"));
+    }
+
+    /// ORA3-M2: a real `POST /reload` through the policy handle — when the file
+    /// disappears after a successful load, admin reports 500 and the real
+    /// policy survives (no silent downgrade to the all-pass default).
+    #[test]
+    fn reload_missing_policy_file_reports_500_and_keeps_lkg() {
+        use crate::policy_loader::PolicyHandle;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hygress-admin-reload-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.yaml");
+        std::fs::write(&path, "version: 1\n").unwrap();
+
+        let handle = Arc::new(PolicyHandle::new(path.to_string_lossy().into_owned()));
+        // Load a real policy (one route), then delete the file.
+        std::thread::sleep(std::time::Duration::from_millis(15)); // distinct mtime
+        std::fs::write(
+            &path,
+            "version: 1\nroutes:\n  - name_glob: \"ai-route-route-*\"\n    limits:\n      consumer: { rps: 5, burst: 10 }\n",
+        )
+        .unwrap();
+        assert!(handle.reload());
+        assert_eq!(handle.shared().routes.len(), 1);
+
+        let h2 = handle.clone();
+        let reloader: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || h2.reload());
+        let s = AdminState::new(
+            Arc::new(Metrics::new()),
+            Some("secret".to_string()),
+            Some(reloader),
+        );
+        let mut ok = h();
+        ok.insert("authorization", "Bearer secret");
+
+        std::fs::remove_file(&path).unwrap();
+        let r = s.route("POST", "/reload", &ok);
+        assert_eq!(r.status, 500, "a missing policy file must never report 200");
+        assert!(r.body.contains("no new policy applied"));
+        // The loaded policy (1 route) survived the failed reload.
+        assert_eq!(handle.shared().routes.len(), 1, "LKG must be kept");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -509,19 +568,17 @@ mod tests {
                 hosts: vec![TlsHost {
                     host: "api.example.com".into(),
                     is_default: true,
-                    cert_pem: "-----BEGIN CERTIFICATE-----\nSECRETCERT\n-----END CERTIFICATE-----".into(),
-                    key_pem: "-----BEGIN PRIVATE KEY-----\nSECRETKEY\n-----END PRIVATE KEY-----".into(),
+                    cert_pem: "-----BEGIN CERTIFICATE-----\nSECRETCERT\n-----END CERTIFICATE-----"
+                        .into(),
+                    key_pem: "-----BEGIN PRIVATE KEY-----\nSECRETKEY\n-----END PRIVATE KEY-----"
+                        .into(),
                 }],
             },
             ..Default::default()
         };
         let shared = hygress_core::SharedConfig::new(data).unwrap();
-        AdminState::new(
-            Arc::new(Metrics::new()),
-            token.map(str::to_string),
-            None,
-        )
-        .with_config_shared(Arc::new(shared))
+        AdminState::new(Arc::new(Metrics::new()), token.map(str::to_string), None)
+            .with_config_shared(Arc::new(shared))
     }
 
     #[test]

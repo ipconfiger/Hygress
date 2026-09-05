@@ -3,8 +3,10 @@
 //!
 //! The inbound set strips untrusted headers **before** any auth, renames the
 //! legacy `x-gpustack-model` header, restores the original path from the
-//! fallback marker, and backstops `:path` into `x-gpustack-original-path`
-//! for the fallback flow. The outbound set guarantees the instance /
+//! fallback marker, strips any client-forged `x-gpustack-original-path`, and
+//! backstops `:path` into `x-gpustack-original-path` for the fallback flow —
+//! so the only value of that header the fallback hop can read is the
+//! gateway's own (ORA3-M8). The outbound set guarantees the instance /
 //! route-name headers survive (deduped, never stripped).
 //!
 //! [`HeaderMap`] is the header abstraction: keys are stored
@@ -240,17 +242,26 @@ impl Transformer {
     ///
     /// 1. remove `x-gpustack-auth-token` (untrusted, stripped before auth)
     /// 2. remove `x-gpustack-model-instance` (untrusted)
-    /// 3. rename `x-gpustack-model` → `x-higress-llm-model`
-    /// 4. rename `x-gpustack-fallback-path` → `:path`
-    /// 5. dedupe `x-gpustack-model` (RETAIN_FIRST) — legacy no-op after rename
-    /// 6. dedupe `x-higress-llm-model` (RETAIN_FIRST — existing wins)
-    /// 7. dedupe `:path` (RETAIN_LAST — fallback-restored path wins)
-    /// 8. backstop `:path` → `x-gpustack-original-path`
-    /// 9. remove `x-gpustack-fallback-path`
+    /// 3. remove `x-gpustack-original-path` (untrusted — client-forgeable
+    ///    fallback-restore value, ORA3-M8; see the backstop rule below)
+    /// 4. rename `x-gpustack-model` → `x-higress-llm-model`
+    /// 5. rename `x-gpustack-fallback-path` → `:path`
+    /// 6. dedupe `x-gpustack-model` (RETAIN_FIRST) — legacy no-op after rename
+    /// 7. dedupe `x-higress-llm-model` (RETAIN_FIRST — existing wins)
+    /// 8. dedupe `:path` (RETAIN_LAST — fallback-restored path wins)
+    /// 9. backstop `:path` → `x-gpustack-original-path`
+    /// 10. remove `x-gpustack-fallback-path`
     pub fn inbound() -> Self {
         Self::new(vec![
             TransformRule::remove("x-gpustack-auth-token"),
             TransformRule::remove("x-gpustack-model-instance"),
+            // ORA3-M8: `x-gpustack-original-path` is a GATEWAY-WRITTEN internal
+            // header (the rule-9 backstop feeds the fallback restore), so any
+            // client-supplied occurrence must be stripped BEFORE the backstop
+            // runs — the fallback hop reads the FIRST value (HeaderMap::get),
+            // and an inbound value that survived would win over the backstop
+            // and steer the restored `:path` of the fallback re-dispatch.
+            TransformRule::remove("x-gpustack-original-path"),
             TransformRule::rename("x-gpustack-model", "x-higress-llm-model"),
             TransformRule::rename("x-gpustack-fallback-path", ":path"),
             TransformRule::dedupe("x-gpustack-model", RetainMode::RetainFirst),
@@ -438,6 +449,47 @@ mod tests {
         Transformer::inbound().apply(&mut h2);
         assert!(!h2.contains("x-gpustack-original-path"));
         assert!(!h2.contains(":path"));
+    }
+
+    #[test]
+    fn inbound_strips_client_forged_original_path_before_backstop() {
+        // ORA3-M8: `x-gpustack-original-path` is a GATEWAY-WRITTEN internal
+        // header (the fallback hop restores `:path` from its FIRST value via
+        // HeaderMap::get). A client-supplied value must be stripped by the
+        // inbound set BEFORE the `:path` backstop appends, so the only value
+        // present at the fallback hop is the gateway's own — otherwise a
+        // client could choose the restored path of the fallback re-dispatch
+        // (falling to the mirror catch-all when the Fallback predicate cannot
+        // match) and have the forged value echoed upstream.
+        let mut h = HeaderMap::from_iter([
+            (":path", "/v1/chat/completions"),
+            ("x-gpustack-original-path", "/attacker/chosen"),
+        ]);
+        Transformer::inbound().apply(&mut h);
+        // The forged value is gone; the backstop appended exactly one value —
+        // the gateway's own, so `get()` (first value) reads it.
+        assert_eq!(h.count("x-gpustack-original-path"), 1);
+        assert_eq!(
+            h.get("x-gpustack-original-path"),
+            Some("/v1/chat/completions"),
+            "the client value must not win over the gateway backstop"
+        );
+
+        // Header names are case-insensitive: any casing of the forged header
+        // is stripped (keys are stored lowercased).
+        let mut h2 = HeaderMap::from_iter([
+            (":path", "/v1/embeddings"),
+            ("X-GPUStack-Original-Path", "/attacker/chosen"),
+        ]);
+        Transformer::inbound().apply(&mut h2);
+        assert_eq!(h2.count("x-gpustack-original-path"), 1);
+        assert_eq!(h2.get("x-gpustack-original-path"), Some("/v1/embeddings"));
+
+        // No `:path` to backstop: a forged value is stripped outright and no
+        // header is created (nothing to restore).
+        let mut h3 = HeaderMap::from_iter([("x-gpustack-original-path", "/attacker/chosen")]);
+        Transformer::inbound().apply(&mut h3);
+        assert!(!h3.contains("x-gpustack-original-path"));
     }
 
     // ----- outbound -----

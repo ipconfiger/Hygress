@@ -13,12 +13,16 @@
 //! [`PolicyHandle`] owns the live `ArcSwap<PolicyConfig>` (cheap per-request
 //! load, no lock) plus the source path and an mtime watermark. Two reload
 //! entry points:
-//! - [`PolicyHandle::poll`] — the 1s mtime-poll tick (only reloads when the
-//!   file actually changed);
+//! - [`PolicyHandle::poll`] — the mtime-poll tick, invoked on the gateway's
+//!   30s dutycycle (bootstrap; only reloads when the file actually changed);
 //! - [`PolicyHandle::reload_from`] — the admin `POST /reload` path (forced).
 //!
 //! Both keep the last-known-good value (and warn) on failure (design §7:
-//! last-known-good semantics).
+//! last-known-good semantics). ORA3-M2: a **disappeared** policy file is a
+//! failure, never a silent downgrade — [`PolicyHandle::reload_from`] keeps the
+//! last-known-good (when one was ever loaded) and reports `false`, and the
+//! initial load of an absent file warns once that limits/quota/guardrails are
+//! effectively disabled (all-pass).
 //!
 //! ## Merge (design §3: `global` defaults → `routes` override)
 //!
@@ -39,6 +43,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -47,7 +52,7 @@ use hygress_core::prelude::{
     GlobalPolicy, GuardrailSpec, LimitsSpec, PolicyConfig, QuotaSpec, RoutePolicyActions,
     RoutePolicySpec, StaticRuleSet, StaticRuleSpec,
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 /// The default policy file location (design §2.1 / D-7).
 pub const DEFAULT_POLICY_PATH: &str = "/etc/hygress/policy.yaml";
@@ -73,7 +78,8 @@ pub fn load_policy(path: impl AsRef<Path>) -> Result<PolicyConfig, String> {
 
 /// The live policy holder: an `ArcSwap<PolicyRuntime>` (lock-free per-request
 /// load of the config **and** its precomputed merged-policy index) plus the
-/// source path and an mtime watermark for the 1s poll.
+/// source path, an mtime watermark for the poll, and a "loaded once" flag that
+/// drives the ORA3-M2 missing-file reload behaviour.
 ///
 /// The per-request policy cost is one `Arc` load ([`PolicyHandle::shared`] /
 /// [`PolicyHandle::merged_for`]); the merge (and static-rule regex compilation)
@@ -99,18 +105,40 @@ struct PolicyInner {
     /// The last observed file mtime (`None` when the file is absent) — the
     /// poll reloads only when this changes.
     last_mtime: std::sync::Mutex<Option<SystemTime>>,
+    /// ORA3-M2: true once a *present* policy file was loaded successfully
+    /// (initial load or reload). Distinguishes "keep the last-known-good" from
+    /// "nothing real was ever loaded" when the file disappears before /reload.
+    loaded_once: AtomicBool,
 }
 
 impl PolicyHandle {
     /// Build the handle and perform the **initial** load from `path`.
     ///
-    /// A missing file starts as the all-pass default; a malformed file starts
-    /// as the all-pass default **with a warn** (there is no last-known-good at
-    /// startup — design §7).
+    /// A missing file starts as the all-pass default **with a warn** (ORA3-M2:
+    /// a missing/mis-mounted policy must not silently disable limits/quota/
+    /// guardrails); a malformed file starts as the all-pass default with a warn
+    /// too (there is no last-known-good at startup — design §7).
     pub fn new(path: impl Into<String>) -> Self {
         let path = path.into();
+        // Present = the path names an existing regular-ish file. A missing file
+        // is the built-in all-pass default — warn once so operators see it.
+        let present = Path::new(&path).is_file();
+        let mut loaded_once = false;
         let initial = match load_policy(&path) {
-            Ok(c) => c,
+            Ok(c) => {
+                if present {
+                    // A real (possibly content-free) policy file was read.
+                    loaded_once = true;
+                } else {
+                    // ORA3-M2 (boot): the loader returned the built-in default
+                    // because the file is absent — surface it.
+                    warn!(
+                        path = %path,
+                        "policy file missing at startup; limits/quota/guardrails are effectively disabled (all-pass default)"
+                    );
+                }
+                c
+            }
             Err(e) => {
                 warn!(
                     path = %path,
@@ -120,12 +148,15 @@ impl PolicyHandle {
                 PolicyConfig::default()
             }
         };
-        let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let last_mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         Self {
             inner: Arc::new(PolicyInner {
                 state: ArcSwap::new(Arc::new(PolicyRuntime::of(initial))),
                 path,
                 last_mtime: std::sync::Mutex::new(last_mtime),
+                loaded_once: AtomicBool::new(loaded_once),
             }),
         }
     }
@@ -150,16 +181,37 @@ impl PolicyHandle {
 
     /// Reload (and swap) from `path`.
     ///
-    /// Returns `true` when the file was read and parsed and the swap happened
-    /// (a missing file swaps in the all-pass default). Returns `false` when the
-    /// read/parse failed — the **last-known-good value is kept** and a warn is
-    /// logged (design §7).
+    /// Returns `true` when the file was read and parsed and the swap happened.
+    /// Returns `false` — **without swapping** — when the file is missing or the
+    /// read/parse failed: the last-known-good value is kept and the failure is
+    /// logged (design §7). ORA3-M2: a missing file is NEVER reported as a
+    /// successful reload, and when a real policy was loaded before it is kept
+    /// (no silent downgrade to the built-in all-pass default).
     pub fn reload_from(&self, path: &str) -> bool {
+        // ORA3-M2: a disappeared policy file must not silently swap in the
+        // all-pass default — keep the last-known-good and report the failure.
+        if !Path::new(path).is_file() {
+            if self.inner.loaded_once.load(Ordering::SeqCst) {
+                error!(
+                    path = %path,
+                    "policy file is missing; keeping the last-known-good policy \
+                     (limits/quota/guardrails stay in force)"
+                );
+            } else {
+                error!(
+                    path = %path,
+                    "policy file is missing and no policy was ever loaded; \
+                     limits/quota/guardrails remain disabled (all-pass default)"
+                );
+            }
+            return false;
+        }
         match load_policy(path) {
             Ok(c) => {
                 self.inner.state.store(Arc::new(PolicyRuntime::of(c)));
                 *self.inner.last_mtime.lock().unwrap() =
                     std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+                self.inner.loaded_once.store(true, Ordering::SeqCst);
                 true
             }
             Err(e) => {
@@ -178,7 +230,8 @@ impl PolicyHandle {
         self.reload_from(&self.inner.path)
     }
 
-    /// The 1s mtime poll tick: reload **only** when the file's mtime changed.
+    /// The mtime-poll tick (the gateway invokes it on its 30s dutycycle):
+    /// reload **only** when the file's mtime changed.
     ///
     /// A missing file (metadata failure) is a no-op — the handle keeps its
     /// current value (the all-pass default when it never existed, the
@@ -367,7 +420,10 @@ fn merge_quota(global: Option<&QuotaSpec>, route: Option<&QuotaSpec>) -> Option<
 
 /// **Inherit + append** the static rules (route rules after the global ones);
 /// the route's `llm` and `fail_mode` win when the route section is present.
-fn merge_guardrail(global: Option<&GuardrailSpec>, route: Option<&GuardrailSpec>) -> Option<GuardrailSpec> {
+fn merge_guardrail(
+    global: Option<&GuardrailSpec>,
+    route: Option<&GuardrailSpec>,
+) -> Option<GuardrailSpec> {
     match (global, route) {
         (None, None) => None,
         (Some(g), None) => Some(g.clone()),
@@ -388,16 +444,17 @@ fn merge_guardrail(global: Option<&GuardrailSpec>, route: Option<&GuardrailSpec>
 mod tests {
     use super::*;
     use hygress_core::prelude::{
-        GlobalPolicy, GuardAction, GuardrailFailMode, GuardrailSpec, LimitsSpec, LlmGuardSpec,
-        LlmGuardMode, LimitWindowSpec, PolicyConfig, QuotaSpec, RoutePolicyActions,
-        RoutePolicySpec, StaticRuleSpec, TokenBucketSpec,
+        GlobalPolicy, GuardAction, GuardrailFailMode, GuardrailSpec, LimitWindowSpec, LimitsSpec,
+        LlmGuardMode, LlmGuardSpec, PolicyConfig, QuotaSpec, RoutePolicyActions, RoutePolicySpec,
+        StaticRuleSpec, TokenBucketSpec,
     };
 
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn tempdir() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("hygress-policy-test-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hygress-policy-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -448,12 +505,18 @@ routes:
         let c = load_policy(&path).unwrap();
         assert_eq!(c.version, 1);
         assert!(c.global.limits.is_some());
-        assert_eq!(c.global.limits.as_ref().unwrap().ip.as_ref().unwrap().burst, 40);
+        assert_eq!(
+            c.global.limits.as_ref().unwrap().ip.as_ref().unwrap().burst,
+            40
+        );
         assert_eq!(c.routes.len(), 1);
         assert_eq!(c.routes[0].name_glob, "ai-route-route-*");
         // `header_add` is a list of `[name, value]` pairs (serde (String, String)).
         let actions = c.routes[0].policy.as_ref().unwrap();
-        assert_eq!(actions.header_add, vec![("x-canary".to_string(), "true".to_string())]);
+        assert_eq!(
+            actions.header_add,
+            vec![("x-canary".to_string(), "true".to_string())]
+        );
         assert_eq!(actions.header_del, vec!["x-internal".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -515,8 +578,14 @@ routes:
         assert_eq!(c.routes.len(), 1);
         assert_eq!(c.routes[0].name_glob, "ai-route-route-*");
         let actions = c.routes[0].policy.as_ref().unwrap();
-        assert_eq!(actions.override_route.as_deref(), Some("model-8-6.static:80"));
-        assert_eq!(actions.pin_provider_svc_pattern.as_deref(), Some("provider-8.*"));
+        assert_eq!(
+            actions.override_route.as_deref(),
+            Some("model-8-6.static:80")
+        );
+        assert_eq!(
+            actions.pin_provider_svc_pattern.as_deref(),
+            Some("provider-8.*")
+        );
         assert_eq!(actions.timeout_ms, Some(30000));
         assert_eq!(actions.retries, Some(2));
         std::fs::remove_dir_all(&dir).ok();
@@ -591,9 +660,64 @@ routes:
         assert!(!h.reload());
         assert_eq!(h.shared().routes.len(), 1, "last-known-good must be kept");
 
-        // reload_from on a missing path swaps in the all-pass default.
-        assert!(h.reload_from(&dir.join("absent.yaml").to_string_lossy()));
+        // ORA3-M2: a reload whose file has *disappeared* is a failure — the
+        // last-known-good is kept (never a silent downgrade to all-pass) and
+        // the response is false (admin surfaces a non-200).
+        std::fs::remove_file(&path).unwrap();
+        assert!(!h.reload_from(&path.to_string_lossy()));
+        assert_eq!(
+            h.shared().routes.len(),
+            1,
+            "last-known-good must be kept when the file disappears"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_reload_missing_file_without_prior_load_is_an_honest_failure() {
+        // ORA3-M2: boot with no policy file (image default) → all-pass + warn;
+        // a later /reload while the file is still missing must NOT report a
+        // successful reload (the old behaviour returned true + 200 "reloaded").
+        let dir = tempdir();
+        let absent = dir.join("absent.yaml");
+        let h = PolicyHandle::new(absent.to_string_lossy().into_owned());
         assert_eq!(*h.shared(), PolicyConfig::default());
+        assert!(
+            !h.reload(),
+            "missing-file reload must report failure (honest)"
+        );
+        assert_eq!(
+            *h.shared(),
+            PolicyConfig::default(),
+            "state stays the built-in all-pass"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_reload_after_malformed_boot_then_fixed_then_missing() {
+        // Full ORA3-M2 cycle: malformed at boot (all-pass, no LKG) → fixed via
+        // /reload (a real policy loads) → the file disappears → /reload keeps
+        // the real policy and fails loudly instead of downgrading to all-pass.
+        let dir = tempdir();
+        let path = dir.join("policy.yaml");
+        std::fs::write(&path, "version: [broken").unwrap();
+        let h = PolicyHandle::new(path.to_string_lossy().into_owned());
+        assert_eq!(*h.shared(), PolicyConfig::default());
+        // Still malformed → false (LKG = all-pass, kept).
+        assert!(!h.reload());
+        // Fixed → a real policy loads.
+        std::fs::write(&path, policy_yaml()).unwrap();
+        assert!(h.reload());
+        assert_eq!(h.shared().routes.len(), 1);
+        // Gone → the real policy is kept and reload reports false.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!h.reload());
+        assert_eq!(
+            h.shared().routes.len(),
+            1,
+            "real policy must survive the file disappearing"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -626,7 +750,10 @@ routes:
             bare_ingress_name("higress-system/ai-route-route-1.internal"),
             "ai-route-route-1.internal"
         );
-        assert_eq!(bare_ingress_name("ai-route-route-1.internal"), "ai-route-route-1.internal");
+        assert_eq!(
+            bare_ingress_name("ai-route-route-1.internal"),
+            "ai-route-route-1.internal"
+        );
         assert_eq!(bare_ingress_name("gpustack"), "gpustack");
     }
 
@@ -653,7 +780,10 @@ routes:
         let c = cfg_with(
             GlobalPolicy {
                 limits: Some(LimitsSpec {
-                    ip: Some(TokenBucketSpec { rps: 20.0, burst: 40 }),
+                    ip: Some(TokenBucketSpec {
+                        rps: 20.0,
+                        burst: 40,
+                    }),
                     consumer: None,
                 }),
                 quota: None,
@@ -683,8 +813,14 @@ routes:
         let c = cfg_with(
             GlobalPolicy {
                 limits: Some(LimitsSpec {
-                    ip: Some(TokenBucketSpec { rps: 20.0, burst: 40 }),
-                    consumer: Some(TokenBucketSpec { rps: 100.0, burst: 200 }),
+                    ip: Some(TokenBucketSpec {
+                        rps: 20.0,
+                        burst: 40,
+                    }),
+                    consumer: Some(TokenBucketSpec {
+                        rps: 100.0,
+                        burst: 200,
+                    }),
                 }),
                 quota: Some(QuotaSpec {
                     by_model_tokens: Some(LimitWindowSpec {
@@ -699,7 +835,10 @@ routes:
                 name_glob: "ai-route-route-*".into(),
                 limits: Some(LimitsSpec {
                     ip: None,
-                    consumer: Some(TokenBucketSpec { rps: 5.0, burst: 10 }),
+                    consumer: Some(TokenBucketSpec {
+                        rps: 5.0,
+                        burst: 10,
+                    }),
                 }),
                 quota: Some(QuotaSpec {
                     by_model_tokens: Some(LimitWindowSpec {
@@ -719,9 +858,24 @@ routes:
         // ... but the route consumer overrides the global consumer.
         assert_eq!(limits.consumer.as_ref().unwrap().burst, 10);
         // The route quota wins over the global quota.
-        assert_eq!(m.quota.as_ref().unwrap().by_model_tokens.as_ref().unwrap().hard, Some(50_000));
         assert_eq!(
-            m.quota.as_ref().unwrap().by_model_tokens.as_ref().unwrap().soft,
+            m.quota
+                .as_ref()
+                .unwrap()
+                .by_model_tokens
+                .as_ref()
+                .unwrap()
+                .hard,
+            Some(50_000)
+        );
+        assert_eq!(
+            m.quota
+                .as_ref()
+                .unwrap()
+                .by_model_tokens
+                .as_ref()
+                .unwrap()
+                .soft,
             Some(1000)
         );
         // No guardrail anywhere.
@@ -793,7 +947,10 @@ routes:
         let m = merge_policy(&c, "anything");
         assert_eq!(m.guardrail.as_ref().unwrap().static_rules.len(), 1);
         // The route section's default fail_mode (Closed) applies.
-        assert_eq!(m.guardrail.as_ref().unwrap().fail_mode, GuardrailFailMode::Closed);
+        assert_eq!(
+            m.guardrail.as_ref().unwrap().fail_mode,
+            GuardrailFailMode::Closed
+        );
     }
 
     #[test]

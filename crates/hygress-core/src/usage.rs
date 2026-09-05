@@ -171,10 +171,7 @@ impl Operation {
 
     /// Parse a wire string into an [`Operation`]; `None` for unknown values.
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|op| op.as_str() == s)
+        Self::ALL.iter().copied().find(|op| op.as_str() == s)
     }
 }
 
@@ -872,7 +869,10 @@ mod tests {
             "wire must be exactly 17 fields, got {}",
             obj.len()
         );
-        assert_eq!(keys, expected, "wire field set must equal the 17 pinned names");
+        assert_eq!(
+            keys, expected,
+            "wire field set must equal the 17 pinned names"
+        );
 
         // The 4 server-side-only fields must be ABSENT on the wire.
         for forbidden in SERVER_ONLY_FIELDS {
@@ -998,7 +998,10 @@ mod tests {
         assert_eq!(Operation::ImageGeneration.as_str(), "image_generation");
         assert_eq!(Operation::AudioSpeech.as_str(), "audio_speech");
         // Server spelling (intentional typo in GPUStack): audit_transcription.
-        assert_eq!(Operation::AuditTranscription.as_str(), "audit_transcription");
+        assert_eq!(
+            Operation::AuditTranscription.as_str(),
+            "audit_transcription"
+        );
         assert_eq!(Operation::ALL.len(), 7);
     }
 
@@ -1152,6 +1155,82 @@ mod tests {
         assert_eq!(m2.total_token, 10);
     }
 
+    // ----- ORA3-M9: mid-stream flush (the write-fail terminal contract) -----
+
+    #[test]
+    fn flush_after_mid_stream_disconnect_carries_observed_tokens() {
+        // The gateway's mid-stream write-fail terminal (ORA3-M9) flushes the
+        // LIVE accumulator retained when the downstream died mid-stream — NOT a
+        // fresh empty snapshot. The response here ends abruptly right after the
+        // usage chunk (no [DONE], no clean end-of-body), exactly like a
+        // downstream disconnect: the flushed incomplete row must still carry
+        // the tokens absorbed before the break and `completed` must reflect
+        // that a usage object was observed.
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        // Content chunk, then the canonical usage chunk — then the stream dies.
+        assert!(!s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"H\"}}]}\n\n"));
+        assert!(s.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":40,\"total_tokens\":140,\"prompt_tokens_details\":{\"cached_tokens\":12}}}\n\n"
+        ));
+        // Mid-stream: the usage object was observed, but the response never
+        // reached a natural end — no [DONE] was fed.
+        assert!(s.complete());
+        let (in_tok, out_tok, cached) = s.tokens();
+        assert_eq!((in_tok, out_tok, cached), (100, 40, 12));
+
+        let m = s.flush(&FlushFields {
+            model: "gpt-4o".into(),
+            model_id: Some(1),
+            model_route_id: Some(2),
+            provider_id: Some(3),
+            request_content_bytes: 512,
+            started_at_ms: Some(1000),
+            completed_at_ms: Some(2000),
+            ..Default::default()
+        });
+        assert!(
+            m.completed,
+            "usage was observed mid-stream; the incomplete row must report completed=true, not empty"
+        );
+        assert_eq!(m.input_token, 100);
+        assert_eq!(m.output_token, 40);
+        assert_eq!(m.input_cached_token, 12);
+        assert_eq!(m.total_token, 140);
+        // Attribution flows through on the incomplete row exactly as on the
+        // normal end-of-stream flush.
+        assert_eq!(
+            (m.model_id, m.model_route_id, m.provider_id),
+            (Some(1), Some(2), Some(3))
+        );
+    }
+
+    #[test]
+    fn flush_after_mid_stream_disconnect_without_usage_stays_empty() {
+        // No usage object was observed before the break: the incomplete row
+        // must stay the historical `completed=false` zero-token row (the
+        // GPUStack server falls back to byte/chunk estimation).
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        assert!(!s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"H\"}}]}\n\n"));
+        assert!(!s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"i\"}}]}\n\n"));
+        // Mid-stream: only content chunks were fed, then the stream died.
+        assert!(!s.complete());
+        let m = s.flush(&FlushFields {
+            model: "gpt-4o".into(),
+            request_content_bytes: 512,
+            ..Default::default()
+        });
+        assert!(!m.completed);
+        assert_eq!(
+            (
+                m.input_token,
+                m.output_token,
+                m.input_cached_token,
+                m.total_token
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
     // ----- Anthropic (last-wins, cache, total) -----
 
     #[test]
@@ -1236,7 +1315,8 @@ mod tests {
         // A single data line split across two feeds is counted exactly once —
         // only when its newline terminates the line.
         let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
-        let line = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}";
+        let line =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}";
         let half = line.len() / 2;
         s.feed(&line[..half]);
         // Not yet newline-terminated -> not counted.
@@ -1303,9 +1383,7 @@ mod tests {
         // A `"usage"` key that is not the top-level field of the payload must
         // not be absorbed.
         let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
-        s.feed(
-            b"data: {\"meta\":{\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":40}}}\n\n",
-        );
+        s.feed(b"data: {\"meta\":{\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":40}}}\n\n");
         // The nested usage is not top-level -> no completion, no tokens.
         assert!(!s.complete());
         assert_eq!(s.tokens(), (0, 0, 0));
@@ -1317,7 +1395,8 @@ mod tests {
         // literal token is split by the chunk boundary (`"us` + `age"`), so a
         // per-chunk-slice prefilter would miss it — only the cross-buffer line
         // splice sees the contiguous token.
-        let full = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n";
+        let full =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n";
         // Split inside the `"usage"` token (after the `"us` prefix).
         let split = find_subseq(full, b"\"usage\"", 0).expect("anchor") + 3;
         let (a, b) = full.split_at(split);
@@ -1368,7 +1447,11 @@ mod tests {
         assert_eq!(s.mode, Mode::Unknown);
         assert_eq!(s.tail.len(), 700 * 1024);
         s.feed(&junk);
-        assert_eq!(s.mode, Mode::Oversized, "cap must stop the Unknown accumulation");
+        assert_eq!(
+            s.mode,
+            Mode::Oversized,
+            "cap must stop the Unknown accumulation"
+        );
         assert!(s.tail.is_empty(), "buffered tail must be dropped");
 
         // After the cap the rest of the response is ignored (no more buffering / full re-parses)...
@@ -1403,7 +1486,10 @@ mod tests {
         // ... the second 600 KiB pushes the pending line past the cap: it is dropped + skipped.
         assert!(!s.feed(&big));
         assert!(s.tail.is_empty(), "oversized line must not stay buffered");
-        assert!(s.skip_until_newline, "remaining oversized line is skipped to its \\n");
+        assert!(
+            s.skip_until_newline,
+            "remaining oversized line is skipped to its \\n"
+        );
 
         // The giant line's terminator arrives; the line AFTER it is processed normally.
         assert!(s.feed(b"\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n"));
@@ -1430,7 +1516,10 @@ mod tests {
         assert_eq!(s.json_parse_attempts, 1, "one failed attempt recorded");
         // ... then the remainder completes the object on the final `}`.
         let rest = &body[prefix.len()..];
-        assert!(s.feed(rest), "completed JSON object with usage must be absorbed");
+        assert!(
+            s.feed(rest),
+            "completed JSON object with usage must be absorbed"
+        );
         assert_eq!(s.tokens(), (11, 4, 0));
         assert_eq!(s.mode, Mode::Json);
         assert!(s.complete());
@@ -1450,11 +1539,13 @@ mod tests {
             chunk.extend_from_slice(frag);
             chunk.extend_from_slice(format!("x{i}").as_bytes());
             chunk.push(b'}');
-            assert!(!s.feed(&chunk), "never-complete fragments must not absorb usage");
+            assert!(
+                !s.feed(&chunk),
+                "never-complete fragments must not absorb usage"
+            );
         }
         assert_eq!(
-            s.json_parse_attempts,
-            MAX_JSON_PARSE_ATTEMPTS,
+            s.json_parse_attempts, MAX_JSON_PARSE_ATTEMPTS,
             "parse attempts must be budgeted, not unbounded"
         );
         // Still Unknown (never classified, never overflowed the cap), flush is well-defined.

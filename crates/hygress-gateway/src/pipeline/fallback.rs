@@ -33,6 +33,11 @@ pub fn budget_exhausted(redirect_count: u32, spec: &FallbackSpec) -> bool {
 /// `redirect_count` is the number of fallback redirects already taken for this
 /// request (0 on the first failure). `original_path` is the pre-rewrite
 /// `:path` (the `x-gpustack-original-path` backstop).
+///
+/// ORA3-M3: `None` is the **budget-exhausted terminal** — the pipe then
+/// forwards the final error and records `hygress_fallback_exhausted_total` with
+/// a warn carrying the route key + hop count (operators can tell a
+/// "failed after N fallback hops" from a direct failure).
 pub fn plan(spec: &FallbackSpec, original_path: &str, redirect_count: u32) -> Option<FallbackPlan> {
     if budget_exhausted(redirect_count, spec) {
         return None;

@@ -27,7 +27,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | EnvoyFilter（fallback, managed） | custom_response 重定向 | `wire_fallbacks` → `FallbackLink` | **EQUIVALENT-WITHIN-SCOPE** |
 | EnvoyFilter（全局 custom-response，**无 managed label**） | 全局错误响应整形 | **忽略**（label 过滤，translate.rs:22-24） | 🟡 **GAP-C5**（见 §B） |
 | Secret `gpustack-tls-*` | Cert Server 签发 + SDS 下发 | `secret_to_tls_host`（tls.crt/tls.key base64）→ TLS SNI 监听 | **EQUIVALENT-WITHIN-SCOPE**（🟠 GAP-C3：单默认证书 + 无热载，见 §B） |
-| ConfigMap `higress-config` | ConfigmapMgr → EnvoyFilter（tracing/gzip/mcpServer 等） | **仅** `downstream.idleTimeout`/`upstream.idleTimeout`/`maxRequestHeadersKb` → `TimingConfig`（translate.rs:848-880）；其余键忽略 | **EQUIVALENT-WITHIN-SCOPE**（🟡 GAP-C2：envoy 调优类键不生效） |
+| ConfigMap `higress-config` | ConfigmapMgr → EnvoyFilter（tracing/gzip/mcpServer 等） | **内嵌安装不消费**：GPUStack 写入 `higress-config` **不带** `gpustack.ai/managed` 标签 → 适配器 ConfigMap LIST/WATCH 按 managed 标签选择器过滤（client.rs:81、lib.rs:243-249）永不列出 → `configmap_to_timing`（translate.rs:938）在内嵌安装不可达，timing 保持种子默认（1800/10） | **NOT-CONSUMED / 文档化限制**（修正原 EQUIVALENT-WITHIN-SCOPE 声明，ORA3-M16；即使列出数据面也不强制，R-9③；详见 §B-C2） |
 | Http2Rpc / Gateway API / VirtualService 等 | Higress Controller 支持 | 不消费（GPUStack embedded 模式不写） | **N/A**（超出 GPUStack 使用面） |
 
 **reject-vs-ignore 语义**（与 xDS NACK 对照）：
@@ -58,7 +58,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 
 | 维度 | Higress（pilot/xDS） | Hygress（WATCH 快照） | 判定 |
 |---|---|---|---|
-| 配置下发 | MCP-over-xDS `xds://127.0.0.1:15051` + k8s → Envoy LDS/RDS/CDS/EDS/SDS，增量推送（亚秒） | 6 类 WATCH（`kube-runtime` watcher，reconnect/relist 内建）→ 去抖 → 一次全量 LIST+translate+ArcSwap store；rv 指纹幂等短路（rv==0 加固）；30s 安全网 tick | **EQUIVALENT-WITHIN-SCOPE**：变更收敛 ≤1 事件周期（亚秒级 vs xDS 毫秒级，同量级）；无事件时 30s 兜底（实例缩扩容等 k8s 事件必然触发 WATCH，不依赖兜底）。⚠️ 实测注：GPUStack **embedded apiserver 不提供 resourceVersion**（LIST 结果无 rv），6 类 WATCH 均报 `NoResourceVersion` 而不可用 → 实际收敛路径是 **30s 安全网 tick**（每唤醒无条件 sync_once，指纹短路）。watcher 错误已加 60s 退避 + 30s 日志限速（2026-09-05），避免热循环刷屏（此前 ~2000 行/s、17.6GB 日志）；事件驱动仅在 external 拓扑（apiserver 支持 WATCH）时生效 |
+| 配置下发 | MCP-over-xDS `xds://127.0.0.1:15051` + k8s → Envoy LDS/RDS/CDS/EDS/SDS，增量推送（亚秒） | 6 类 WATCH（`kube-runtime` watcher，reconnect/relist 内建）→ 去抖 → 一次全量 LIST+translate+ArcSwap store；rv 指纹幂等短路（rv==0 加固）；30s 安全网 tick | **EQUIVALENT-WITHIN-SCOPE**：拓扑 B 变更收敛 ≤1 事件周期（亚秒级 vs xDS 毫秒级，同量级；30s tick 仅兜底）；⚠️ 实测注：GPUStack **embedded apiserver（拓扑 A）不提供 resourceVersion**（LIST 结果无 rv），6 类 WATCH 均报 `NoResourceVersion` 而不可用 → 实际收敛路径是 **30s 安全网 tick**（每唤醒无条件 sync_once，指纹短路）。watcher 错误已加 60s 退避 + 30s 日志限速（2026-09-05），避免热循环刷屏（此前 ~2000 行/s、17.6GB 日志）；事件驱动仅在 external 拓扑（apiserver 支持 WATCH）时生效 |
 | 实例 join/scale/delete | EDS 增量 | McpBridge registries 变更 → WATCH 事件 → SWRR 池重建 | EQUIVALENT-WITHIN-SCOPE（全量重建 vs 增量——namespace 规模下 O(对象数) 可忽略；未基准测实例扩缩收敛延迟，🟢 注） |
 | 配置校验失败 | NACK（per-object，`proxy-status` 可见） | per-object skip+warn / 结构性整快照拒绝 keep-last-good（lib.rs:395） | **EQUIVALENT-WITHIN-SCOPE**（语义同向；可见性差异见 §B-C4） |
 | 启动门控 | envoy 先起、配置后到（空配置期） | **fail-fast**：首快照成功才绑 :80（300s 窗口，bootstrap.rs） | 行为差异（有意）：hygress 不出现"无配置裸奔窗口"；代价是 apiserver 未就绪则网关不就绪 |
@@ -89,18 +89,18 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | # | 严重度 | 差距 | 证据 | 影响 |
 |---|---|---|---|---|
 | 🟠 C1 | 潜在（GPUStack 演进才可见） | **未消费的 WasmPlugin 配置字段**：8 个受管 WasmPlugin 中 4 个（ext-auth/header-transformer/token-usage/ai-statistics）的 `defaultConfig` 完全不消费（原生等价实现，按 pin 契约固化）；model-router 仅消费 `aliasNameMapping`（`modelKey`/`autoRouting*`/`maxBodyBytes` 忽略）。GPUStack **当前**不热更这些字段（pin §2.1/2.3/2.7），但 **GPUStack 升级若写入新字段/改 init 配置，hygress 静默忽略**（translate.rs:962-975 仅 trace） | translate.rs:540/555（unknown keys … ignored, never reject）、962-975 | 建议：启动时对已消费 WasmPlugin 的 `defaultConfig` 做**未消费键告警**（warn 一次），并把"GPUStack 版本升级 → 重跑契约 pin 对比"写入手册 |
-| 🟠 C2 | 潜在 | **`higress-config` ConfigMap 仅消费 3 个超时键**（idleTimeout×2/maxRequestHeadersKb，translate.rs:848-880）；mesh/tracing/gzip/mcpServer.redis 等 envoy 调优键静默忽略 | translate.rs:848-880 | 建议：未知顶层键 warn 一次；文档明示"仅超时三键生效" |
+| 🟠 C2 | 潜在（当前行为差 → 已文档化，ORA3-M16） | **`higress-config` ConfigMap 实际不被消费**：GPUStack 写入不带 `gpustack.ai/managed` 标签（higress-config/higress-https/higress-ca-root-cert 三个 ConfigMap 均无）→ 适配器 ConfigMap LIST/WATCH 按 managed 标签选择器过滤（client.rs:81、snapshot.rs:89、lib.rs:243-249）永不列出 → `configmap_to_timing`（translate.rs:938）在内嵌安装不可达，timing 保持种子默认（1800/10）。即使列出，数据面也不强制（R-9③：仅解析入快照 + 绑定时 warn-once，bootstrap.rs:253-268）——原"仅消费 3 键、其余忽略"表述修正 | client.rs:81；snapshot.rs:89；lib.rs:243-249；translate.rs:938；bootstrap.rs:253-268 | 维持文档化降级（equivalence A1 行已改 **NOT-CONSUMED**）；若 GPUStack 一直不补标签，可后续按名列出（McpBridge 先例）再定是否强制 |
 | 🟠 C3 | 潜在（TLS 轮换/多证书场景） | **TLS 证书启动时一次性写入**（`write_default_tls_pem` 取 default/first），Secret WATCH 会更新快照但**不重载监听证书**；多 `gpustack-tls-*` 主机时仅默认证书服务所有 SNI | bootstrap.rs:226-244 | 单证书 GPUStack 部署无影响；多证书/轮换场景需重启或补 SNI+热载 |
 | 🟡 C4 | 运维可见性 | 无 `istioctl proxy-config` 等效物：当前生效快照（路由/注册表/特性/被拒对象）不可 introspect；拒绝/跳过仅 warn 日志、无计数指标 | lib.rs:395-397 | 建议：admin `GET /config` dump + `config_reject_total`/`config_object_skipped` 计数器（成本低，ArcSwap 已有） |
 | 🟡 C5 | 行为差异（语义等价内） | 全局 custom-response EnvoyFilter（未受管）被忽略——最终错误的**响应体形状**可能与 envoy 不同（hygress 用自有 JSON 错误形状）；SWRR vs envoy 加权 RR 的短时分布差异；`realIPHeader` 默认值歧义（pin §6.1） | translate.rs:22-24；pin §6 | 低影响：GPUStack 服务端不解析网关错误体；e2e 已验证错误路径功能 |
 | 🟢 C6 | N/A | Http2Rpc / Gateway API / Gateway Controller / Cert Server 签发、xDS/MCP 协议本身、多集群——GPUStack embedded 模式不使用（契约钉范围外） | Higress 架构附录 | 记录边界即可 |
 | 🟢 C7 | 已消除 | 早期"每请求路由表重建"、close-delimited、单线程、1s 轮询——均已修复（857d21b/5df02f2/815ebd3/493dc21/cf4f6c5），benchmark §6-§11 曲线为证 | benchmark.md | — |
 
-**没有 🔴**：GPUStack **当前实际写入**的每一个控制面变更（路由/注册表/provider 令牌/模型映射/TLS/超时）都被 hygress 消费并产生等价数据面行为，且有真机 DoD（CRD 逐字节一致、usage 逐位一致、429/403/200 矩阵）背书。
+**没有 🔴**：GPUStack **当前实际写入**的每一个控制面变更（路由/注册表/provider 令牌/模型映射/TLS；**唯一例外：`higress-config` 超时 ConfigMap 无 managed 标签 → 标签选择器不消费，见 C2**）都被 hygress 消费并产生等价数据面行为，且有真机 DoD（CRD 逐字节一致、usage 逐位一致、429/403/200 矩阵）背书。
 
 ## C. 判定（推荐表述）
 
-> **在 GPUStack 当前实际使用的控制面范围内（6 类受管 CRD 的已写字段 × 数据面管线 ①-⑮），Hygress 与内嵌 Higress 控制面行为等价，且已经真机验证（CRD fixture 逐字节一致、e2e usage 落库逐位一致、wrk 同 rig 对比性能持平或反超）。等价性边界是显式设计的：GPUStack 静态初始化的 4 个 WasmPlugin 与 higress-config 的 envoy 调优键由原生实现按 pin 契约固化，不消费 CRD 内容——这换来"无 Wasm 运行时/无 xDS/单二进制"的资源与运维收益（≈23× RSS、13.6k req/s 内核下限），代价是 GPUStack 未来若写入这些字段或引入新 CRD kind，hygress 不会自动跟随（静默忽略 + trace 日志）。动态配置收敛语义等价（WATCH 事件驱动 ≤1 事件周期 vs xDS 推送；失败 keep-last-good 双方一致），仅证书热轮换与配置可见性存在运维级差距（C3/C4）。**
+> **在 GPUStack 当前实际使用的控制面范围内（6 类受管 CRD 的已写字段 × 数据面管线 ①-⑮），Hygress 与内嵌 Higress 控制面行为等价，且已经真机验证（CRD fixture 逐字节一致、e2e usage 落库逐位一致、wrk 同 rig 对比性能持平或反超）。等价性边界是显式设计的：GPUStack 静态初始化的 4 个 WasmPlugin 的 defaultConfig 由原生实现按 pin 契约固化、不消费 CRD 内容，且 `higress-config` ConfigMap（超时/调优键）因 GPUStack 不带 managed 标签而被标签选择器**有意不消费**（A1 行 = NOT-CONSUMED，ORA3-M16；timing 保持种子默认 1800/10，数据面亦不强制 R-9③）——这换来"无 Wasm 运行时/无 xDS/单二进制"的资源与运维收益（≈23× RSS、13.6k req/s 内核下限），代价是 GPUStack 未来若补 managed 标签/写入新字段或引入新 CRD kind，hygress 不会自动跟随（静默忽略 + trace 日志）。动态配置收敛语义等价（拓扑 B WATCH 事件驱动 ≤1 事件周期 vs xDS 推送；拓扑 A 为 30s 兜底 tick；失败 keep-last-good 双方一致），仅证书热轮换与配置可见性存在运维级差距（C3/C4）。**
 
 一句话版本：**"GPUStack 所用 surface 内范围性等价（真机验证）；surface 外的 Higress/Istio 通用能力不等价，且有明确清单（§B）。"**
 

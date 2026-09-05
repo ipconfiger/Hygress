@@ -24,6 +24,10 @@
 //!   keeps the previous snapshot; only a successful store swaps.
 //! - Orphan tolerance: never delete upstream objects; `ai-route-model-<id>` is legacy; the
 //!   unmanaged global custom-response EnvoyFilter is ignored (it lacks the managed label).
+//! - ORA3-M16 (documented downgrade): the embedded topology does **NOT** consume the unlabeled
+//!   `higress-config` timing ConfigMap (GPUStack writes it without the managed label, so the
+//!   snapshot's label-selector listing never sees it — see `snapshot.rs`); `config.timing`
+//!   stays at the built-in seed defaults (downstream 1800s / upstream 10s).
 //!
 //! ## Public API (the gateway depends on this)
 //!
@@ -31,7 +35,7 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //! use hygress_core::SharedConfig;
-//! use hygress_adapter::Controller;
+//! use hygress_adapter::{Controller, ControllerHooks};
 //!
 //! # async fn example(shared: Arc<SharedConfig>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 //! let controller = Controller::new(
@@ -40,7 +44,8 @@
 //!     "higress-system".into(),
 //!     "higress".into(),
 //!     Duration::from_secs(1),
-//!     false, // seed_ingress_class: topology B / external (seeds once inside `run`)
+//!     false,           // seed_ingress_class: topology B / external (seeds once inside `run`)
+//!     ControllerHooks::default(), // observability hooks (optional; see [`ControllerHooks`])
 //! )?;
 //!
 //! let ready = controller.ready();
@@ -71,9 +76,9 @@ use futures::StreamExt;
 use kube::runtime::watcher::{watcher, Config};
 use kube::Api;
 
-use snapshot::SnapshotFingerprint;
 pub use client::Client;
 pub use error::{Error, Result};
+use snapshot::SnapshotFingerprint;
 pub use translate::{Object, ObjectKind};
 
 /// Mirror-ingress name env var (GPUStack `GATEWAY_MIRROR_INGRESS_NAME`, design §2.1.1 / §4.3).
@@ -84,6 +89,25 @@ const MIRROR_NAME_ENV: &str = "GATEWAY_MIRROR_INGRESS_NAME";
 /// a missed / restarted watch stream. [`Controller::run`] uses `max(this, poll_interval)`, so
 /// the configured cadence can never make the backstop run more often than 30s.
 const FALLBACK_TICK: Duration = Duration::from_secs(30);
+
+/// ORA3-MAJ-1: optional observability hooks the controller invokes so the
+/// gateway can expose control-plane health on `/metrics` (the adapter itself
+/// stays dependency-free — no prometheus/tracing-coupled types leak in here).
+///
+/// All callbacks are cheap (`Fn` — never awaited); a `None` hook is a no-op.
+#[derive(Default, Clone)]
+pub struct ControllerHooks {
+    /// Called `(kind, class)` on **every** classified watcher error — `kind`
+    /// is the watched resource kind (`configmap`/`ingress`/`secret`/…),
+    /// `class` is `"permanent"` (watch unsupported by the apiserver →
+    /// convergence degraded to the safety-net tick) or `"transient"`
+    /// (recoverable watch failure). Invoked regardless of log-rate limiting.
+    pub on_watch_error: Option<Arc<dyn Fn(&'static str, &'static str) + Send + Sync>>,
+    /// Called after **every** successful store of a new snapshot (the store
+    /// path in [`Controller::run`] → `sync_once`); the gateway counts stores
+    /// and stamps its last-store staleness gauge from here.
+    pub on_snapshot_store: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
 /// Control-plane adapter (strategy 2): a read-only kube CRD consumer that LISTs the managed
 /// Higress CRDs, translates them into [`hygress_core::ConfigData`], and stores the snapshot
@@ -103,10 +127,12 @@ pub struct Controller {
     mirror_name: String,
     ready: Arc<tokio::sync::Notify>,
     ready_notified: Arc<std::sync::atomic::AtomicBool>,
-    /// Last LISTed snapshot fingerprint (P4 short-circuit). Interior-mutable: the poll loop
-    /// updates it once per tick. A `Mutex` is fine — one short critical section per 1s tick in
-    /// the control-plane runtime (never held across an `.await`).
+    /// Last LISTed snapshot fingerprint (P4 short-circuit). Interior-mutable: the main loop
+    /// updates it once per reconcile wake. A `Mutex` is fine — one short critical section per
+    /// wake in the control-plane runtime (never held across an `.await`).
     last_fingerprint: Mutex<Option<SnapshotFingerprint>>,
+    /// ORA3-MAJ-1: observability hooks (see [`ControllerHooks`]).
+    hooks: ControllerHooks,
 }
 
 impl Controller {
@@ -115,9 +141,12 @@ impl Controller {
     /// `shared` is the gateway's config holder (the adapter stores snapshots into it);
     /// `kubeconfig` is the embedded file kubeconfig path (`None` → in-cluster / `KUBECONFIG`);
     /// `ingress_class` is the IngressClass name to probe/seed (topology B); `poll_interval`
-    /// is the snapshot refresh cadence (1s); `seed_ingress_class` gates the single
+    /// is the floor for the safety-net reconcile tick — [`Controller::run`] reconciles
+    /// **event-driven** on watch changes with a `max(30s, poll_interval)` backstop (a 1s config
+    /// value therefore still yields the 30s tick); `seed_ingress_class` gates the single
     /// IngressClass seed inside [`Controller::run`] (AM-1) — set it for topology B /
-    /// external, leave it `false` for topology A (embedded apiserver, zero writes).
+    /// external, leave it `false` for topology A (embedded apiserver, zero writes);
+    /// `hooks` carries the optional ORA3-MAJ-1 observability callbacks.
     ///
     /// Fails with [`Error::InvalidConfig`] on an empty namespace / ingress class, or a
     /// zero poll interval.
@@ -128,12 +157,17 @@ impl Controller {
         ingress_class: String,
         poll_interval: std::time::Duration,
         seed_ingress_class: bool,
+        hooks: ControllerHooks,
     ) -> Result<Self> {
         if gateway_namespace.trim().is_empty() {
-            return Err(Error::InvalidConfig("gateway_namespace must be non-empty".into()));
+            return Err(Error::InvalidConfig(
+                "gateway_namespace must be non-empty".into(),
+            ));
         }
         if ingress_class.trim().is_empty() {
-            return Err(Error::InvalidConfig("ingress_class must be non-empty".into()));
+            return Err(Error::InvalidConfig(
+                "ingress_class must be non-empty".into(),
+            ));
         }
         if poll_interval.is_zero() {
             return Err(Error::InvalidConfig("poll_interval must be > 0".into()));
@@ -155,6 +189,7 @@ impl Controller {
             ready: Arc::new(tokio::sync::Notify::new()),
             ready_notified: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fingerprint: Mutex::new(None),
+            hooks,
         })
     }
 
@@ -183,11 +218,9 @@ impl Controller {
     /// Returns `Err` only on connect/discovery failure (the event loop never aborts on a
     /// transient error).
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
-        let client = client::Client::connect(
-            self.kubeconfig.as_deref(),
-            self.gateway_namespace.clone(),
-        )
-        .await?;
+        let client =
+            client::Client::connect(self.kubeconfig.as_deref(), self.gateway_namespace.clone())
+                .await?;
 
         reconcile::wait_for_apiserver_ready(&client).await?;
 
@@ -210,14 +243,23 @@ impl Controller {
         let dirty = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
         let managed = client::MANAGED_SELECTOR;
+        let hooks = self.hooks.clone();
         let handles = vec![
-            Self::spawn_watcher(client.mcpbridges(), Config::default(), "mcpbridge", &dirty, &notify),
+            Self::spawn_watcher(
+                client.mcpbridges(),
+                Config::default(),
+                "mcpbridge",
+                &dirty,
+                &notify,
+                hooks.clone(),
+            ),
             Self::spawn_watcher(
                 client.wasmplugins(),
                 Config::default().labels(managed),
                 "wasmplugin",
                 &dirty,
                 &notify,
+                hooks.clone(),
             ),
             Self::spawn_watcher(
                 client.envoyfilters(),
@@ -225,6 +267,7 @@ impl Controller {
                 "envoyfilter",
                 &dirty,
                 &notify,
+                hooks.clone(),
             ),
             Self::spawn_watcher(
                 client.ingresses(),
@@ -232,6 +275,7 @@ impl Controller {
                 "ingress",
                 &dirty,
                 &notify,
+                hooks.clone(),
             ),
             Self::spawn_watcher(
                 client.secrets(),
@@ -239,6 +283,7 @@ impl Controller {
                 "secret",
                 &dirty,
                 &notify,
+                hooks.clone(),
             ),
             Self::spawn_watcher(
                 client.configmaps(),
@@ -246,6 +291,7 @@ impl Controller {
                 "configmap",
                 &dirty,
                 &notify,
+                hooks,
             ),
         ];
 
@@ -285,17 +331,19 @@ impl Controller {
     }
 
     /// Spawn one `kube::runtime::watcher` stream for a managed kind. Each `Ok` event marks the
-    /// shared dirty flag + notifies the main loop; `Err` items are rate-limit-logged and the
-    /// loop backs off before polling again (kube-runtime does no backoff itself — see the
-    /// inline comment). A transient error must never terminate the watcher task (P4/1.1); a
-    /// permanently-unsupported watch (`NoResourceVersion`, embedded apiserver) retries slowly
-    /// and the 30s fallback tick in [`Controller::run`] remains the convergence backstop.
+    /// shared dirty flag + notifies the main loop; `Err` items are rate-limit-logged, surfaced
+    /// through the ORA3-MAJ-1 `hooks.on_watch_error` callback, and the loop backs off before
+    /// polling again (kube-runtime does no backoff itself — see the inline comment). A
+    /// transient error must never terminate the watcher task (P4/1.1); a permanently-unsupported
+    /// watch (`NoResourceVersion`, embedded apiserver) retries slowly and the 30s fallback tick
+    /// in [`Controller::run`] remains the convergence backstop.
     fn spawn_watcher<K>(
         api: Api<K>,
         config: Config,
         kind: &'static str,
         dirty: &Arc<AtomicBool>,
         notify: &Arc<tokio::sync::Notify>,
+        hooks: ControllerHooks,
     ) -> tokio::task::JoinHandle<()>
     where
         K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
@@ -321,6 +369,9 @@ impl Controller {
             // box: ~2000 lines/s from 6 kinds once every few ms).
             const LOG_INTERVAL: Duration = Duration::from_secs(30);
             let mut last_log = std::time::Instant::now() - LOG_INTERVAL;
+            // ORA3-MAJ-1: log the "degraded to tick-only" transition at most once per kind
+            // (the first permanent error that also passes the log gate).
+            let mut degraded_logged = false;
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(_event) => {
@@ -330,6 +381,12 @@ impl Controller {
                     Err(e) => {
                         let permanent =
                             matches!(e, kube::runtime::watcher::Error::NoResourceVersion);
+                        // ORA3-MAJ-1: surface EVERY classified error to the gateway's
+                        // watch-error counter (kind + class), independent of log-rate
+                        // limiting (the per-error backoff below bounds the rate).
+                        if let Some(hook) = &hooks.on_watch_error {
+                            hook(kind, if permanent { "permanent" } else { "transient" });
+                        }
                         // Rate-limited warn (first occurrence of a burst is logged, then
                         // at most one line per LOG_INTERVAL per kind).
                         if last_log.elapsed() >= LOG_INTERVAL {
@@ -349,6 +406,18 @@ impl Controller {
                                 }
                             );
                             last_log = std::time::Instant::now();
+                            // ORA3-MAJ-1: a permanently-unsupported watch means this kind
+                            // can only ever converge through the safety-net tick — say so
+                            // once, loudly (the metric carries the ongoing count).
+                            if permanent && !degraded_logged {
+                                degraded_logged = true;
+                                tracing::info!(
+                                    kind,
+                                    "convergence degraded to tick-only (embedded apiserver): \
+                                     {kind} watch unsupported; snapshot refreshes ride the \
+                                     30s safety-net tick"
+                                );
+                            }
                         }
                         // Pause before polling again: kube-runtime recovers on the next
                         // poll, so sleeping here IS the backoff (watcher docs).
@@ -374,9 +443,12 @@ impl Controller {
 
     /// Lock the last-fingerprint guard, recovering from a poisoned mutex instead of panicking.
     /// (Poisoning would require a panic while holding the lock — the only holder is the single
-    /// poll loop, and the guarded `clone`/`assign` cannot panic, so this is purely defensive.)
+    /// reconcile loop, and the guarded `clone`/`assign` cannot panic, so this is purely
+    /// defensive.)
     fn lock_fingerprint(&self) -> std::sync::MutexGuard<'_, Option<SnapshotFingerprint>> {
-        self.last_fingerprint.lock().unwrap_or_else(|e| e.into_inner())
+        self.last_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// One poll iteration: LIST → fingerprint short-circuit → translate → store; keep
@@ -418,6 +490,11 @@ impl Controller {
 
         match self.shared.store(data) {
             Ok(dropped) => {
+                // ORA3-MAJ-1: notify the gateway that a NEW snapshot was stored (it
+                // counts the store and stamps its last-store staleness gauge).
+                if let Some(hook) = &self.hooks.on_snapshot_store {
+                    hook();
+                }
                 // R-4: surface per-object validation skips (previously silent).
                 if dropped > 0 {
                     tracing::warn!(
@@ -466,17 +543,38 @@ mod tests {
     fn new_validates_parameters() {
         let sc = shared(ConfigData::default());
         // Empty namespace is rejected.
-        assert!(
-            Controller::new(sc.clone(), None, String::new(), "higress".into(), std::time::Duration::from_secs(1), false).is_err()
-        );
+        assert!(Controller::new(
+            sc.clone(),
+            None,
+            String::new(),
+            "higress".into(),
+            std::time::Duration::from_secs(1),
+            false,
+            ControllerHooks::default()
+        )
+        .is_err());
         // Empty ingress class is rejected.
-        assert!(
-            Controller::new(sc.clone(), None, "higress-system".into(), String::new(), std::time::Duration::from_secs(1), false).is_err()
-        );
+        assert!(Controller::new(
+            sc.clone(),
+            None,
+            "higress-system".into(),
+            String::new(),
+            std::time::Duration::from_secs(1),
+            false,
+            ControllerHooks::default()
+        )
+        .is_err());
         // Zero poll interval is rejected.
-        assert!(
-            Controller::new(sc.clone(), None, "higress-system".into(), "higress".into(), std::time::Duration::from_secs(0), false).is_err()
-        );
+        assert!(Controller::new(
+            sc.clone(),
+            None,
+            "higress-system".into(),
+            "higress".into(),
+            std::time::Duration::from_secs(0),
+            false,
+            ControllerHooks::default()
+        )
+        .is_err());
         // Valid params build.
         let c = Controller::new(
             sc.clone(),
@@ -485,6 +583,7 @@ mod tests {
             "higress".into(),
             std::time::Duration::from_secs(1),
             false,
+            ControllerHooks::default(),
         )
         .unwrap();
         assert!(c.mirror_name == translate::MIRROR_NAME);
@@ -509,9 +608,13 @@ mod tests {
             "higress".into(),
             std::time::Duration::from_secs(1),
             false,
+            ControllerHooks::default(),
         )
         .unwrap();
-        assert!(!off.seed_ingress_class, "topology A: seed must be gated off");
+        assert!(
+            !off.seed_ingress_class,
+            "topology A: seed must be gated off"
+        );
         let on = Controller::new(
             sc,
             None,
@@ -519,9 +622,81 @@ mod tests {
             "higress".into(),
             std::time::Duration::from_secs(1),
             true,
+            ControllerHooks::default(),
         )
         .unwrap();
         assert!(on.seed_ingress_class, "topology B: seed must be gated on");
+    }
+
+    #[test]
+    fn new_wires_default_hooks_as_noops() {
+        // ORA3-MAJ-1: a controller built with `ControllerHooks::default()` must accept and
+        // store the hooks (all `None` → the control plane runs with no observability
+        // callback); the gateway is the only caller that wires real closures.
+        let sc = shared(ConfigData::default());
+        let c = Controller::new(
+            sc,
+            None,
+            "higress-system".into(),
+            "higress".into(),
+            std::time::Duration::from_secs(1),
+            false,
+            ControllerHooks::default(),
+        )
+        .unwrap();
+        assert!(c.hooks.on_watch_error.is_none());
+        assert!(c.hooks.on_snapshot_store.is_none());
+    }
+
+    #[test]
+    fn controller_hooks_invoke_wired_callbacks() {
+        // ORA3-MAJ-1: the hooks are plain `Fn` callbacks — exercise the wiring contract the
+        // gateway relies on (kind/class for watcher errors, a bare call for store events)
+        // without a cluster (the call sites inside `run`/`sync_once` need a live apiserver).
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex as StdMutex;
+        let errors: Arc<StdMutex<Vec<(String, String)>>> = Arc::default();
+        let stores = Arc::new(AtomicUsize::new(0));
+        let e2 = errors.clone();
+        let s2 = stores.clone();
+        let hooks = ControllerHooks {
+            on_watch_error: Some(Arc::new(move |kind: &'static str, class: &'static str| {
+                e2.lock()
+                    .unwrap()
+                    .push((kind.to_string(), class.to_string()));
+            })),
+            on_snapshot_store: Some(Arc::new(move || {
+                s2.fetch_add(1, Ordering::Relaxed);
+            })),
+        };
+        let sc = shared(ConfigData::default());
+        let c = Controller::new(
+            sc,
+            None,
+            "higress-system".into(),
+            "higress".into(),
+            std::time::Duration::from_secs(1),
+            false,
+            hooks,
+        )
+        .unwrap();
+        let (h_err, h_store) = (
+            c.hooks.on_watch_error.as_ref().unwrap(),
+            c.hooks.on_snapshot_store.as_ref().unwrap(),
+        );
+        h_err("configmap", "permanent");
+        h_err("ingress", "transient");
+        h_store();
+        h_store();
+        let seen = errors.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                ("configmap".to_string(), "permanent".to_string()),
+                ("ingress".to_string(), "transient".to_string()),
+            ]
+        );
+        assert_eq!(stores.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -538,8 +713,14 @@ mod tests {
         dirty.store(true, Ordering::Relaxed);
         dirty.store(true, Ordering::Relaxed);
         dirty.store(true, Ordering::Relaxed);
-        assert!(dirty.swap(false, Ordering::Relaxed), "a dirty burst must trigger one reconcile");
-        assert!(!dirty.swap(false, Ordering::Relaxed), "no further reconcile until the next event");
+        assert!(
+            dirty.swap(false, Ordering::Relaxed),
+            "a dirty burst must trigger one reconcile"
+        );
+        assert!(
+            !dirty.swap(false, Ordering::Relaxed),
+            "no further reconcile until the next event"
+        );
         // The next event triggers the next reconcile.
         dirty.store(true, Ordering::Relaxed);
         assert!(dirty.swap(false, Ordering::Relaxed));

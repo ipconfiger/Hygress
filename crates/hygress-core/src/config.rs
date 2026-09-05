@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::destination::ServiceType;
 use crate::error::Error;
 use crate::matcher::RouteMatch;
-use crate::registry::{OutboundProxy, PreResolvedRegistry, Registry, precompute_registries};
+use crate::registry::{precompute_registries, OutboundProxy, PreResolvedRegistry, Registry};
 use crate::route::{FallbackLink, RouteKind, RouteRule};
 use crate::swrr::{SwrrCandidate, SwrrState};
 
@@ -86,7 +86,11 @@ impl ConfigData {
     /// - **cascading drop**: after the per-object pass, a route whose fallback
     ///   target names a Fallback route that was **itself** dropped by the
     ///   per-object pass is removed too (the redirect would dangle in the
-    ///   accepted snapshot — AM-4);
+    ///   accepted snapshot — AM-4). The cascade is re-run to a **fixpoint**
+    ///   (each pass recomputes the accepted Fallback-key set from the
+    ///   *current* accepted routes) so a multi-hop chain — a Fallback route
+    ///   that carries its own fallback link to a route dropped by validation —
+    ///   is fully unwound and leaves no dangling reference behind (ORA3-M7);
     /// - **structural** failures (a path predicate that is not a valid regex)
     ///   are surfaced when a [`RouteTable`] is built from the accepted set —
     ///   they reject the whole snapshot.
@@ -170,7 +174,11 @@ impl ConfigData {
                 }
             }
             if let Some(fl) = &route.fallback {
-                if !self.routes.iter().any(|r| r.kind == RouteKind::Fallback && r.key == fl.target_key) {
+                if !self
+                    .routes
+                    .iter()
+                    .any(|r| r.kind == RouteKind::Fallback && r.key == fl.target_key)
+                {
                     route_issues.push(ValidationError::new(format!(
                         "{label}: fallback target '{}' not found in routes",
                         fl.target_key
@@ -218,33 +226,57 @@ impl ConfigData {
             accepted_routes = kept;
         }
 
-        // ---- fallback targets: re-check against the ACCEPTED set (AM-4) ----
-        // The first-pass target check above ran against the FULL `self.routes`, so a
-        // Main route whose referenced Fallback route is itself dropped by validation
-        // (a per-object issue in this pass) would survive with a dangling fallback.
-        // Re-check every accepted route that carries a fallback link against the
-        // accepted Fallback-route keys and drop the referencing route too (its
-        // redirect would otherwise target nothing in the live snapshot).
+        // ---- fallback targets: cascade re-checks to a fixpoint (AM-4) ----
+        // The first-pass target check above ran against the FULL `self.routes`,
+        // so a route whose referenced Fallback route is itself dropped by
+        // validation (a per-object issue in this pass) would survive with a
+        // dangling fallback. The cascade can span MORE than one hop: a Fallback
+        // route may itself carry a fallback link whose target was dropped, so
+        // it is only removed in a LATER pass than the routes already judged
+        // against the previous accepted-key snapshot — a single fixed-key pass
+        // would leave those referencing routes dangling (ORA3-M7). Re-run the
+        // re-check until a full pass drops nothing:
+        //   - termination: every pass that changes anything removes at least one
+        //     route (removed routes are never re-added), so after at most N
+        //     shrinking passes the accepted set is empty and the next pass
+        //     observes "no change" and exits;
+        //   - bound (defense-in-depth): the loop runs at most
+        //     `initial_len + 1` passes — one more than the theoretical maximum
+        //     number of shrinking passes — so the cap provably cannot truncate
+        //     a cascade before the fixpoint. (GPUStack-written configs link
+        //     fallbacks only to depth 1; even a linear chain spanning every
+        //     accepted route is fully unwound inside this bound.)
         {
-            let accepted_fallback_keys: BTreeSet<String> = accepted_routes
-                .iter()
-                .filter(|r| r.kind == RouteKind::Fallback)
-                .map(|r| r.key.clone())
-                .collect();
-            let mut kept: Vec<RouteRule> = Vec::with_capacity(accepted_routes.len());
-            for route in accepted_routes {
-                let label = format!("route '{}'", route.key);
-                match &route.fallback {
-                    Some(fl) if !accepted_fallback_keys.contains(&fl.target_key) => {
-                        issues.push(ValidationError::new(format!(
-                            "{label}: fallback target '{}' not accepted (referenced Fallback route was dropped by validation)",
-                            fl.target_key
-                        )));
+            let initial_len = accepted_routes.len();
+            for _pass in 0..=initial_len {
+                // Recomputed every pass: the keys must reflect THIS pass's
+                // accepted set, or a Fallback route dropped earlier in the
+                // cascade would still vouch for its references.
+                let accepted_fallback_keys: BTreeSet<String> = accepted_routes
+                    .iter()
+                    .filter(|r| r.kind == RouteKind::Fallback)
+                    .map(|r| r.key.clone())
+                    .collect();
+                let before = accepted_routes.len();
+                let mut kept: Vec<RouteRule> = Vec::with_capacity(before);
+                for route in accepted_routes {
+                    let label = format!("route '{}'", route.key);
+                    match &route.fallback {
+                        Some(fl) if !accepted_fallback_keys.contains(&fl.target_key) => {
+                            issues.push(ValidationError::new(format!(
+                                "{label}: fallback target '{}' not accepted (referenced Fallback route was dropped by validation)",
+                                fl.target_key
+                            )));
+                        }
+                        _ => kept.push(route),
                     }
-                    _ => kept.push(route),
+                }
+                let changed = kept.len() != before;
+                accepted_routes = kept;
+                if !changed {
+                    break; // Fixpoint: a full pass dropped nothing.
                 }
             }
-            accepted_routes = kept;
         }
 
         // ---- registries: per-object skip-and-report ----
@@ -300,9 +332,7 @@ impl ConfigData {
                 )));
             }
             if pt.api_tokens.is_empty() {
-                pt_issues.push(ValidationError::new(format!(
-                    "{label}: has no apiTokens"
-                )));
+                pt_issues.push(ValidationError::new(format!("{label}: has no apiTokens")));
             }
             if pt_issues.is_empty() {
                 accepted_provider_tokens.push(pt.clone());
@@ -821,7 +851,10 @@ impl RouteTable {
                         by_main_key.entry(route.key.clone()).or_default().push(r);
                     }
                     RouteKind::Fallback => {
-                        by_fallback_key.entry(route.key.clone()).or_default().push(r);
+                        by_fallback_key
+                            .entry(route.key.clone())
+                            .or_default()
+                            .push(r);
                     }
                     RouteKind::Mirror => {}
                 }
@@ -934,7 +967,11 @@ impl RouteTable {
     /// **Fallback redirect**: match a **Fallback** route by exact
     /// `x-higress-fallback-from` key (AND its full-match path predicate), else
     /// the mirror. A Main route is never selectable here.
-    pub fn find_match_fallback(&self, fallback_from: Option<&str>, path: &str) -> Option<RouteMatch> {
+    pub fn find_match_fallback(
+        &self,
+        fallback_from: Option<&str>,
+        path: &str,
+    ) -> Option<RouteMatch> {
         if let Some(k) = fallback_from {
             if let Some(idxs) = self.by_fallback_key.get(k) {
                 for &r in idxs {
@@ -1002,7 +1039,11 @@ impl RouteTable {
 
     /// The `index`-th route's destination whose service string equals
     /// `service_id` (the O(1) map-back from the SWRR ordering).
-    pub fn destination_for_service(&self, index: usize, service_id: &str) -> Option<&crate::destination::Destination> {
+    pub fn destination_for_service(
+        &self,
+        index: usize,
+        service_id: &str,
+    ) -> Option<&crate::destination::Destination> {
         self.destination_index[index]
             .get(service_id)
             .map(|&i| &self.routes[index].destinations[i])
@@ -1012,9 +1053,7 @@ impl RouteTable {
     /// connect target or the resolve error), derived from the same snapshot as
     /// this table (M8). Reading it here (instead of a second `ArcSwap` load)
     /// keeps a request's decision path on **one** consistent snapshot.
-    pub fn registry_index(
-        &self,
-    ) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
+    pub fn registry_index(&self) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
         &self.registry_index
     }
 
@@ -1137,9 +1176,7 @@ impl Snapshot {
 
     /// The precomputed registry-resolution index for this snapshot (carried by
     /// the route table — same atomic read as [`Snapshot::table`]).
-    pub fn registries(
-        &self,
-    ) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
+    pub fn registries(&self) -> &HashMap<String, Result<PreResolvedRegistry, String>> {
         self.table.registry_index()
     }
 }
@@ -1172,10 +1209,7 @@ impl SharedConfig {
     /// [`ConfigData::sanitize`]. The dropped-object count is recorded in
     /// [`SharedConfig::snapshot_skipped_total`] (R-4).
     pub fn new(data: ConfigData) -> Result<Self, Vec<ValidationError>> {
-        let SanitizeResult {
-            accepted,
-            issues,
-        } = data.sanitize();
+        let SanitizeResult { accepted, issues } = data.sanitize();
         let skipped = issues.len() as u64;
         let table = match RouteTable::rebuild(&accepted) {
             Ok(t) => t,
@@ -1206,10 +1240,7 @@ impl SharedConfig {
     /// rejection, recorded in [`SharedConfig::snapshot_reject_total`]) keeps
     /// the last-known-good snapshot (R-4).
     pub fn store(&self, data: ConfigData) -> Result<usize, Vec<ValidationError>> {
-        let SanitizeResult {
-            accepted,
-            issues,
-        } = data.sanitize();
+        let SanitizeResult { accepted, issues } = data.sanitize();
         let dropped = issues.len();
         let table = match RouteTable::rebuild(&accepted) {
             Ok(t) => t,
@@ -1222,10 +1253,8 @@ impl SharedConfig {
         };
         // Prune stale SWRR state for removed routes / destination groups.
         let valid = valid_group_keys(&accepted);
-        self.swrr_states
-            .retain(|k, _| valid.contains(k));
-        self.data
-            .store(Arc::new(Snapshot::build(accepted, table)));
+        self.swrr_states.retain(|k, _| valid.contains(k));
+        self.data.store(Arc::new(Snapshot::build(accepted, table)));
         if dropped > 0 {
             self.snapshot_skipped_total
                 .fetch_add(dropped as u64, Ordering::Relaxed);
@@ -1363,7 +1392,9 @@ mod tests {
         // Initial requests can only see the Main; fallback only the Fallback.
         let m = t.find_match(Some("k"), "/v1/chat/completions").unwrap();
         assert_eq!(m.matched_by, crate::matcher::MatchKind::HeaderExact);
-        let f = t.find_match_fallback(Some("k"), "/v1/chat/completions").unwrap();
+        let f = t
+            .find_match_fallback(Some("k"), "/v1/chat/completions")
+            .unwrap();
         assert_eq!(f.matched_by, crate::matcher::MatchKind::FallbackExact);
         assert_ne!(m.index, f.index);
     }
@@ -1384,8 +1415,12 @@ mod tests {
         };
         let t = RouteTable::rebuild(&data).unwrap();
         assert!(t.find_match(Some("m"), "/v1/chat/completions").is_some());
-        assert!(t.find_match(Some("m"), "/v1/chat/completions/extra").is_none());
-        assert!(t.find_match(Some("m"), "/prefix/v1/chat/completions").is_none());
+        assert!(t
+            .find_match(Some("m"), "/v1/chat/completions/extra")
+            .is_none());
+        assert!(t
+            .find_match(Some("m"), "/prefix/v1/chat/completions")
+            .is_none());
     }
 
     #[test]
@@ -1554,9 +1589,14 @@ mod tests {
             ..Default::default()
         };
         let sr = data.sanitize();
-        assert!(sr.accepted.routes.is_empty(), "route must be dropped, not kept");
         assert!(
-            sr.issues.iter().any(|i| i.message.contains("out-of-range weight")),
+            sr.accepted.routes.is_empty(),
+            "route must be dropped, not kept"
+        );
+        assert!(
+            sr.issues
+                .iter()
+                .any(|i| i.message.contains("out-of-range weight")),
             "out-of-range issue expected: {:?}",
             sr.issues
         );
@@ -1680,11 +1720,13 @@ mod tests {
         assert_eq!(sr.accepted.routes.len(), 1);
         assert_eq!(sr.accepted.routes[0].key, "m2");
         assert!(sr.accepted.routes.iter().all(|r| r.key != "m1"));
+        assert!(sr.issues.iter().any(|i| i
+            .message
+            .contains("fallback target 'fb-target' not accepted")));
         assert!(sr
             .issues
             .iter()
-            .any(|i| i.message.contains("fallback target 'fb-target' not accepted")));
-        assert!(sr.issues.iter().any(|i| i.message.contains("has no destinations")));
+            .any(|i| i.message.contains("has no destinations")));
 
         // Store semantics: per-object skip count covers both drops, and the live
         // snapshot carries only the good route.
@@ -1715,6 +1757,120 @@ mod tests {
         assert_eq!(sr.accepted.routes.len(), 2);
         assert!(sr.accepted.routes.iter().any(|r| r.key == "m1"));
         assert!(sr.accepted.routes.iter().any(|r| r.key == "fb-target"));
+    }
+
+    #[test]
+    fn validation_fallback_cascade_reaches_fixpoint_through_chain() {
+        // ORA3-M7: the AM-4 re-check must run to a FIXPOINT, not a single
+        // fixed-key pass. Here a Fallback route (`fb2`) carries its own
+        // fallback link whose target (`gb`) is dropped by the per-object pass;
+        // `fb2` is therefore only removed in a LATER pass than the Main (`m1`)
+        // that references `fb1` -> `fb2` was judged against. A single pass
+        // keeps `m1` (and `fb1`) while dropping `fb2`, leaving a dangling
+        // reference in the final snapshot. The fixpoint must unwind the whole
+        // chain: m1 -> fb1 -> fb2 -> gb(dropped).
+        let gb = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(), // per-object issue: no destinations
+            ..main_route("gb")
+        };
+        let fb2 = RouteRule::new(
+            "fb2",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("gb"));
+        let fb1 = RouteRule::new(
+            "fb1",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb2"));
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb1"));
+        let good = main_route("m2");
+        let data = ConfigData {
+            routes: vec![main, fb1, fb2, gb, good],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        // The whole broken chain is unwound — only the unrelated good route
+        // survives.
+        assert_eq!(sr.accepted.routes.len(), 1, "accepted: {:?}", sr.accepted);
+        assert_eq!(sr.accepted.routes[0].key, "m2");
+        // Each cascade hop produced its own issue.
+        for (dropped, target) in [("fb2", "gb"), ("fb1", "fb2"), ("m1", "fb1")] {
+            let needle = format!("route '{dropped}': fallback target '{target}' not accepted");
+            assert!(
+                sr.issues.iter().any(|i| i.message.contains(&needle)),
+                "missing cascade issue for {dropped} -> {target}: {:?}",
+                sr.issues
+            );
+        }
+        assert!(sr
+            .issues
+            .iter()
+            .any(|i| i.message.contains("has no destinations")));
+        // Final-snapshot invariant: NO accepted route carries a fallback link
+        // whose target is not an accepted Fallback route (zero dangling
+        // references).
+        let accepted_fallback_keys: BTreeSet<String> = sr
+            .accepted
+            .routes
+            .iter()
+            .filter(|r| r.kind == RouteKind::Fallback)
+            .map(|r| r.key.clone())
+            .collect();
+        for route in &sr.accepted.routes {
+            if let Some(fl) = &route.fallback {
+                assert!(
+                    accepted_fallback_keys.contains(&fl.target_key),
+                    "route '{}' references dropped fallback '{}' — final snapshot is dangling",
+                    route.key,
+                    fl.target_key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_healthy_fallback_chain_is_untouched() {
+        // Control case (ORA3-M7): a multi-hop chain whose every fallback target
+        // is a valid, accepted Fallback route must pass through the fixpoint
+        // unchanged — no cascade, no issues.
+        let fb2 = RouteRule::new(
+            "fb2",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap();
+        let fb1 = RouteRule::new(
+            "fb1",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb2"));
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb1"));
+        let data = ConfigData {
+            routes: vec![main, fb1, fb2],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        assert!(
+            sr.issues.is_empty(),
+            "healthy chain must be untouched: {:?}",
+            sr.issues
+        );
+        assert_eq!(sr.accepted.routes.len(), 3);
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "m1"));
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "fb1"));
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "fb2"));
     }
 
     #[test]
@@ -1813,8 +1969,8 @@ mod tests {
 
         // Store a mixed snapshot: good objects kept, bad dropped, then the
         // current snapshot reflects only the good ones.
-        assert!(
-            sc.store(ConfigData {
+        assert!(sc
+            .store(ConfigData {
                 routes: vec![
                     RouteRule {
                         key: String::new(),
@@ -1825,8 +1981,7 @@ mod tests {
                 ],
                 ..Default::default()
             })
-            .is_ok()
-        );
+            .is_ok());
         assert_eq!(sc.load().routes.len(), 2);
         // Storing an all-good (even empty) snapshot is fine.
         assert!(sc.store(ConfigData::default()).is_ok());
@@ -1916,10 +2071,10 @@ mod tests {
         })
         .unwrap();
         let services = vec!["model-1-10.static:80".to_string()];
-        sc.swrr_group_state("m1", &services).or_default().current_weights.insert(
-            "model-1-10.static:80".to_string(),
-            7,
-        );
+        sc.swrr_group_state("m1", &services)
+            .or_default()
+            .current_weights
+            .insert("model-1-10.static:80".to_string(), 7);
         // Swap in a snapshot where "m1" is gone -> its state is pruned.
         assert!(sc
             .store(ConfigData {
@@ -1934,15 +2089,17 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        sc2.swrr_group_state("m1", &services).or_default().current_weights.insert(
-            "model-1-10.static:80".to_string(),
-            9,
-        );
+        sc2.swrr_group_state("m1", &services)
+            .or_default()
+            .current_weights
+            .insert("model-1-10.static:80".to_string(), 9);
         // Same route + same group survives a same-content store.
-        assert!(sc2.store(ConfigData {
-            routes: vec![main_route("m1")],
-            ..Default::default()
-        }).is_ok());
+        assert!(sc2
+            .store(ConfigData {
+                routes: vec![main_route("m1")],
+                ..Default::default()
+            })
+            .is_ok());
         assert_eq!(
             sc2.swrr_group_state_ref("m1", &services)
                 .unwrap()
@@ -2083,8 +2240,9 @@ mod tests {
         // `ProviderToken` is built by the adapter (not deserialized from GPUStack's
         // `ai-proxy` wire directly), so its field names are the internal snapshot
         // form (snake_case).
-        let v: ProviderToken = serde_json::from_str(r#"{"service":"provider-1.proxy","api_tokens":["sk-a"]}"#)
-            .unwrap();
+        let v: ProviderToken =
+            serde_json::from_str(r#"{"service":"provider-1.proxy","api_tokens":["sk-a"]}"#)
+                .unwrap();
         assert_eq!(v.service, "provider-1.proxy");
         assert_eq!(v.ingress_scope, None);
         assert_eq!(v.api_tokens, vec!["sk-a".to_string()]);
@@ -2095,8 +2253,7 @@ mod tests {
             ingress_scope: Some("ai-route-route-5.internal".into()),
             api_tokens: vec!["sk-1".into(), "sk-2".into()],
         };
-        let rt: ProviderToken =
-            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        let rt: ProviderToken = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
         assert_eq!(p, rt);
     }
 
@@ -2157,8 +2314,14 @@ mod tests {
         assert_eq!(sr.accepted.provider_tokens.len(), 1);
         assert_eq!(sr.accepted.provider_tokens[0].service, "provider-9.proxy");
         assert_eq!(sr.issues.len(), 3);
-        assert!(sr.issues.iter().any(|i| i.message.contains("service must be a valid")));
-        assert!(sr.issues.iter().any(|i| i.message.contains("has no apiTokens")));
+        assert!(sr
+            .issues
+            .iter()
+            .any(|i| i.message.contains("service must be a valid")));
+        assert!(sr
+            .issues
+            .iter()
+            .any(|i| i.message.contains("has no apiTokens")));
     }
 
     #[test]
@@ -2188,12 +2351,18 @@ mod tests {
         };
         // Scoped match (ns-qualified ingress): the scoped token wins.
         assert_eq!(
-            data.provider_token("provider-1.proxy", "higress-system/ai-route-route-5.internal"),
+            data.provider_token(
+                "provider-1.proxy",
+                "higress-system/ai-route-route-5.internal"
+            ),
             Some("scoped-key")
         );
         // Same service, ingress without a matching scope -> global token.
         assert_eq!(
-            data.provider_token("provider-1.proxy", "higress-system/ai-route-route-7.internal"),
+            data.provider_token(
+                "provider-1.proxy",
+                "higress-system/ai-route-route-7.internal"
+            ),
             Some("global-key")
         );
         // Bare ingress name matches the ns-qualified scope (last segment).
@@ -2209,7 +2378,10 @@ mod tests {
         // Unknown service -> None.
         assert_eq!(data.provider_token("provider-3.dns", "x"), None);
         // Empty snapshot -> always None.
-        assert_eq!(ConfigData::default().provider_token("provider-1.proxy", "x"), None);
+        assert_eq!(
+            ConfigData::default().provider_token("provider-1.proxy", "x"),
+            None
+        );
     }
 
     #[test]

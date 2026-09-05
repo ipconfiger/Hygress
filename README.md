@@ -103,6 +103,11 @@ usage sink（`ModelUsageMetrics` 17 字段防丢行）→ 写回头（X-Mse-Cons
 - **端口纪律**：数据面 80/443；admin 127.0.0.1:8081；stats 15020；永不停用/绑定 9876/15010/15012/8888/15051。
 - **认证/用量 wire 契约**：`/token-auth`（转发 7 头 + 注入派生 `X-GPUStack-Auth-Token`，AUTHED 模型额外
   转发客户端 `Authorization`）；usage 恰好 17 字段（operation/cluster_id/provider_name/provider_type 不上送）。
+- **SSE 计量注入为文档化超集（AM-2/ORA3-M18）**：与上游 Higress ai-proxy 不同（其仅对 OpenAI 协议非
+  generic 目标注入），Hygress 对**全部** model-route 的 `/v1/chat/completions` 与 `/v1/completions`
+  stream=true 请求出站强制注入 `"stream_options":{"include_usage":true}`（GPUStack 自身写出的目标是
+  OpenAI 协议，type=openai）；客户端显式 `stream_options`（含 `include_usage=false`）**始终尊重、不覆盖**。
+  generic/非 OpenAI 协议目标尚未按 apiName 判别 → 严格引擎（如 vLLM<0.4.3 类）下可能多注入，已文档化。
 
 ---
 
@@ -116,7 +121,7 @@ usage sink（`ModelUsageMetrics` 17 字段防丢行）→ 写回头（X-Mse-Cons
 | 延迟 | Wasm 插件链多跳（AUTHN→…→TRAFFIC） | Pingora 全文读取、单跳原生管道，测试低至 ~0.4s 首 token 级响应 |
 | 可观测性 | 指标散在 Envoy/Istio/Wasm 各通道 | Rust tracing + Prometheus（:15020）+ admin 集中输出 |
 | 多租户 | 依赖路由命名约定 | 类型安全的路由/注册表隔离 + 原生命中/映射 |
-| 可控性 | 扩展需 Go + Wasm 桥接 | 全 Rust，`async`/无锁 ARC-swap 热重载：CRD 变更随 WATCH ≤1 事件周期生效，policy 文件 mtime ≤30s + `/reload` 即时 |
+| 可控性 | 扩展需 Go + Wasm 桥接 | 全 Rust，`async`/无锁 ARC-swap 热重载：CRD 变更收敛 **≤1 事件周期**（拓扑 B/external，WATCH 事件驱动）或 **≤30s tick**（拓扑 A：GPUStack 内嵌 apiserver 不支持 WATCH，tick-only 收敛）；policy 文件 mtime 检查同为 30s dutycycle + `/reload` 即时 |
 | 测试 | — | **368 测试、零 mock/stub、Gate-1/2 oracle 9/10** |
 | **兼容性** | 自身即基线 | **端口契约 / CRD schema / usage 落库逐字节一致**，只读控制面，零 Python 改动 |
 | 回滚 | — | s6 层保留 `.dist` 原脚本快照，一条命令回退基线镜像 |
@@ -189,12 +194,12 @@ gpustack-server:
 | `GPUSTACK_JWT_SECRET_KEY` | 无（缺省回退读 `{GPUSTACK_DATA_DIR}/jwt_secret_key` 文件；两者皆无 → 启动 fail-fast） | GPUStack `jwt_secret_key`（派生网关 token 与 usage 推送 HMAC，见 design §9） |
 | `HYGRESS_KUBECONFIG` | `${EMBEDDED_KUBECONFIG_PATH}` | 内嵌 apiserver kubeconfig |
 | `GATEWAY_NAMESPACE` | `higress-system` | 网关命名空间 |
-| `HYGRESS_ADMIN_ADDR` | 127.0.0.1:8081 | admin 监听地址（loopback；/healthz、/metrics 公开） |
+| `HYGRESS_ADMIN_ADDR` | 127.0.0.1:8081 | admin 监听地址（loopback；/healthz、/metrics 公开）。**地址不做解析期校验**（坏地址仅在绑定时报错）——请保持默认 loopback，勿暴露到非本机 |
 | `HYGRESS_ADMIN_TOKEN` | 无（**容器内默认不注入**） | admin token 门禁：缺省 ⇒ `/reload`、`GET /stats/usage`、`GET /config` 出厂即 **401 fail-closed**；生产需自行注入（随机值） |
-| `GATEWAY_PILOT_AGENT_METRICS_PORT` | 15020 | stats 浅兼容端口（/stats、/stats/prometheus，无鉴权） |
+| `GATEWAY_PILOT_AGENT_METRICS_PORT` | 15020 | stats 浅兼容端口（/stats、/stats/prometheus；绑 **0.0.0.0**、无鉴权——Istio sidecar 契约，勿暴露到公网） |
 | `POLL_INTERVAL` | 1s | 控制面 CRD 轮询/兜底周期（`config.rs` 解析；Phase 1.1 后稳态由 kube WATCH 事件驱动，轮询仅作安全网） |
 | `HYGRESS_API_READY_TIMEOUT` / `HYGRESS_SNAPSHOT_TIMEOUT` | 30s / 60s | 启动窗口（launcher 已放宽 300s） |
-| `HYGRESS_TOPOLOGY_B` | 关 | 外部网关拓扑时播种 IngressClass |
+| `HYGRESS_TOPOLOGY_B` | 关 | **仅拓扑 B（external 集群）需要置 true**：GPUStack external 模式启动即探测 `higress` IngressClass，缺失会直接 raise（"cluster does not support Higress"）；Hygress 仅在 true 时播种该类（B9.5 起 env 解析对拼写错误告警），或预先在目标集群创建 IngressClass。**拓扑 A（embedded）从不探测 IngressClass，必须保持关闭**（零 apiserver 写入，AM-1） |
 | `HYGRESS_POLICY_PATH` | `/etc/hygress/policy.yaml` | 延伸能力配置文件路径（限流/配额/路由策略/护栏；mtime 热重载轮询 ≤30s + `/reload` 即时） |
 | `HYGRESS_QUOTA_K` | 4 | token 配额预留估算分母（`est = ceil(body_bytes / K)`） |
 | `HYGRESS_GUARDRAIL_URL` | 无 | LLM 护栏判定服务 URL（未设置 ⇒ LLM 护栏未配置 → 直通） |
@@ -206,6 +211,18 @@ gpustack-server:
 > `GPUSTACK_API_PORT` 默认值来源：二进制解析默认 80（`crates/hygress-gateway/src/config.rs`）；s6
 > launcher（`pack/hygress-s6/.../gateway/run`）显式导出默认 30080（对齐 GPUStack compose 映射）。
 > 容器内生效值 = 30080（表内默认以 launcher 为准）；直接裸跑二进制且未设 env 时为 80。
+
+> **数据面 TLS :443（ORA3-M19 默认安装差异）**：Hygress **仅当控制面快照含 managed `gpustack-tls-*`
+> Secret 时才绑 :443**；GPUStack **仅以 `--ssl-keyfile`/`--ssl-certfile` 启动时才写**该类 Secret →
+> **默认 GPUStack 安装（无 `--ssl-*`）下 `https://host:443` 为 connection refused**，而真实内嵌 Higress
+> 默认会呈现一张自签证书页。对策：给 GPUStack 配置 `--ssl-keyfile`/`--ssl-certfile`（Hygress 证书名语法
+> 与托管路径已对齐），或接受 http :80。
+> **SNI 约束（OX-9）**：pingora 0.8 文件式 API 下监听器对所有 SNI 只服务 default/first 主机的证书
+> （per-host SniStore 未接入 live 监听器）→ 多 TLS 域名部署会得到超出默认证书的 hostname mismatch；
+> 单默认证书为文档化约束。
+> **证书轮换（OX-9）**：Secret 内容变更在运行时被检出（60s 巡检 log + `hygress_tls_cert_change_detected_total`
+> / `hygress_tls_cert_requires_restart_total` 计数器），但**需重启容器才生效**——操作 runbook 见
+> `pack/hygress-s6/README.md`。
 
 ### 4.4 验证（真机验证矩阵）
 

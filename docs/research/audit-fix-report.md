@@ -76,3 +76,26 @@
 - 观察项处理（2026-09-05，提交见 git log）：
   1. **embedded apiserver WATCH 刷屏已修复**：根因=embedded apiserver LIST 无 resourceVersion → 6 类 watcher 报 `NoResourceVersion` 且 kube-runtime 无自退避 → 热循环（实测 ~2000 行/s，hygress.log 17.6GB）。`adapter/src/lib.rs` `spawn_watcher` Err 分支现做分类退避（永久错误 60s / 瞬时 5s）+ 30s 日志限速；收敛仍由 30s 安全网 tick（R-2）保证。equivalence §A3 同步修正"6 类 WATCH 可用"的旧表述（embedded 下实际退化为 tick）。
   2. **AM-2 SSE-chunk 真机判别环境限制已固化**：该机后端是 GPUStack 测试用手写最小 OpenAI 兼容服务器（serve.py，忽略 stream 字段恒非流式），非流式是测试替身特性；强判别需 llama-box/vLLM 流式后端环境。
+
+## 7. B9.5 — ora-3 终审修复批（audit-oracle-review-ora3.md §6 条件清单第 1-4 + 部分 5/7 组）
+- 范围：ORA3-MAJ-1（控制面指标 + panic hook + 收敛模式日志）、ORA3-M1（env 解析告警 + 启动脱敏摘要）、
+  ORA3-M2（策略缺失 boot 告警 / reload 缺文件保 LKG 返 false）、ORA3-M3（fallback 耗尽计数）、
+  ORA3-M4（usage 丢弃计数 on_drop 接线 + flusher drain-on-close）、ORA3-M5（1s→30s 注释 + 文档拓扑限定）、
+  ORA3-M6（FAIL_OPEN 文案收口 + HIGRESS_EXT_AUTH_TIMEOUT_MS 接线）、ORA3-M7（AM-4 不动点 + 链式测试）、
+  ORA3-M8（x-gpustack-original-path 入站剥离）、ORA3-M9（中途写失败记账 + 活快照冲刷）、
+  ORA3-M16（higress-config 文档化降级 + equivalence 修正）、ORA3-M17/18/19/OX-9/11（文档与 runbook）、
+  ORA3-M20（default=["integrations"]）。结构批（M10-M15）与 AM-6 按约定并入扩容轮，未在本批。
+- 门禁（本会话实测）：**608 tests**（35 integration e2e 全绿，含 B9.5 新增 ~21 例）/ clippy
+  `--workspace --all-targets --all-features -D warnings` 0 / `-p hygress-gateway --all-targets
+  --no-default-features -D warnings` 0 / Cargo.lock 未动（无新依赖）。
+- 协调修复：integration.rs 补 GpustackSink 第 4 参；bootstrap 中 run_forever(`-> !`) 后死代码移除、
+  Result.filter→ok().filter、tracing::warn 按 feature 门控导入；pipe.rs while-let 多余括号。
+
+## 8. 诚实声明（B9.5）
+- 纯静态实施 + 编译/测试/静态审计门禁；**无真机复跑**——ORA3-MAJ-1 的"kill controller 后出现可告警陈旧信号"
+  与 ORA3-M4 的 shutdown drain 属运行时行为，需真机/进程级验证（验收标准已写入 checklist，待下轮真机会话）。
+- 仓库在 rustfmt 默认（max_width=100）下并非全量排版干净（历史风格行宽更宽、未强制 fmt）；本批未做全仓格式化，
+  只格式化语义文件会引入噪音，故维持现状并在 checklist 记录。
+- 集成维三项诚实未知维持：AM-2 真实流式引擎判别、拓扑 A ≤30s 收敛对 UI create→infer 流敏感度、默认安装 :443。
+- 并行实施期间 5 个代理按文件属主严格分工；跨代理契约（GpustackSink::new 尾参 on_drop、metrics 记录方法名）
+  在主控侧预置/钉死，合并后统一编译验证。

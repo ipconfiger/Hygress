@@ -30,7 +30,7 @@
 //! - [`fallback`]          ⑭  `x-higress-fallback-from` match, original-path restore, max-10 guard
 
 use hygress_core::prelude::{
-    ConfigData, HeaderMap, ProviderToken, RouteMatch, RouteTable, provider_bearer,
+    provider_bearer, ConfigData, HeaderMap, ProviderToken, RouteMatch, RouteTable,
 };
 
 use crate::context::{
@@ -69,7 +69,10 @@ pub struct PipelineCtx<'a> {
 /// Route is matched by **initial** key (`x-higress-llm-model` → Main, else mirror).
 /// Pure: no I/O. ⑤ forward-auth (async, egress) and ⑧⑨ (per-candidate, via
 /// [`build_outbound`]) are intentionally excluded and run in the pipe.
-pub fn prepare(inbound: &InboundRequest, ctx: &PipelineCtx) -> Result<PreparedRequest, GatewayError> {
+pub fn prepare(
+    inbound: &InboundRequest,
+    ctx: &PipelineCtx,
+) -> Result<PreparedRequest, GatewayError> {
     prepare_inner(inbound, ctx, route_match::match_initial)
 }
 
@@ -130,12 +133,9 @@ fn prepare_inner(
         // (alloc + copy) and record the body as carrying `model`.
         if crate::body::model_field_equals(&body, content_type, &ctx.router.model_key, model) {
             Some(model.clone())
-        } else if let Some(nb) = crate::body::rewrite_model_field(
-            &body,
-            content_type,
-            &ctx.router.model_key,
-            model,
-        ) {
+        } else if let Some(nb) =
+            crate::body::rewrite_model_field(&body, content_type, &ctx.router.model_key, model)
+        {
             body = nb;
             Some(model.clone()) // rewritten → the body now carries `mr.model`
         } else {
@@ -170,12 +170,17 @@ fn prepare_inner(
     let groups = if route.rewrite_target.is_some() {
         matched
             .matched_predicate
-            .map(|pi| ctx.table.capture_groups_for(matched.index, pi, &inbound.path))
+            .map(|pi| {
+                ctx.table
+                    .capture_groups_for(matched.index, pi, &inbound.path)
+            })
             .unwrap_or_default()
     } else {
         Vec::new()
     };
-    let upstream_path = route.rewrite_path(&groups).unwrap_or_else(|| inbound.path.clone());
+    let upstream_path = route
+        .rewrite_path(&groups)
+        .unwrap_or_else(|| inbound.path.clone());
 
     // ⑦ registry resolve + SWRR weighted order over the per-route-group shared state.
     // The group key / candidates come precomputed from the (cached) route table
@@ -296,6 +301,17 @@ pub fn build_outbound(
     // every metered upstream. `None` keeps `out_body` untouched (R-5
     // zero-allocation short path); a client-supplied `stream_options` is never
     // overridden.
+    //
+    // ORA3-M18 (GX-3): this injection is a DOCUMENTED SUPERSET of upstream
+    // Higress ai-proxy, which only injects for OpenAI-protocol, non-generic
+    // providers (`apiName` in chat/completions|completions). Hygress injects
+    // for ALL model-route chat/completions|completions streams, with no
+    // per-destination protocol discrimination — GPUStack-managed destinations
+    // always speak the OpenAI protocol, so no generic / strict engine (vLLM
+    // < 0.4.3 class, which 400s on unknown `stream_options`) is reachable
+    // through a model route today (README/equivalence updated by the docs
+    // agent). Revisit if generic or non-OpenAI destinations are ever routed
+    // through model routes. Deliberately no behavior change.
     if let Some(nb) = crate::body::ensure_stream_include_usage(
         &out_body,
         Some(prepared.content_type.as_str()),
@@ -338,10 +354,15 @@ pub fn build_outbound(
     // [`hygress_egress::provider::ProviderClient`] performs the identical swap on
     // the live (integrations) forward path; this is the pure, unit-tested model.
     if candidate.service_name.starts_with("provider-") {
-        if let Some(token) =
-            provider_bearer(provider_tokens, &candidate.service_name, &prepared.route.ingress_name)
-        {
-            headers.insert(crate::context::hdr::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(token) = provider_bearer(
+            provider_tokens,
+            &candidate.service_name,
+            &prepared.route.ingress_name,
+        ) {
+            headers.insert(
+                crate::context::hdr::AUTHORIZATION,
+                format!("Bearer {token}"),
+            );
         }
     }
 
@@ -451,7 +472,8 @@ mod tests {
     #[test]
     fn auth_writeback_replaces_client_credentials() {
         let mut p = prepared(true, "higress-system/ai-route-route-1.internal");
-        p.base_headers.insert(hdr::AUTHORIZATION, "Bearer sk-client");
+        p.base_headers
+            .insert(hdr::AUTHORIZATION, "Bearer sk-client");
         p.base_headers.insert(hdr::COOKIE, "client=1");
         let wb = HeaderMap::from_iter([
             (hdr::AUTHORIZATION, "Bearer reg-token".to_string()),
@@ -461,7 +483,10 @@ mod tests {
         ]);
         let out = build_outbound("POST", &p, &candidate(), &wb, &[]);
         // Exactly one Authorization — the registration token (the client key is gone).
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer reg-token"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer reg-token")
+        );
         assert_eq!(out.headers.count(hdr::AUTHORIZATION), 1);
         // Exactly one cookie — the auth service's dummy cookie.
         assert_eq!(out.headers.get(hdr::COOKIE), Some("dummy=dummy"));
@@ -523,7 +548,10 @@ mod tests {
             &HeaderMap::new(),
             &tokens,
         );
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer sk-provider-1"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer sk-provider-1")
+        );
         assert_eq!(out.headers.count(hdr::AUTHORIZATION), 1);
     }
 
@@ -533,11 +561,15 @@ mod tests {
         // destination overrides it with the provider apiToken (exactly one
         // Authorization — the provider key).
         let mut p = prepared(true, "higress-system/ai-route-route-1.internal");
-        p.base_headers.insert(hdr::AUTHORIZATION, "Bearer sk-client");
+        p.base_headers
+            .insert(hdr::AUTHORIZATION, "Bearer sk-client");
         let tokens = provider_tokens_global_and_scoped();
         let wb = HeaderMap::from_iter([(hdr::AUTHORIZATION, "Bearer reg-token".to_string())]);
         let out = build_outbound("POST", &p, &provider_candidate(), &wb, &tokens);
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer sk-provider-1"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer sk-provider-1")
+        );
         assert_eq!(out.headers.count(hdr::AUTHORIZATION), 1);
     }
 
@@ -554,7 +586,10 @@ mod tests {
             &HeaderMap::new(),
             &tokens,
         );
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer sk-provider-1-scoped"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer sk-provider-1-scoped")
+        );
     }
 
     #[test]
@@ -566,7 +601,10 @@ mod tests {
         let tokens = provider_tokens_global_and_scoped();
         let wb = HeaderMap::from_iter([(hdr::AUTHORIZATION, "Bearer reg-token".to_string())]);
         let out = build_outbound("POST", &p, &candidate(), &wb, &tokens);
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer reg-token"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer reg-token")
+        );
     }
 
     #[test]
@@ -581,7 +619,10 @@ mod tests {
         }];
         let wb = HeaderMap::from_iter([(hdr::AUTHORIZATION, "Bearer reg-token".to_string())]);
         let out = build_outbound("POST", &p, &provider_candidate(), &wb, &other);
-        assert_eq!(out.headers.get(hdr::AUTHORIZATION), Some("Bearer reg-token"));
+        assert_eq!(
+            out.headers.get(hdr::AUTHORIZATION),
+            Some("Bearer reg-token")
+        );
     }
 
     // ----- NB6: instance / route-name headers are model-route only -----
@@ -590,7 +631,10 @@ mod tests {
     fn instance_headers_present_for_model_route() {
         let p = prepared(true, "higress-system/ai-route-route-1.internal");
         let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
-        assert_eq!(out.headers.get(hdr::MODEL_INSTANCE_OUT), Some("model-1-10.static"));
+        assert_eq!(
+            out.headers.get(hdr::MODEL_INSTANCE_OUT),
+            Some("model-1-10.static")
+        );
         assert_eq!(
             out.headers.get(hdr::ROUTE_NAME_OUT),
             Some("higress-system/ai-route-route-1.internal")
@@ -672,9 +716,8 @@ mod tests {
         assert_eq!(router.enable_on_path_suffix, vec!["/v1/chat/completions"]);
 
         let table = RouteTable::rebuild(&data).unwrap();
-        let shared = SharedConfigHandle::new(
-            hygress_core::SharedConfig::new(data.clone()).unwrap(),
-        );
+        let shared =
+            SharedConfigHandle::new(hygress_core::SharedConfig::new(data.clone()).unwrap());
         let ctx = PipelineCtx {
             data: &data,
             table: &table,
@@ -693,7 +736,10 @@ mod tests {
         };
         let p = prepare(&inbound, &ctx).unwrap();
         // ② wrote the resolved model to the configured targetHeader ...
-        assert_eq!(p.base_headers.get("x-custom-model"), Some("org1/llama-3-8b"));
+        assert_eq!(
+            p.base_headers.get("x-custom-model"),
+            Some("org1/llama-3-8b")
+        );
         // ... and kept the canonical routing key in sync, so ④ matched the
         // Main route (not the mirror).
         assert_eq!(p.base_headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));

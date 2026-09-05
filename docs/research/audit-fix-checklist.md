@@ -44,7 +44,7 @@
 | `cargo test -p hygress-gateway --test alloc_guard -- --test-threads=1` | ⏳ |
 | `cargo test -p hygress-gateway --test integration`（22 项 e2e） | ⏳ |
 
-## B5 — 真机矩阵 [⏸ 未执行：本沙箱 darwin/arm64 无法产出 linux ELF（zig/aws-lc 汇编、远端无 rust、registry 受限）；真机已回滚恢复。执行套件见 audit-fix-report.md §3]
-> 状态：⏳ 等待用户提供 GPUStack 测试机连接（历史 frp TEST_HOST:33006 未建立；本机 ssh/docker 可用）。若不可达 → ⏸ 未执行 + 交付可执行套件。
+## B5 — 真机矩阵 [✅ 2026-09-05 真机 GPUStack v2.2.3：ready/进程/端口/metrics 新家族//config 401/chat 200+usage 34|5 落行/限流 200→429 rate_limit_error/护栏 403 guardrail_blocked/复位 200]
+> 执行环境：125.67.215.17（linux 构建产物经 cargo-zigbuild 交叉编译）。
 
 > 凭据按需提供；若不可达 → ⏸ 未执行 + 交付可执行套件。

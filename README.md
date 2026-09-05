@@ -10,7 +10,7 @@
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
 - 质量：**538 个测试全绿（审计修复批 B1-B3 后实测；此前 492 为修复前快照）**· clippy 0 警告（all-targets 双模式）· **零 mock/stub** ·
   经多轮 oracle 高精度交叉审核（Gate-1/Gate-2 9/10；升级设计两轮无阻塞；升级实现二轮 BLOCK 闭环）
-- **延伸能力**：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 1s 热重载 +
+- **延伸能力**：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 热重载（文件轮询 ≤30s，admin `/reload` 即时） +
   admin `/reload`；真机验证：限流 429/配额 429/护栏 403 实际生效）
 - 主要文档：`docs/design.md`（设计 v1.5）· `docs/research/plugin-contract-pin.md`（字节级外部契约）
   · `docs/research/gpustack-validation/REPORT.md`（真机验证证据）· `docs/dev-process.md`（开发全过程）

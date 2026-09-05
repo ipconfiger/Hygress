@@ -1,0 +1,14 @@
+Running 20s test @ http://127.0.0.1:8081/healthz
+  4 threads and 16 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.05ms    1.12ms  18.40ms   91.25%
+    Req/Sec     3.42k     1.03k    5.30k    79.75%
+  Latency Distribution
+     50%  736.00us
+     75%    1.24ms
+     90%    2.03ms
+     99%    6.07ms
+  272980 requests in 20.07s, 32.28MB read
+  Socket errors: connect 0, read 272980, write 0, timeout 0
+Requests/sec:  13598.67
+Transfer/sec:      1.61MB

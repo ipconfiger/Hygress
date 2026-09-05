@@ -38,6 +38,10 @@ const BUFFER_SIZE: usize = 1024;
 const MAX_ATTEMPTS: u32 = 3;
 /// Backoff before attempts 2 and 3 (kept tiny so a slow/failed endpoint does not stall the queue).
 const BACKOFFS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(100)];
+/// Per-POST overall timeout (R-8): the flusher must never block forever on an
+/// endpoint that accepts but never answers (the shared client only has a
+/// connect timeout).
+const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Out-of-band sink for `ModelUsageMetrics` → `POST {endpoint}`.
 #[derive(Clone, Debug)]
@@ -153,6 +157,7 @@ impl GpustackSink {
         let mut request = http
             .post(endpoint)
             .header(header::CONTENT_TYPE, "application/json")
+            .timeout(POST_TIMEOUT) // R-8: bounded per-POST (see module const).
             .body(payload.to_vec());
         match http::HeaderValue::from_str(token) {
             Ok(t) => request = request.header(GATEWAY_AUTH_TOKEN_HEADER, t),

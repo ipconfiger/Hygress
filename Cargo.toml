@@ -10,7 +10,10 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-rust-version = "1.83"
+# R-13 (MSRV alignment): raised from 1.83 to match direct dependency MSRVs
+# (kube 4.2 / reqwest 0.13 / pingora 0.8 are ≥1.84–1.89). The repo toolchain
+# (rust-toolchain.toml) stays at 1.98.
+rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]

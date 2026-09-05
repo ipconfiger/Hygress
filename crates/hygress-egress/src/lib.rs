@@ -10,8 +10,10 @@
 //! - [`forward_auth`] — [`forward_auth::Client`]: **GET** `/token-auth`; forwards ONLY the pin §5.3
 //!   allowlist (`X-Real-IP`/`X-Forwarded-For`/`x-higress-llm-model`/`x-api-key`/`cookie`/
 //!   `x-gpustack-auth-cache`), injects `X-GPUStack-Auth-Token`; reads back `X-Mse-Consumer`/
-//!   `Authorization`/`cookie`/`AUTH_CACHE_HEADER`; 30s timeout; FAIL_OPEN on transport errors/5xx
-//!   (returns `None`). No mock in impl: transport failures = fail-open, 4xx+ = real result.
+//!   `Authorization`/`cookie`/`AUTH_CACHE_HEADER`; 30s timeout; transport errors/5xx →
+//!   `Ok(None)` ("auth service unavailable" — the gateway decides reject-vs-fail-open per its
+//!   `HYGRESS_EXT_AUTH_FAIL_MODE`, R-12). No mock in impl: transport failures are genuine
+//!   connect/read errors; 4xx+ = real result.
 //! - [`usage_sink`] — [`usage_sink::GpustackSink`]: `POST /v2/usage/gateway-metrics` with
 //!   `X-GPUStack-Auth-Token` = the derived token; serializes the exact 17-field
 //!   `ModelUsageMetrics` (incl. `completed`); scope = model-route traffic only (the caller's job).

@@ -40,6 +40,10 @@ use tokio::sync::Semaphore;
 
 use crate::{Error, Result};
 
+/// Upper bound on cached verdicts (R-8): entries are keyed by user-controlled
+/// text, so without a cap the map would grow without limit under load.
+const MAX_CACHE_ENTRIES: usize = 4096;
+
 /// A guardrail verdict, parsed **leniently** from the service's response body.
 ///
 /// The canonical wire form is `{ "blocked": bool, "reason": string }`. Because the exact field
@@ -140,7 +144,18 @@ impl GuardrailClient {
         // 3. Cache only a real verdict (the cache stores `GuardVerdict`, not `Option`). A `None`
         //    (no verdict) or an `Err` is not cached.
         if let Ok(Some(ref verdict)) = result {
-            self.cache.insert(key, (verdict.clone(), Instant::now() + self.cache_ttl));
+            // R-8: bound the cache — first drop expired entries, then only insert
+            // when under the cap (user-controlled text otherwise grows memory
+            // without limit).
+            if self.cache.len() >= MAX_CACHE_ENTRIES {
+                let now = Instant::now();
+                self.cache.retain(|_, (_, expiry)| now < *expiry);
+            }
+            if self.cache.len() < MAX_CACHE_ENTRIES {
+                self.cache.insert(key, (verdict.clone(), Instant::now() + self.cache_ttl));
+            } else {
+                tracing::debug!("guardrail verdict cache full; skipping insert");
+            }
         }
 
         result

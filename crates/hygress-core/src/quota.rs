@@ -26,8 +26,9 @@
 //! # Memory bound (D-11 TTL)
 //!
 //! Windows are `window_secs` long; a counter is auto-reset when a later window
-//! is observed, and stale entries (a window far behind the current one) are
-//! lazily removed by [`QuotaEngine::gc_stale`] to prevent leaks.
+//! is observed. Process-level cleanup is **idle-based** [`QuotaEngine::evict_idle`]
+//! (run by the gateway's periodic task); [`QuotaEngine::gc_stale`] is the
+//! window-based auxiliary (not the runtime backstop — corrected in R-3).
 //!
 //! # In-flight settle (per-reservation)
 //!
@@ -198,17 +199,17 @@ impl QuotaEngine {
     /// A release also counts as **activity** (NB-3): `last_used_ms` is
     /// refreshed so a long-lived in-flight stream that aborts late is not
     /// idle-evicted before its release lands.
+    ///
+    /// Time is injected (`now_ms`) for determinism (R-3): this engine never
+    /// reads a system clock, matching the module contract.
     pub fn release(
         &self,
+        now_ms: u64,
         window_idx: u64,
         key: &(String, String),
         est_tokens: u64,
         actual_tokens: u64,
     ) -> u64 {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         if let Some(mut c) = self.counters.get_mut(key) {
             c.last_used_ms = now_ms;
             if c.window_idx == window_idx {
@@ -221,6 +222,11 @@ impl QuotaEngine {
 
     /// Lazily GC entries whose window is older than `current_window_idx`
     /// (leak prevention, D-11). Returns the number of entries removed.
+    ///
+    /// Note (R-3): the LIVE process-level cleanup is the idle-based
+    /// [`QuotaEngine::evict_idle`] invoked by the gateway's periodic task
+    /// (`bootstrap.rs`); `gc_stale` is the window-based auxiliary (its docs
+    /// previously claimed it was the runtime backstop — it is not).
     pub fn gc_stale(&self, current_window_idx: u64) -> usize {
         let mut removed = 0usize;
         self.counters.retain(|_, c| {
@@ -393,10 +399,14 @@ mod tests {
         let key = ("c".to_string(), "m".to_string());
         let widx = QuotaEngine::window_idx(0, &s);
         // Aborted after consuming 40 of the 100 reserved -> returns 60.
-        let returned = e.release(widx, &key, 100, 40);
+        // (now_ms injected: 90_000 refreshes last_used_ms for idle-eviction.)
+        let returned = e.release(90_000, widx, &key, 100, 40);
         assert_eq!(returned, 60);
         // The reservation is released (nothing committed for the abort).
         assert_eq!(e.usage("c", "m"), Some(0));
+        // Release counts as activity: an idle eviction just after (t=90_001,
+        // idle 1s) must NOT remove the key.
+        assert_eq!(e.evict_idle(90_001, 1_000), 0);
     }
 
     #[test]
@@ -407,7 +417,7 @@ mod tests {
         let key = ("c".to_string(), "m".to_string());
         let widx = QuotaEngine::window_idx(0, &s);
         // actual (50) > est (10): the returned difference saturates at 0.
-        let returned = e.release(widx, &key, 10, 50);
+        let returned = e.release(0, widx, &key, 10, 50);
         assert_eq!(returned, 0);
     }
 

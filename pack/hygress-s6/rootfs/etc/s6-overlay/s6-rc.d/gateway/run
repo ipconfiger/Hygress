@@ -14,8 +14,14 @@ source "$GPUSTACK_GATEWAY_CONFIG"
 source "$SCRIPT_ROOT/default-variables.sh"
 
 export HYGRESS_KUBECONFIG="${HYGRESS_KUBECONFIG:-${EMBEDDED_KUBECONFIG_PATH:-/var/lib/gpustack/higress/kubeconfig}}"
+# R-13 (env alignment): the binary reads KUBECONFIG (or the file fallback);
+# mirror the launcher's kubeconfig so both names agree.
+export KUBECONFIG="${KUBECONFIG:-${HYGRESS_KUBECONFIG}}"
 export GATEWAY_HTTP_PORT="${GATEWAY_HTTP_PORT:-80}"
 export GATEWAY_HTTPS_PORT="${GATEWAY_HTTPS_PORT:-443}"
+# R-13 (env alignment): the binary reads GATEWAY_TLS_PORT; accept the
+# GPUStack-side GATEWAY_HTTPS_PORT name as its source.
+export GATEWAY_TLS_PORT="${GATEWAY_TLS_PORT:-${GATEWAY_HTTPS_PORT:-443}}"
 export GPUSTACK_API_PORT="${GPUSTACK_API_PORT:-30080}"
 export HYGRESS_DATA_DIR="${HYGRESS_DATA_DIR:-/var/lib/gpustack}"
 # The Rust bootstrap resolves the jwt_secret_key (design §9) from GPUSTACK_DATA_DIR;
@@ -31,6 +37,9 @@ export GATEWAY_PILOT_AGENT_METRICS_PORT="${GATEWAY_PILOT_AGENT_METRICS_PORT:-150
 export HYGRESS_API_READY_TIMEOUT="${HYGRESS_API_READY_TIMEOUT:-300}"
 export HYGRESS_SNAPSHOT_TIMEOUT="${HYGRESS_SNAPSHOT_TIMEOUT:-300}"
 export HYGRESS_POLICY_PATH="${HYGRESS_POLICY_PATH:-/etc/hygress/policy.yaml}"
+# R-12: ext-auth failure mode (closed = reject when /token-auth unavailable/5xx,
+# matching the GPUStack/Higress baseline; open = legacy fail-open).
+export HYGRESS_EXT_AUTH_FAIL_MODE="${HYGRESS_EXT_AUTH_FAIL_MODE:-closed}"
 
 # honor the original access.log logrotate tooling + keep hygress's own output in a
 # host-visible file (under the GPUStack data bind volume) for diagnosis.

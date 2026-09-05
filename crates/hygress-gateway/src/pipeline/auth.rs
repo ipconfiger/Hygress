@@ -10,9 +10,13 @@
 //! core [`hygress_core::AuthScope`]; the actual `GET /token-auth` request is
 //! [`authenticate`] (`integrations`-gated, egress `forward_auth::Client`).
 //!
-//! Write-back / `FAIL_OPEN`: on a real `401` the pipe short-circuits (401); on
-//! a transport failure the egress client fail-opens (returns `None`) and the
-//! request proceeds without write-back headers.
+//! Write-back / auth-service failure (R-12): on a real `401` (a genuine
+//! rejection) the pipe short-circuits (401). When `/token-auth` is
+//! unreachable or answers 5xx, the outcome is
+//! [`AuthOutcome::AuthServiceUnavailable`]; the pipe then rejects (403,
+//! default — matching GPUStack/Higress `failure_mode_allow=false`) or
+//! fail-opens (env `HYGRESS_EXT_AUTH_FAIL_MODE=open`) per its configured
+//! `auth_fail_closed` mode.
 
 use hygress_core::prelude::{HeaderMap, RouteRule};
 
@@ -32,13 +36,19 @@ pub fn required(route: &RouteRule) -> bool {
 /// the egress glue that produces it is `integrations`-gated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
-    /// Proceed (authenticated **or** fail-open). `write_back` carries the
-    /// response headers to apply to the outbound request (may be empty).
+    /// Proceed (authenticated). `write_back` carries the response headers to
+    /// apply to the outbound request.
     Allowed {
         write_back: HeaderMap,
     },
     /// A real (non-fail-open) denial → the pipe responds 401.
     Denied,
+    /// The auth service could not be reached / answered 5xx (the egress
+    /// client returned "no verdict"). How the pipe reacts is the configured
+    /// `auth_fail_closed` mode (R-12): `true` → reject (default, matches the
+    /// GPUStack/Higress `failure_mode_allow=false` behavior: 403), `false`
+    /// → legacy fail-open (proceed without write-back).
+    AuthServiceUnavailable,
 }
 
 /// Build the outbound write-back header set from a forward-auth verdict.
@@ -107,14 +117,10 @@ pub async fn authenticate(
                 AuthOutcome::Denied
             }
         }
-        Ok(None) => AuthOutcome::Allowed {
-            write_back: HeaderMap::new(),
-        },
+        Ok(None) => AuthOutcome::AuthServiceUnavailable,
         Err(e) => {
-            warn!(error = %e, "forward-auth error; FAIL_OPEN (proceed without write-back)");
-            AuthOutcome::Allowed {
-                write_back: HeaderMap::new(),
-            }
+            warn!(error = %e, "forward-auth error; auth service unavailable (mode decided by the pipe)");
+            AuthOutcome::AuthServiceUnavailable
         }
     }
 }

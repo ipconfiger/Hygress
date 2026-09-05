@@ -321,9 +321,11 @@ fn build_state_ext(
     let shared = SharedConfig::new(data).expect("config is valid");
     Arc::new(GatewayState {
         config: Arc::new(SharedConfigHandle::new(shared)),
+        tls: hygress_gateway::tls_store::SniStore::new(), // R-9⑤ (unused on the plain-HTTP test path)
         auth: Some(Arc::new(
             forward_auth::Client::new(auth_url, http.clone()).with_auth_token(token.clone()),
         )),
+        auth_fail_closed: true, // R-12 default (matches GPUStack/Higress)
         sink: Some(Arc::new(GpustackSink::new(
             usage_url,
             http.clone(),

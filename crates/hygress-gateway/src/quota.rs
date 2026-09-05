@@ -21,8 +21,9 @@
 //!
 //! Settlement is **idempotent**: an explicit [`QuotaReservation::settle`]
 //! marks the guard settled, so the `Drop` is a no-op; an unsettled drop
-//! releases the (still in-flight) estimate so no budget leaks (the TTL `gc_stale`
-//! is the process-level backstop).
+//! releases the (still in-flight) estimate so no budget leaks. Process-level
+//! leak prevention is the idle-based `QuotaEngine::evict_idle` periodic task
+//! (bootstrap); the core `gc_stale` is a window-based auxiliary (R-3).
 
 use std::sync::Arc;
 
@@ -87,7 +88,7 @@ impl QuotaReservation {
                     .commit(now, &self.key.0, &self.key.1, &self.spec, self.est, actual);
             }
             None => {
-                self.engine.release(self.widx, &self.key, self.est, 0);
+                self.engine.release(now, self.widx, &self.key, self.est, 0);
             }
         }
     }
@@ -108,7 +109,8 @@ impl Drop for QuotaReservation {
     /// settle) releases the in-flight estimate — no budget leak (D-11).
     fn drop(&mut self) {
         if !self.settled {
-            self.engine.release(self.widx, &self.key, self.est, 0);
+            let now = now_millis();
+            self.engine.release(now, self.widx, &self.key, self.est, 0);
         }
     }
 }

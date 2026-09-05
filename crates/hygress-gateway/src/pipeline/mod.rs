@@ -125,7 +125,12 @@ fn prepare_inner(
             base_headers.insert(crate::context::hdr::LLM_MODEL, model);
         }
         let content_type = Some(inbound.content_type.as_str());
-        if let Some(nb) = crate::body::rewrite_model_field(
+        // R-5 (identity short-circuit): when the body's `model` field already
+        // equals the resolved value, do NOT splice — skip the full-body rewrite
+        // (alloc + copy) and record the body as carrying `model`.
+        if crate::body::model_field_equals(&body, content_type, &ctx.router.model_key, model) {
+            Some(model.clone())
+        } else if let Some(nb) = crate::body::rewrite_model_field(
             &body,
             content_type,
             &ctx.router.model_key,
@@ -158,12 +163,18 @@ fn prepare_inner(
     };
     let route = ctx.table.route(matched.index);
 
-    // Rewrite capture: the matched predicate's groups → `rewrite-target` (e.g. `/$1$3`).
-    let groups = matched
-        .matched_predicate
-        .and_then(|pi| route.path_predicates.get(pi))
-        .map(|pi| route_match::capture_groups(pi, &inbound.path))
-        .unwrap_or_default();
+    // Rewrite capture: the matched predicate's groups → `rewrite-target`
+    // (e.g. `/$1$3`). R-6: only computed when the route actually defines a
+    // rewrite target, and served from the route table's ALREADY-COMPILED
+    // regex (no per-request `RegexBuilder::build`).
+    let groups = if route.rewrite_target.is_some() {
+        matched
+            .matched_predicate
+            .map(|pi| ctx.table.capture_groups_for(matched.index, pi, &inbound.path))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let upstream_path = route.rewrite_path(&groups).unwrap_or_else(|| inbound.path.clone());
 
     // ⑦ registry resolve + SWRR weighted order over the per-route-group shared state.

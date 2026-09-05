@@ -71,13 +71,20 @@ impl DataState {
     pub fn new(config: GatewayConfig, data: ConfigData) -> Result<Self, GatewayError> {
         let shared = SharedConfig::new(data)
             .map_err(|issues| GatewayError::Other(format!("initial snapshot rejected: {issues:?}")))?;
+        let metrics = Arc::new(Metrics::new());
+        let shared_handle = SharedConfigHandle::new(shared);
+        // R-4: publish the core control-plane reject/skip counters on /metrics
+        // (and the 15020 shallow-compat /stats/prometheus) at scrape time.
+        metrics.add_collector(Box::new(
+            crate::metrics::ConfigSnapshotCollector::new(shared_handle.inner.clone()),
+        ));
         let policy = Arc::new(crate::policy_loader::PolicyHandle::new(
             config.policy_path.clone(),
         ));
         Ok(Self {
             config,
-            shared: SharedConfigHandle::new(shared),
-            metrics: Arc::new(Metrics::new()),
+            shared: shared_handle,
+            metrics,
             tls: SniStore::new(),
             policy,
         })
@@ -94,11 +101,13 @@ impl DataState {
         let policy = self.policy.clone();
         let reloader: Arc<dyn Fn() -> bool + Send + Sync> =
             Arc::new(move || policy.reload());
-        Arc::new(AdminState::new(
+        let admin = AdminState::new(
             self.metrics.clone(),
             self.config.admin_token.clone(),
             Some(reloader),
-        ))
+        );
+        // R-4 / C4: expose the current snapshot summary via GET /config.
+        Arc::new(admin.with_config_shared(self.shared.inner.clone()))
     }
 
     /// Real 15020 stats service state (`/stats/prometheus` `/stats`).
@@ -230,7 +239,32 @@ fn attach_data_plane(
                 .map_err(|e| GatewayError::Other(format!("TLS listener on {tls_addr}: {e}")))?,
             Err(e) => warn!(error = %e, "TLS material present but not exportable; plain HTTP only on {tls_addr}"),
         }
-        info!(tls_port = config.tls_port, "data plane TLS listener bound (default cert)");
+        // R-9⑤ (minimal wiring): reflect the snapshot into the SniStore so the
+        // (future) SNI resolver / integration tests see the same cert table.
+        // Pingora 0.8's public listener API serves the default-cert PEM above.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let accepted = state.tls.store_config(&data.tls, &provider);
+        info!(
+            accepted,
+            tls_port = config.tls_port,
+            "data plane TLS listener bound (default cert PEM); SniStore reflected (0.8 file-path API)"
+        );
+    }
+    // R-9③ (honest degradation): `higress-config` timing values are parsed into
+    // the snapshot but NOT enforced by the data plane (enforcing an upstream
+    // idle timeout risks killing long SSE streams); warn once at bind so the
+    // gap is discoverable.
+    let t = &data.timing;
+    if t.downstream_idle_timeout_secs != 1800
+        || t.upstream_idle_timeout_secs != 10
+        || t.max_request_headers_kb.is_some()
+    {
+        warn!(
+            downstream_idle_timeout_secs = t.downstream_idle_timeout_secs,
+            upstream_idle_timeout_secs = t.upstream_idle_timeout_secs,
+            max_request_headers_kb = ?t.max_request_headers_kb,
+            "higress-config timing parsed but NOT enforced by the data plane (R-9③; recorded for observability only)"
+        );
     }
 
     server.add_service(data_svc);
@@ -255,7 +289,30 @@ fn write_default_tls_pem(tls: &hygress_core::prelude::TlsConfig) -> std::io::Res
     let key = dir.join("key.pem");
     std::fs::write(&cert, &host.cert_pem)?;
     std::fs::write(&key, &host.key_pem)?;
+    // R-9⑤: the private key must not sit in world-readable temp files.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600));
+    }
     Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()))
+}
+
+/// Deterministic content fingerprint of the TLS table (sorted by host): used by
+/// the R-11 rotation watcher to detect a cert/key change in the snapshot.
+#[cfg(feature = "integrations")]
+fn tls_fingerprint(tls: &hygress_core::prelude::TlsConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut hosts = tls.hosts.clone();
+    hosts.sort_by(|a, b| a.host.cmp(&b.host));
+    for h in hosts {
+        hasher.update(h.host.as_bytes());
+        hasher.update(h.cert_pem.as_bytes());
+        hasher.update(h.key_pem.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Kubeconfig for the control-plane `Controller` (design §9): the `KUBECONFIG` env, else
@@ -384,7 +441,9 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         )));
         let gateway_state = Arc::new(GatewayState {
             config: Arc::new(ds.shared.clone()),
+            tls: ds.tls.clone(), // R-9⑤: SNI store reflected at bind time
             auth,
+            auth_fail_closed: config.ext_auth_fail_closed, // R-12
             sink,
             upstream: Arc::new(ProviderClient),
             metrics: ds.metrics.clone(),
@@ -409,11 +468,13 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         //     Also performs periodic eviction of idle quota counters and
         //     rate-limit buckets (BLOCK-2: leak prevention).
         let policy_poll = ds.policy.clone();
-        let poll_interval = config.poll_interval;
         let quota_evict = gateway_state.quota.clone();
         let ratelimit_evict = gateway_state.ratelimit_buckets.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(poll_interval);
+            // R-8: run the dutycycle on a 30s cadence (the old 1s full-table
+            // evict scans competed with the data plane for no benefit — the
+            // idle threshold is 5 minutes).
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.tick().await; // the first tick is immediate
             // Idle threshold: 5 minutes (hardcoded; not currently
             // configurable via env).
@@ -489,6 +550,42 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         //    all bound only now, after ready().
         let mut server = build_server(config, admin, stats)?;
         attach_data_plane(&mut server, gateway_state, config)?;
+
+        // R-11 (C3): TLS rotation detection. Pingora 0.8 binds the listener cert
+        // from PEM written at bind time (no hot reload), so a snapshot TLS
+        // content change must be surfaced loudly: rewrite the PEM (for the next
+        // restart), log an error, and bump the counters.
+        {
+            let shared_h = ds.shared.clone();
+            let metrics = ds.metrics.clone();
+            tokio::spawn(async move {
+                let mut last = tls_fingerprint(&shared_h.load().tls);
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let tls = shared_h.load().tls.clone();
+                    let fp = tls_fingerprint(&tls);
+                    if fp == last {
+                        continue;
+                    }
+                    last = fp;
+                    metrics.record_tls_cert_change_detected();
+                    if !tls.hosts.is_empty() {
+                        if let Err(e) = write_default_tls_pem(&tls) {
+                            error!("TLS rotation: could not rewrite listener PEM (snapshot cert changed): {e}");
+                        }
+                    }
+                    metrics.record_tls_cert_requires_restart();
+                    error!(
+                        "TLS certificate content changed in the control-plane snapshot; \
+                         pingora 0.8 serves the listener cert from the PEM written at bind, \
+                         so a container restart is REQUIRED for the new certificate to take effect"
+                    );
+                }
+            });
+        }
+
         Ok(server)
     }
 

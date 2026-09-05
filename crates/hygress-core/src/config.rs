@@ -11,6 +11,7 @@
 //! takes effect on the next request without restart (design D6).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -379,6 +380,11 @@ fn default_true() -> bool {
 
 /// One WasmPlugin-equivalent feature config (plugin name + phase + priority +
 /// immutable `defaultConfigDisable`).
+///
+/// R-9①: the opaque `defaultConfig` raw spec is deliberately NOT retained in
+/// the snapshot — GPUStack writes provider `apiTokens` and even the derived
+/// gateway token into some plugin `defaultConfig`s, and nothing in the data
+/// plane consumes the raw spec (typed equivalents are implemented natively).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayFeatureConfig {
     /// WasmPlugin resource name (e.g. `gpustack-model-router`).
@@ -393,9 +399,6 @@ pub struct GatewayFeatureConfig {
     /// `defaultConfigDisable` — recorded and immutable after creation.
     #[serde(default)]
     pub default_config_disable: bool,
-    /// The plugin `defaultConfig` / match-rule payload (opaque here).
-    #[serde(default)]
-    pub config: serde_json::Value,
 }
 
 /// TLS certificate table (`Secret gpustack-tls-<host>` / `-default`).
@@ -944,6 +947,34 @@ impl RouteTable {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// The 1-based capture groups of predicate `predicate_index` of route
+    /// `route_index` full-matched on `path` — served from the **already
+    /// compiled** predicate regex (R-6: no per-request `RegexBuilder::build`,
+    /// matching the full-match + ignore_case shape the table matched on).
+    /// Empty when the predicate is absent or does not full-match.
+    pub fn capture_groups_for(
+        &self,
+        route_index: usize,
+        predicate_index: usize,
+        path: &str,
+    ) -> Vec<String> {
+        let Some(re) = self
+            .regexes
+            .get(route_index)
+            .and_then(|rs| rs.get(predicate_index))
+        else {
+            return Vec::new();
+        };
+        let Some(caps) = re.captures(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for g in caps.iter().skip(1) {
+            out.push(g.map(|s| s.as_str().to_string()).unwrap_or_default());
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,20 +1069,28 @@ impl Snapshot {
 pub struct SharedConfig {
     data: ArcSwap<Snapshot>,
     swrr_states: DashMap<(String, String), SwrrState>,
+    /// Total control-plane snapshots rejected as a whole (structural failure,
+    /// keep-last-known-good). Atomic, incremented by `store` on rejection (R-4).
+    pub snapshot_reject_total: AtomicU64,
+    /// Total per-object validation skips applied by `store`/`new` (bad objects
+    /// dropped, good ones kept). Atomic (R-4).
+    pub snapshot_skipped_total: AtomicU64,
 }
 
 impl SharedConfig {
     /// Create the holder from a snapshot.
     ///
-    /// Per-object issues are dropped (good objects kept). The whole snapshot
+    /// Per-object issues are dropped (good objects kept); the whole snapshot
     /// is rejected (`Err`) only for a **structural** failure (a path predicate
     /// that is not a valid regex). Callers wanting the per-object issues use
-    /// [`ConfigData::sanitize`].
+    /// [`ConfigData::sanitize`]. The dropped-object count is recorded in
+    /// [`SharedConfig::snapshot_skipped_total`] (R-4).
     pub fn new(data: ConfigData) -> Result<Self, Vec<ValidationError>> {
         let SanitizeResult {
             accepted,
             issues,
         } = data.sanitize();
+        let skipped = issues.len() as u64;
         let table = match RouteTable::rebuild(&accepted) {
             Ok(t) => t,
             Err(e) => {
@@ -1063,6 +1102,8 @@ impl SharedConfig {
         Ok(Self {
             data: ArcSwap::from_pointee(Snapshot::build(accepted, table)),
             swrr_states: DashMap::new(),
+            snapshot_reject_total: AtomicU64::new(0),
+            snapshot_skipped_total: AtomicU64::new(skipped),
         })
     }
 
@@ -1072,14 +1113,22 @@ impl SharedConfig {
     /// is rejected only for a structural failure. Stale SWRR state entries for
     /// routes / destination groups no longer present in the new snapshot are
     /// pruned before the swap.
-    pub fn store(&self, data: ConfigData) -> Result<(), Vec<ValidationError>> {
+    ///
+    /// Returns `Ok(dropped)` where `dropped` is the number of per-object
+    /// validation skips this store applied (recorded in
+    /// [`SharedConfig::snapshot_skipped_total`]); `Err` (a structural
+    /// rejection, recorded in [`SharedConfig::snapshot_reject_total`]) keeps
+    /// the last-known-good snapshot (R-4).
+    pub fn store(&self, data: ConfigData) -> Result<usize, Vec<ValidationError>> {
         let SanitizeResult {
             accepted,
             issues,
         } = data.sanitize();
+        let dropped = issues.len();
         let table = match RouteTable::rebuild(&accepted) {
             Ok(t) => t,
             Err(e) => {
+                self.snapshot_reject_total.fetch_add(1, Ordering::Relaxed);
                 let mut all = issues;
                 all.push(ValidationError::new(format!("structural: {e}")));
                 return Err(all);
@@ -1091,7 +1140,11 @@ impl SharedConfig {
             .retain(|k, _| valid.contains(k));
         self.data
             .store(Arc::new(Snapshot::build(accepted, table)));
-        Ok(())
+        if dropped > 0 {
+            self.snapshot_skipped_total
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
+        Ok(dropped)
     }
 
     /// The current snapshot (lock-free read).
@@ -1907,6 +1960,55 @@ mod tests {
         assert!(f.use_original_body && f.use_original_uri);
         // main_ingress_name is optional in the wire form (defaults to empty).
         assert_eq!(f.main_ingress_name, "");
+    }
+
+    // ----- R-4: config reject / skip counters -----
+
+    #[test]
+    fn store_reports_and_counts_per_object_skips() {
+        let sc = SharedConfig::new(ConfigData::default()).unwrap();
+        assert_eq!(sc.snapshot_reject_total.load(Ordering::Relaxed), 0);
+        assert_eq!(sc.snapshot_skipped_total.load(Ordering::Relaxed), 0);
+        // A mixed snapshot: 2 bad routes dropped, 1 good kept.
+        let data = ConfigData {
+            routes: vec![
+                RouteRule {
+                    key: String::new(),
+                    ..main_route("bad1")
+                },
+                RouteRule {
+                    key: String::new(),
+                    ..main_route("bad2")
+                },
+                main_route("good"),
+            ],
+            ..Default::default()
+        };
+        let dropped = sc.store(data).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(sc.load().routes.len(), 1);
+        assert_eq!(sc.snapshot_skipped_total.load(Ordering::Relaxed), 2);
+        assert_eq!(sc.snapshot_reject_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn store_structural_reject_increments_reject_counter() {
+        let sc = SharedConfig::new(ConfigData::default()).unwrap();
+        let structural = ConfigData {
+            routes: vec![RouteRule::new(
+                "m",
+                RouteKind::Main,
+                vec![PathPred::new("([unclosed")],
+                vec![Destination::new("a.static:80")],
+            )
+            .unwrap()],
+            ..Default::default()
+        };
+        assert!(sc.store(structural).is_err());
+        assert_eq!(sc.snapshot_reject_total.load(Ordering::Relaxed), 1);
+        // A subsequent successful store leaves the reject counter untouched.
+        assert!(sc.store(ConfigData::default()).is_ok());
+        assert_eq!(sc.snapshot_reject_total.load(Ordering::Relaxed), 1);
     }
 
     impl Registry {

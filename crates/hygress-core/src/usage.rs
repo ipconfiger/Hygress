@@ -430,7 +430,9 @@ impl UsageSnapshot {
     pub fn flush(&self, f: &FlushFields) -> ModelUsageMetrics {
         let input = self.input_token.unwrap_or(0);
         let output = self.output_token.unwrap_or(0);
-        let recomputed = input + output;
+        // R-3: saturating — a hostile/malformed upstream value (e.g. u64::MAX)
+        // must not overflow/panic on the data plane.
+        let recomputed = input.saturating_add(output);
         // Prefer the upstream total when it exceeds the recomputed sum
         // (metrics_collector: `total_token > input + output`).
         let total = match self.total_token {
@@ -1205,5 +1207,25 @@ mod tests {
         s.feed(b);
         assert!(s.complete(), "reassembled line must be seen and absorbed");
         assert_eq!(s.tokens(), (11, 4, 0));
+    }
+
+    #[test]
+    fn flush_saturates_huge_upstream_tokens() {
+        // R-3: a hostile / malformed upstream report with u64::MAX tokens must
+        // not overflow (debug panic / release wrap) on the flush recompute.
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        s.feed(
+            b"data: {\"usage\":{\"prompt_tokens\":18446744073709551615,\
+               \"completion_tokens\":18446744073709551615}}\n\n",
+        );
+        let m = s.flush(&FlushFields {
+            request_content_bytes: 0,
+            ..Default::default()
+        });
+        assert_eq!(m.input_token, u64::MAX);
+        assert_eq!(m.output_token, u64::MAX);
+        // recomputed = saturating_sum -> still u64::MAX (no wrap, no panic).
+        assert_eq!(m.total_token, u64::MAX);
+        assert!(m.completed);
     }
 }

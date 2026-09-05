@@ -7,10 +7,18 @@
 //! [`arc_swap::ArcSwap`] of a [`SniMap`] owned by the [`SniStore`].
 //! [`SniStore::store_config`] reads the `tls.crt`/`tls.key` PEM content from a
 //! [`TlsConfig`], PEM-parses it into rustls `pki_types`, builds a rustls
-//! [`CertifiedKey`] per host, and atomically `store()`s the result — so a hot
-//! reload (the adapter poll diff) is visible to the very next TLS handshake,
-//! with no second storage to drift. Malformed entries are isolated per-host
-//! (skipped + WARN) and never break the other hosts' certs (design §5.4).
+//! [`CertifiedKey`] per host, and atomically `store()`s the result — so a
+//! re-`store_config` (a hot snapshot change) is visible to the very next
+//! handshake **that resolves through this store**.
+//!
+//! R-9⑤ (pingora 0.8 constraint): the data-plane listener is attached with the
+//! file-based `pingora` `add_tls` (single default-cert PEM, written once at
+//! bind — see `bootstrap::write_default_tls_pem`); the `SniStore` is
+//! snapshot-reflected at bind time for the future SNI resolver / integration
+//! tests, and the rustls [`ServerConfig`] built here (`server_config`) is what
+//! a pingora upgrade with an injectable resolver (PR #599 / issue #832) would
+//! attach. Certificate rotation in 0.8 therefore requires a container restart
+//! (documented; a rotation-detection loop is added in R-11).
 //!
 //! ## SNI selection (exact → first-level wildcard → default)
 //!

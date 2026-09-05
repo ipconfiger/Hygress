@@ -84,6 +84,42 @@ const FALLBACK_FROM_VALUE_HEADER: &str = "x-higress-fallback-from";
 /// The Envoy custom-response filter key inside a fallback EnvoyFilter's `typed_per_filter_config`.
 const CUSTOM_RESPONSE_FILTER: &str = "envoy.filters.http.custom_response";
 
+/// Managed WasmPlugin resource names Hygress consumes (pin §1; typed native
+/// equivalents). A managed plugin OUTSIDE this set is a future/unknown plugin
+/// whose behavior Hygress does not reproduce — surfaced once per pass (R-10 /
+/// C1, fail-open).
+const KNOWN_WASM_PLUGINS: &[&str] = &[
+    "gpustack-llm-ext-auth",
+    "gpustack-ai-statistics",
+    "gpustack-model-router",
+    "gpustack-ai-proxy",
+    "gpustack-set-model-pre-route",
+    "gpustack-model-mapper",
+    "gpustack-header-transformer",
+    "gpustack-token-usage",
+];
+
+/// R-10 / C1: warn (once per object) about `defaultConfig` / rule keys Hygress
+/// does not consume — GPUStack upgrade drift becomes discoverable instead of
+/// silently ignored. Fail-open: never rejects, never changes behavior.
+fn warn_unknown_keys(value: &Value, known: &[&str], what: &str) {
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    let unknown: Vec<String> = obj
+        .keys()
+        .filter(|k| !known.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            what,
+            unknown_keys = ?unknown,
+            "unconsumed config keys (possible GPUStack upgrade drift; C1) — native typed equivalent is authoritative"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Object model (input to the pure translation)
 // ---------------------------------------------------------------------------
@@ -379,8 +415,9 @@ pub fn mcpbridge_to_registries(obj: &Object) -> Result<(Vec<Registry>, Vec<Outbo
             if let Some(k) = kind {
                 proxy = proxy.with_kind(k);
             }
-            // `listenerPort` is not a builder field; attach it directly.
-            let _ = listener_port;
+            // `listenerPort` is not an `OutboundProxy` builder field; attach it
+            // directly (field retained for wire fidelity; no data-plane consumer
+            // — R-9④).
             proxies.push(with_listener_port(proxy, listener_port));
         }
     }
@@ -426,8 +463,11 @@ fn with_listener_port(mut proxy: OutboundProxy, port: Option<u16>) -> OutboundPr
 // WasmPlugin → gateway feature config + model-mapping rules
 // ---------------------------------------------------------------------------
 
-/// Translate one `WasmPlugin` into a [`GatewayFeatureConfig`] (the plugin name/phase/priority/
-/// immutable `defaultConfigDisable` + the opaque `spec` payload).
+/// Translate one `WasmPlugin` into a [`GatewayFeatureConfig`] (the plugin
+/// name/phase/priority/immutable `defaultConfigDisable`). The raw
+/// `defaultConfig` spec is NOT retained (R-9① — it can carry provider
+/// `apiTokens` / the derived gateway token, and nothing consumes it: typed
+/// equivalents are implemented natively).
 pub fn wasmplugin_to_feature(obj: &Object) -> GatewayFeatureConfig {
     let spec = obj.value.get("spec").cloned().unwrap_or(Value::Null);
     let phase = spec.get("phase").and_then(|v| v.as_str()).unwrap_or("UNSPECIFIED_PHASE");
@@ -448,8 +488,6 @@ pub fn wasmplugin_to_feature(obj: &Object) -> GatewayFeatureConfig {
         priority,
         fail_open,
         default_config_disable,
-        // Opaque: keep the whole spec so the data plane can inspect per-plugin config.
-        config: spec,
     }
 }
 
@@ -487,6 +525,12 @@ pub fn wasmplugin_model_mapping(obj: &Object) -> Vec<ModelMappingRule> {
 
     let mut out = Vec::new();
     for rule in rules {
+        // R-10 / C1: warn on unknown rule keys (GPUStack upgrade drift).
+        warn_unknown_keys(
+            rule,
+            &["config", "service", "ingress", "domain", "configDisable"],
+            "gpustack-model-mapper matchRule",
+        );
         let Some(model) = rule
             .get("config")
             .and_then(|c| c.get("modelMapping"))
@@ -560,6 +604,21 @@ fn translate_model_router_config(default_config: Option<&Value>) -> ModelRouterS
     if !cfg.is_object() {
         return ModelRouterSettings::default();
     }
+    // R-10 / C1: keys beyond the typed-consumed set (prefix/targetHeader/
+    // enableOnPathSuffix/aliasNameMapping/maxBodyBytes) are not consumed —
+    // GPUStack contract fields such as modelKey/autoRouting* included — so a
+    // GPUStack upgrade writing new behaviour here becomes visible.
+    warn_unknown_keys(
+        cfg,
+        &[
+            "prefix",
+            "targetHeader",
+            "enableOnPathSuffix",
+            "aliasNameMapping",
+            "maxBodyBytes",
+        ],
+        "gpustack-model-router defaultConfig",
+    );
     match serde_json::from_value::<ModelRouterSettings>(cfg.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -592,6 +651,10 @@ pub fn wasmplugin_ai_proxy(obj: &Object) -> Vec<ProviderToken> {
     let Some(spec) = obj.value.get("spec") else {
         return Vec::new();
     };
+    // R-10 / C1: the ai-proxy defaultConfig carries only `providers` today.
+    if let Some(dc) = spec.get("defaultConfig") {
+        warn_unknown_keys(dc, &["providers"], "gpustack-ai-proxy defaultConfig");
+    }
 
     // `defaultConfig.providers[]`: provider `id` -> `apiTokens` (list).
     let mut provider_tokens: std::collections::BTreeMap<String, Vec<String>> =
@@ -623,6 +686,12 @@ pub fn wasmplugin_ai_proxy(obj: &Object) -> Vec<ProviderToken> {
     let mut out = Vec::new();
     if let Some(rules) = spec.get("matchRules").and_then(|r| r.as_array()) {
         for rule in rules {
+            // R-10 / C1.
+            warn_unknown_keys(
+                rule,
+                &["config", "service", "ingress", "domain", "configDisable"],
+                "gpustack-ai-proxy matchRule",
+            );
             let active = rule
                 .get("config")
                 .and_then(|c| c.get("activeProviderId"))
@@ -869,22 +938,44 @@ pub fn secret_to_tls_host(obj: &Object) -> Option<TlsHost> {
 pub fn configmap_to_timing(obj: &Object) -> Option<TimingConfig> {
     let data = obj.value.get("data").and_then(|d| d.as_object())?;
     let mut cfg = TimingConfig::default();
+    // R-10 / C1: only the `higress` YAML document (and the flat timeout
+    // fallbacks below) are consumed; other data keys are envoy-tuning keys that
+    // Hygress does not reproduce — surface them once.
+    let flat_known = ["higress", "downstream.idleTimeout", "upstream.idleTimeout", "maxRequestHeadersKb"];
+    let unknown_flat: Vec<String> = data
+        .keys()
+        .filter(|k| !flat_known.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if !unknown_flat.is_empty() {
+        tracing::warn!(
+            what = "higress-config data",
+            unknown_keys = ?unknown_flat,
+            "unconsumed ConfigMap keys (C1) — only the timeout document is honored"
+        );
+    }
 
     // ---- preferred source: the `higress` YAML document (the real GPUStack shape) ----
     let (yml_down, yml_up, yml_max): (Option<u64>, Option<u64>, Option<u64>) =
         match data.get("higress").and_then(|v| v.as_str()) {
             Some(document) => match serde_yaml::from_str::<serde_yaml::Value>(document) {
-                Ok(m) => (
-                    m.get("downstream")
-                        .and_then(|d| d.get("idleTimeout"))
-                        .and_then(|v| v.as_u64()),
-                    m.get("upstream")
-                        .and_then(|u| u.get("idleTimeout"))
-                        .and_then(|v| v.as_u64()),
-                    m.get("downstream")
-                        .and_then(|d| d.get("maxRequestHeadersKb"))
-                        .and_then(|v| v.as_u64()),
-                ),
+                Ok(m) => {
+                    // (R-10/C1 for the flat map is emitted above; the YAML
+                    // document is serde_yaml::Value — its extra sections
+                    // (mesh/tracing/gzip/…) are covered by the timing
+                    // not-enforced warning at bind.)
+                    (
+                        m.get("downstream")
+                            .and_then(|d| d.get("idleTimeout"))
+                            .and_then(|v| v.as_u64()),
+                        m.get("upstream")
+                            .and_then(|u| u.get("idleTimeout"))
+                            .and_then(|v| v.as_u64()),
+                        m.get("downstream")
+                            .and_then(|d| d.get("maxRequestHeadersKb"))
+                            .and_then(|v| v.as_u64()),
+                    )
+                }
                 Err(e) => {
                     tracing::warn!("higress-config: could not parse 'higress' YAML: {e}");
                     (None, None, None)
@@ -960,6 +1051,14 @@ pub fn build_config_data(objects: &[Object], gateway_namespace: &str, mirror_nam
                 Err(e) => tracing::warn!(bridge = %obj.name, "dropping mcpbridge on translation: {e}"),
             },
             ObjectKind::WasmPlugin => {
+                // R-10 / C1: a MANAGED plugin outside the known set is one
+                // Hygress does not reproduce natively — surface it (fail-open).
+                if !KNOWN_WASM_PLUGINS.contains(&obj.name.as_str()) && obj.is_managed() {
+                    tracing::warn!(
+                        plugin = %obj.name,
+                        "managed WasmPlugin is not reproduced natively by Hygress (C1); its behavior will differ from GPUStack"
+                    );
+                }
                 features.push(wasmplugin_to_feature(obj));
                 // The model-router (generic-proxy-router) `defaultConfig` is typed and
                 // hot-reloadable; last-wins across puids (plugin absent -> default).
@@ -1713,8 +1812,8 @@ upstream:
         assert_eq!(f.priority, 800);
         assert!(f.fail_open);
         assert!(!f.default_config_disable);
-        // Opaque spec payload retained.
-        assert_eq!(f.config.get("url").and_then(|v| v.as_str()), Some("http://127.0.0.1:8080/plugins/gpustack-model-mapper/1.0.0/plugin.wasm"));
+        // R-9①: the opaque `defaultConfig` spec is NOT retained (it could carry
+        // provider apiTokens / the derived gateway token).
     }
 
     // ----- model-router (generic-proxy-router) defaultConfig ----

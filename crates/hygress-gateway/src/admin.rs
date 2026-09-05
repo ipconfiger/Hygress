@@ -40,6 +40,9 @@ pub struct AdminState {
     /// `false` on failure (last-known-good kept). `None` ⇒ `/reload` reports
     /// 501 (reload not wired).
     pub reloader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The control-plane snapshot holder for `GET /config` (R-4 / C4).
+    /// `None` ⇒ `/config` reports 503 (not wired).
+    pub shared: Option<Arc<hygress_core::SharedConfig>>,
 }
 
 impl AdminState {
@@ -53,7 +56,14 @@ impl AdminState {
             metrics,
             admin_token,
             reloader,
+            shared: None,
         }
+    }
+
+    /// Attach the control-plane snapshot holder for `GET /config` (R-4 / C4).
+    pub fn with_config_shared(mut self, shared: Arc<hygress_core::SharedConfig>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// Extract the `Authorization: Bearer <token>` value, if present.
@@ -111,9 +121,127 @@ impl AdminState {
                     self.metrics.encode(),
                 )
             }
+            ("GET", "/config") => {
+                // C4 (R-4): introspect the current control-plane snapshot
+                // (redacted summary). Token-gated, fail-closed like /reload.
+                if !self.authorized(headers) {
+                    return AdminResp::json(401, "unauthorized", "missing or invalid admin token");
+                }
+                match &self.shared {
+                    Some(shared) => AdminResp::new(
+                        200,
+                        "application/json; charset=utf-8",
+                        config_summary_json(shared),
+                    ),
+                    None => AdminResp::json(503, "config_unavailable", "config introspection not wired"),
+                }
+            }
             _ => AdminResp::json(404, "not_found", "unknown path"),
         }
     }
+}
+
+/// Redacted JSON summary of the current control-plane snapshot (GET /config).
+///
+/// **Never** includes: provider `api_tokens`, TLS `key_pem`/`cert_pem` payloads
+/// (TLS hosts are shown as a sha256 fingerprint of the cert only), or the raw
+/// WasmPlugin spec (which carried the derived `X-GPUStack-Auth-Token`).
+fn config_summary_json(shared: &hygress_core::SharedConfig) -> String {
+    use serde_json::json;
+    let data = shared.load();
+    let routes: Vec<serde_json::Value> = data
+        .routes
+        .iter()
+        .map(|r| {
+            let kind = match r.kind {
+                hygress_core::RouteKind::Main => "main",
+                hygress_core::RouteKind::Fallback => "fallback",
+                hygress_core::RouteKind::Mirror => "mirror",
+            };
+            json!({
+                "kind": kind,
+                "key": r.key,
+                "ingress_name": r.ingress_name,
+                "path_predicates": r.path_predicates.len(),
+                "destinations": r.destinations.len(),
+                "auth": r.auth_scope.enabled,
+                "fallback": r.fallback.as_ref().map(|f| f.target_key.as_str()),
+            })
+        })
+        .collect();
+    let registries: Vec<serde_json::Value> = data
+        .registries
+        .iter()
+        .map(|reg| json!({ "id": reg.id, "domain": reg.domain, "port": reg.port }))
+        .collect();
+    let proxies: Vec<serde_json::Value> = data
+        .proxies
+        .iter()
+        .map(|p| {
+            json!({ "name": p.name, "server_address": p.server_address, "server_port": p.server_port })
+        })
+        .collect();
+    let tls: Vec<serde_json::Value> = data
+        .tls
+        .hosts
+        .iter()
+        .map(|h| {
+            // sha256 fingerprint of the cert PEM — the key/cert payloads are
+            // never exposed.
+            let fp = sha256_short(&h.cert_pem);
+            json!({ "host": h.host, "is_default": h.is_default, "cert_sha256_prefix12": fp })
+        })
+        .collect();
+    let features: Vec<serde_json::Value> = data
+        .features
+        .iter()
+        .map(|f| {
+            json!({
+                "plugin": f.plugin,
+                "phase": f.phase,
+                "priority": f.priority,
+                "fail_open": f.fail_open,
+                "default_config_disable": f.default_config_disable,
+            })
+        })
+        .collect();
+    let provider_tokens: Vec<serde_json::Value> = data
+        .provider_tokens
+        .iter()
+        .map(|t| json!({ "service": t.service, "ingress_scope": t.ingress_scope }))
+        .collect();
+    let body = json!({
+        "routes": routes,
+        "registries": registries,
+        "proxies": proxies,
+        "tls_hosts": tls,
+        "features": features,
+        "provider_tokens": provider_tokens,
+        "timing": {
+            "downstream_idle_timeout_secs": data.timing.downstream_idle_timeout_secs,
+            "upstream_idle_timeout_secs": data.timing.upstream_idle_timeout_secs,
+        },
+        "model_router": {
+            "prefix": data.model_router.prefix,
+            "target_header": data.model_router.target_header,
+            "alias_count": data.model_router.alias_name_mapping.len(),
+            "suffix_count": data.model_router.enable_on_path_suffix.len(),
+        },
+        "snapshot_counters": {
+            "reject_total": shared.snapshot_reject_total.load(std::sync::atomic::Ordering::Relaxed),
+            "object_skipped_total": shared.snapshot_skipped_total.load(std::sync::atomic::Ordering::Relaxed),
+        },
+    });
+    serde_json::to_string(&body).unwrap_or_else(|_| r#"{"error":"serialize"}"#.to_string())
+}
+
+/// First 12 hex chars of the sha256 of `bytes` (a short, non-reversible
+/// content fingerprint for `GET /config` TLS redaction).
+fn sha256_short(bytes: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes.as_bytes());
+    hex::encode(hasher.finalize())[..12].to_string()
 }
 
 /// One admin response (status + content-type + body), produced by the pure
@@ -171,6 +299,11 @@ impl ServeHttp for AdminService {
         *out.status_mut() = status;
         if let Ok(ct) = resp.content_type.parse() {
             out.headers_mut().insert(header::CONTENT_TYPE, ct);
+        }
+        // R-8 (P1 nitpick): frame the fixed-size response so the writer is not
+        // close-delimited (keeps the admin connection reusable).
+        if let Ok(cl) = http::header::HeaderValue::from_str(&out.body().len().to_string()) {
+            out.headers_mut().insert(header::CONTENT_LENGTH, cl);
         }
         out
     }
@@ -290,5 +423,72 @@ mod tests {
         let s = state(None);
         assert_eq!(s.route("GET", "/nope", &h()).status, 404);
         assert_eq!(s.route("DELETE", "/healthz", &h()).status, 404);
+    }
+
+    // ----- C4 / R-4: GET /config (token-gated, redacted) -----
+
+    fn state_with_shared(token: Option<&str>) -> AdminState {
+        use hygress_core::prelude::{ProviderToken, TlsConfig, TlsHost};
+        let data = hygress_core::ConfigData {
+            provider_tokens: vec![ProviderToken {
+                service: "provider-1.proxy".into(),
+                ingress_scope: None,
+                api_tokens: vec!["sk-TOP-SECRET".into()],
+            }],
+            tls: TlsConfig {
+                hosts: vec![TlsHost {
+                    host: "api.example.com".into(),
+                    is_default: true,
+                    cert_pem: "-----BEGIN CERTIFICATE-----\nSECRETCERT\n-----END CERTIFICATE-----".into(),
+                    key_pem: "-----BEGIN PRIVATE KEY-----\nSECRETKEY\n-----END PRIVATE KEY-----".into(),
+                }],
+            },
+            ..Default::default()
+        };
+        let shared = hygress_core::SharedConfig::new(data).unwrap();
+        AdminState::new(
+            Arc::new(Metrics::new()),
+            token.map(str::to_string),
+            None,
+        )
+        .with_config_shared(Arc::new(shared))
+    }
+
+    #[test]
+    fn config_is_token_gated() {
+        let s = state_with_shared(None);
+        assert_eq!(s.route("GET", "/config", &h()).status, 401);
+        let s2 = state_with_shared(Some("tk"));
+        let mut ok = h();
+        ok.insert("authorization", "Bearer tk");
+        let r = s2.route("GET", "/config", &ok);
+        assert_eq!(r.status, 200);
+        assert!(r.content_type.contains("application/json"));
+        assert!(r.body.contains("\"routes\""));
+        assert!(r.body.contains("\"tls_hosts\""));
+    }
+
+    #[test]
+    fn config_redacts_secrets() {
+        let s = state_with_shared(Some("tk"));
+        let mut ok = h();
+        ok.insert("authorization", "Bearer tk");
+        let body = s.route("GET", "/config", &ok).body;
+        // Secrets must not leak into the dump.
+        assert!(!body.contains("sk-TOP-SECRET"));
+        assert!(!body.contains("SECRETKEY"));
+        assert!(!body.contains("SECRETCERT"));
+        assert!(!body.contains("-----BEGIN"));
+        // The TLS fingerprint field IS present (sha256 short).
+        assert!(body.contains("cert_sha256_prefix12"));
+        assert!(body.contains("api.example.com"));
+    }
+
+    #[test]
+    fn config_unwired_reports_503() {
+        let s = state(Some("tk"));
+        let mut ok = h();
+        ok.insert("authorization", "Bearer tk");
+        assert_eq!(s.route("GET", "/config", &ok).status, 503);
     }
 }

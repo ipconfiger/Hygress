@@ -179,6 +179,31 @@ pub fn rewrite_model_field(
     }
 }
 
+/// `true` when the body's top-level `model` value already equals `value`
+/// (R-5 identity short-circuit): the stage-② overwrite can skip the full-body
+/// splice when the resolved value is already present. One bounded scan; no
+/// output allocation.
+pub fn model_field_equals(
+    body: &Bytes,
+    content_type: Option<&str>,
+    model_key: &str,
+    value: &str,
+) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    if is_json(content_type) {
+        match scan_top_level_value(body, model_key) {
+            Ok(Some(v)) => v.decoded.as_deref() == Some(value),
+            _ => false,
+        }
+    } else if let Some(boundary) = parse_boundary(content_type) {
+        extract_multipart_model(body, &boundary).as_deref() == Some(value)
+    } else {
+        false
+    }
+}
+
 /// `true` when a multipart part header block carries `name="model"`.
 fn contains_field(header: &[u8], field: &str) -> bool {
     let needle = format!("name=\"{field}\"");

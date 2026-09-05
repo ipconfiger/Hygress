@@ -91,6 +91,10 @@ impl ServeHttp for StatsService {
         if let Ok(ct) = resp.content_type.parse() {
             out.headers_mut().insert(header::CONTENT_TYPE, ct);
         }
+        // R-8 (P1 nitpick): frame the fixed-size response (reusable connection).
+        if let Ok(cl) = http::header::HeaderValue::from_str(&out.body().len().to_string()) {
+            out.headers_mut().insert(header::CONTENT_LENGTH, cl);
+        }
         out
     }
 }

@@ -12,9 +12,14 @@
 //! - **Write-back** (response → request), parsed from **headers only** (the body is never read):
 //!   `X-Mse-Consumer` → consumer, `Authorization` → authorization, `cookie` → set_cookie,
 //!   `x-gpustack-auth-cache` (`AUTH_CACHE_HEADER`) → auth_cache.
-//! - **FAIL_OPEN**: transport error or a 5xx response → `Ok(None)` (pass-through, no verdict). A
-//!   2xx → `Ok(Some(VERDICT authenticated=true))`; any other status (3xx/4xx) →
-//!   `Ok(Some(VERDICT authenticated=false))` (a real rejection, not a fail-open).
+//! - **FAIL_OPEN / availability** (R-12): a transport error or a 5xx response
+//!   → `Ok(None)` ("no verdict — the auth service is unavailable"). Whether
+//!   that becomes a rejection (default: 403, matching GPUStack/Higress
+//!   `failure_mode_allow=false`) or the legacy fail-open is the **gateway's**
+//!   configured `HYGRESS_EXT_AUTH_FAIL_MODE` — the egress contract only reports
+//!   the availability gap. A 2xx → `Ok(Some(VERDICT authenticated=true))`; any
+//!   other status (3xx/4xx) → `Ok(Some(VERDICT authenticated=false))` (a real
+//!   rejection, not a fail-open).
 //! - **Timeout**: 30 s overall (`HIGRESS_EXT_AUTH_TIMEOUT_MS` default).
 //!
 //! No mock in impl: real HTTP via `reqwest`; transport failures are genuine connect/read errors that

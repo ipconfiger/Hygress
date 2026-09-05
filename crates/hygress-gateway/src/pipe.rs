@@ -362,10 +362,23 @@ impl ProxyHttp for HygressProxy {
                 if let Some(client) = state.auth.as_ref() {
                     let outcome =
                         crate::pipeline::auth::authenticate(client, &prepared.base_headers).await;
-                    state.metrics.record_auth(match &outcome {
-                        crate::pipeline::auth::AuthOutcome::Allowed { .. } => "allowed",
-                        crate::pipeline::auth::AuthOutcome::Denied => "denied",
-                    });
+                    match &outcome {
+                        crate::pipeline::auth::AuthOutcome::Allowed { .. } => {
+                            state.metrics.record_auth("allowed");
+                        }
+                        crate::pipeline::auth::AuthOutcome::Denied => {
+                            state.metrics.record_auth("denied");
+                        }
+                        crate::pipeline::auth::AuthOutcome::AuthServiceUnavailable => {
+                            // R-12: distinguish the availability failure mode in
+                            // the metrics.
+                            state.metrics.record_auth(if state.auth_fail_closed {
+                                "auth_service_unavailable_denied"
+                            } else {
+                                "auth_service_unavailable_allowed"
+                            });
+                        }
+                    }
                     match outcome {
                         crate::pipeline::auth::AuthOutcome::Denied => {
                             return short_circuit(session, 401, "auth_denied").await;
@@ -377,6 +390,23 @@ impl ProxyHttp for HygressProxy {
                                 }
                             }
                             auth_writeback = write_back;
+                        }
+                        crate::pipeline::auth::AuthOutcome::AuthServiceUnavailable => {
+                            // R-12: `/token-auth` unreachable / 5xx.
+                            if state.auth_fail_closed {
+                                // Default: reject, matching the GPUStack/Higress
+                                // `failure_mode_allow=false` behavior (403,
+                                // `status_on_error`).
+                                return short_circuit_typed(
+                                    session,
+                                    403,
+                                    "ext_auth_unavailable",
+                                    "external auth service unavailable",
+                                    &HeaderMap::new(),
+                                )
+                                .await;
+                            }
+                            // Legacy fail-open: proceed without write-back.
                         }
                     }
                 }
@@ -498,6 +528,11 @@ impl ProxyHttp for HygressProxy {
                 },
                 None => prepared.route.retry.clone(),
             };
+            // R-1: `tries` = retries allowed AFTER the first attempt (Envoy
+            // `num_retries` semantics, GPUStack writes 2). The loop may advance
+            // past candidate `i` only while `i < tries`; `tries == 0` disables
+            // failover (e.g. a policy `retries: 0`).
+            let retry_cap = retry_policy.tries;
             let mut last: Option<Final> = None;
             // The candidate that produced the terminal non-2xx (NB7 usage
             // attribution: model_id / provider_id parse from its service name —
@@ -550,8 +585,13 @@ impl ProxyHttp for HygressProxy {
                             ctx.status = status;
                             return Ok(true);
                         }
-                        // Non-2xx: retry the next candidate when the policy allows.
+                        // Non-2xx: retry the next candidate only when the
+                        // retry budget allows AND the failure is in the
+                        // policy's trigger set (R-1: `non_idempotent` is a
+                        // gate, not a trigger — 4xx outside the list is never
+                        // retried).
                         if !is_last
+                            && (i as u32) < retry_cap
                             && retry_policy.should_retry(Some(status), false, false, non_idempotent)
                         {
                             state.metrics.record_retry();
@@ -566,8 +606,13 @@ impl ProxyHttp for HygressProxy {
                     }
                     Err(e) => {
                         state.metrics.record_upstream_error();
+                        // R-1: report a reqwest timeout as `timed_out` so the
+                        // policy's `timeout` condition can trigger (previously
+                        // it never fired).
+                        let timed_out = e.is_timeout();
                         if !is_last
-                            && retry_policy.should_retry(None, true, false, non_idempotent)
+                            && (i as u32) < retry_cap
+                            && retry_policy.should_retry(None, true, timed_out, non_idempotent)
                         {
                             state.metrics.record_retry();
                             debug!(error = %e, candidate = %candidate.service_name, "transport failure; trying next candidate");
@@ -1514,8 +1559,12 @@ fn usage_fields(ut: &crate::context::UsageTarget, prepared: &PreparedRequest, se
     }
 }
 
-/// Parse `X-Mse-Consumer` = `<access_key>.gpustack-<user_id>` (or the `none`
-/// sentinel) into (`user_id`, `access_key`) for usage attribution.
+/// Parse `X-Mse-Consumer` into (`user_id`, `access_key`) for usage attribution.
+///
+/// GPUStack `server_auth` (token.py) composes the consumer as
+/// `access_key.gpustack-<user_id>` when an API key was used, or the bare
+/// `gpustack-<user_id>` when the user authenticated without a key (R-4 /
+/// B1 addendum), or the literal sentinel `none` for no-key/public requests.
 fn parse_consumer(consumer: &str) -> (Option<u64>, Option<String>) {
     if consumer.is_empty() || consumer.eq_ignore_ascii_case("none") {
         return (None, None);
@@ -1524,6 +1573,9 @@ fn parse_consumer(consumer: &str) -> (Option<u64>, Option<String>) {
         let access_key = consumer[..idx].to_string();
         let user_id = consumer[idx + ".gpustack-".len()..].parse::<u64>().ok();
         (user_id, Some(access_key))
+    } else if let Some(uid) = consumer.strip_prefix("gpustack-") {
+        // User authenticated without an API key: `gpustack-<user.id>`.
+        (uid.parse::<u64>().ok(), None)
     } else {
         // No `.gpustack-` marker: treat the whole value as the access key.
         (None, Some(consumer.to_string()))
@@ -1699,8 +1751,40 @@ mod tests {
 
     // ----- B1: parse_instance_ids (model_id / provider_id attribution) -----
 
+    // ----- B1 addendum: parse_consumer (X-Mse-Consumer attribution) -----
+
     #[test]
-    fn parses_model_instance_id() {
+    fn consumer_parses_key_dot_user_form() {
+        // `access_key.gpustack-<user.id>` (API-key auth).
+        assert_eq!(parse_consumer("sk-ak.gpustack-7"), (Some(7), Some("sk-ak".to_string())));
+        assert_eq!(
+            parse_consumer("123.gpustack-42"),
+            (Some(42), Some("123".to_string()))
+        );
+    }
+
+    #[test]
+    fn consumer_parses_bare_user_form() {
+        // `gpustack-<user.id>` — user authenticated WITHOUT an API key
+        // (GPUStack server_auth: access_key is None then, so the consumer is
+        // the bare prefix form).
+        assert_eq!(parse_consumer("gpustack-7"), (Some(7), None));
+        assert_eq!(parse_consumer("gpustack-0"), (Some(0), None));
+    }
+
+    #[test]
+    fn consumer_sentinels_and_unknown_forms() {
+        assert_eq!(parse_consumer(""), (None, None));
+        assert_eq!(parse_consumer("none"), (None, None));
+        assert_eq!(parse_consumer("NONE"), (None, None));
+        // No marker: the whole value is treated as an access key.
+        assert_eq!(parse_consumer("raw-key"), (None, Some("raw-key".to_string())));
+        // A non-numeric user id yields user_id None but keeps the access key.
+        assert_eq!(parse_consumer("ak.gpustack-x"), (None, Some("ak".to_string())));
+    }
+
+    #[test]
+    fn consumer_parses_model_instance_id() {
         // `model-<model_id>-<instance_id>.<type>` (contract-pin §4.4).
         assert_eq!(parse_instance_ids("model-1-10.static"), (Some(1), None));
         assert_eq!(parse_instance_ids("model-12-45.dns"), (Some(12), None));

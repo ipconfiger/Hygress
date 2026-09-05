@@ -248,11 +248,13 @@ impl Controller {
                 _ = &mut notified => {}
                 _ = tokio::time::sleep(fallback_tick) => {}
             }
-            // A burst of events collapses into one reconcile (`swap` is the debounce); the
-            // rv-fingerprint short-circuit inside `sync_once` then no-ops if nothing changed.
-            if dirty.swap(false, Ordering::Relaxed) {
-                self.sync_once(&client).await;
-            }
+            // R-2: reconcile on EVERY wake (event burst debounced by `dirty`, or the
+            // low-frequency safety-net tick). The rv-fingerprint short-circuit inside
+            // `sync_once` no-ops on a genuinely unchanged snapshot, and a rejected /
+            // failed LIST is retried by the next wake (the old fingerprint is kept on
+            // failure, so the same snapshot is re-attempted rather than skipped forever).
+            dirty.swap(false, Ordering::Relaxed);
+            self.sync_once(&client).await;
         }
 
         // Abort the (infinite, self-healing) watcher tasks so they don't leak past `run`.
@@ -342,10 +344,16 @@ impl Controller {
     }
 
     /// One poll iteration: LIST → fingerprint short-circuit → translate → store; keep
-    /// last-known-good on failure. When the fingerprint is unchanged since the last tick, the
-    /// expensive translate + store (and the downstream RouteTable/regex rebuild) are skipped
-    /// entirely (P4). The fingerprint is always advanced after a successful LIST (changed or
-    /// not); a LIST failure leaves it untouched and retries next tick.
+    /// last-known-good on failure. When the fingerprint is unchanged since the last
+    /// successful store, the expensive translate + store (and the downstream
+    /// RouteTable/regex rebuild) are skipped entirely (P4).
+    ///
+    /// R-2 (convergence): the fingerprint is advanced **only after a successful
+    /// `store`**. A structurally rejected snapshot therefore leaves the OLD
+    /// fingerprint in place, so the next wake re-attempts the same (changed)
+    /// snapshot instead of the fingerprint short-circuit skipping it forever; a
+    /// LIST/transport failure likewise keeps the old fingerprint (retried on the
+    /// next wake, which now reconciles unconditionally on every wake).
     async fn sync_once(&self, client: &client::Client) {
         let prev = self.lock_fingerprint().clone();
         let (fp, data) = match snapshot::build_snapshot(
@@ -359,24 +367,30 @@ impl Controller {
             Ok(r) => r,
             Err(e) => {
                 // Transport / LIST failure: keep last-known-good (snapshot AND fingerprint),
-                // retry next tick.
+                // retry on the next wake.
                 tracing::warn!("snapshot LIST failed; keeping last-known-good: {e}");
                 return;
             }
         };
 
-        // Always record the fingerprint we just LISTed (changed or not) so the next tick
-        // compares against the latest state.
-        *self.lock_fingerprint() = Some(fp);
-
-        // Unchanged since the last pass: skip the translate + store entirely.
+        // Unchanged since the last successful pass: skip the translate + store entirely
+        // (fp == prev; the fingerprint is already correct — no advance needed).
         let Some(data) = data else {
             tracing::debug!("snapshot unchanged (fingerprint match); skipping rebuild");
             return;
         };
 
         match self.shared.store(data) {
-            Ok(()) => {
+            Ok(dropped) => {
+                // R-4: surface per-object validation skips (previously silent).
+                if dropped > 0 {
+                    tracing::warn!(
+                        skipped = dropped,
+                        "snapshot stored with per-object validation skips (see core config validation)"
+                    );
+                }
+                // Advance the fingerprint ONLY on a successful store (R-2).
+                *self.lock_fingerprint() = Some(fp);
                 let notified = self
                     .ready_notified
                     .compare_exchange(
@@ -393,6 +407,8 @@ impl Controller {
             }
             Err(issues) => {
                 // Structural failure: reject the whole snapshot, keep last-known-good.
+                // The fingerprint is NOT advanced, so the next wake re-attempts it
+                // (retry-next-tick, R-2) rather than skipping it forever.
                 tracing::warn!(
                     "snapshot structurally rejected; keeping last-known-good: {issues:?}"
                 );

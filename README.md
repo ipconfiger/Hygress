@@ -8,7 +8,7 @@
   **升级延伸能力已实现并通过真机 e2e**
 - 数据面：Pingora terminate-mode（单二进制，无 Wasm 运行时 / 无 Envoy）
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
-- 质量：**492 个测试全绿**（基线 368 + 延伸能力 124）· clippy 0 警告 · **零 mock/stub** ·
+- 质量：**538 个测试全绿（审计修复批 B1-B3 后实测；此前 492 为修复前快照）**· clippy 0 警告（all-targets 双模式）· **零 mock/stub** ·
   经多轮 oracle 高精度交叉审核（Gate-1/Gate-2 9/10；升级设计两轮无阻塞；升级实现二轮 BLOCK 闭环）
 - **延伸能力**：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 1s 热重载 +
   admin `/reload`；真机验证：限流 429/配额 429/护栏 403 实际生效）
@@ -186,6 +186,9 @@ gpustack-server:
 | `HYGRESS_POLICY_PATH` | `/etc/hygress/policy.yaml` | 延伸能力配置文件路径（限流/配额/路由策略/护栏） |
 | `HYGRESS_QUOTA_K` | 4 | token 配额预留估算分母（`est = ceil(body_bytes / K)`） |
 | `HYGRESS_GUARDRAIL_URL` | 无 | LLM 护栏判定服务 URL（未设置 ⇒ LLM 护栏未配置 → 直通） |
+| `HYGRESS_EXT_AUTH_FAIL_MODE` | `closed` | `/token-auth` 不可达/5xx 时：`closed`（默认，403，对齐 GPUStack/Higress `failure_mode_allow=false` 基线）；`open`=旧版 fail-open |
+| `KUBECONFIG`（或 launcher `HYGRESS_KUBECONFIG`） | `${EMBEDDED_KUBECONFIG_PATH}` 兜底文件 | 控制面 kubeconfig（launcher 已双名镜像导出） |
+| `GATEWAY_TLS_PORT` | 443（取 `GATEWAY_HTTPS_PORT` 兼容） | 数据面 TLS 端口（launcher 已双名镜像导出） |
 
 ### 4.4 验证（真机验证矩阵）
 

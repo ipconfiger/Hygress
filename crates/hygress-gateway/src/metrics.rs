@@ -2,10 +2,75 @@
 //! [`Registry`]; the admin `/metrics` (and the 15020 shallow-compat `/stats/
 //! prometheus`) scrape it. Counters/histograms are real — no stubs.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use prometheus::core::Collector;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto;
 use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder};
+
+/// A custom prometheus [`Collector`] that publishes the two core control-plane
+/// snapshot counters ([`hygress_core::SharedConfig::snapshot_reject_total`] /
+/// `snapshot_skipped_total`, R-4) at scrape time. The counters live on the
+/// core `SharedConfig` (incremented by the adapter's store path without any
+/// prometheus dependency); this collector only *reads* the atomics.
+pub struct ConfigSnapshotCollector {
+    shared: Arc<hygress_core::SharedConfig>,
+    reject: Desc,
+    skipped: Desc,
+}
+
+const REJECT_NAME: &str = "hygress_config_reject_total";
+const REJECT_HELP: &str = "Control-plane snapshots rejected as a whole (structural, keep-last-known-good).";
+const SKIPPED_NAME: &str = "hygress_config_object_skipped_total";
+const SKIPPED_HELP: &str = "Control-plane objects skipped by per-object validation.";
+
+fn snapshot_desc(name: &str, help: &str) -> Desc {
+    Desc::new(
+        name.to_string(),
+        help.to_string(),
+        Vec::new(),
+        std::collections::HashMap::new(),
+    )
+    .expect("config counter desc")
+}
+
+impl ConfigSnapshotCollector {
+    pub fn new(shared: Arc<hygress_core::SharedConfig>) -> Self {
+        Self {
+            shared,
+            reject: snapshot_desc(REJECT_NAME, REJECT_HELP),
+            skipped: snapshot_desc(SKIPPED_NAME, SKIPPED_HELP),
+        }
+    }
+}
+
+impl Collector for ConfigSnapshotCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.reject, &self.skipped]
+    }
+
+    fn collect(&self) -> Vec<proto::MetricFamily> {
+        let reject = self.shared.snapshot_reject_total.load(Ordering::Relaxed);
+        let skipped = self.shared.snapshot_skipped_total.load(Ordering::Relaxed);
+        vec![
+            counter_family(REJECT_NAME, REJECT_HELP, reject),
+            counter_family(SKIPPED_NAME, SKIPPED_HELP, skipped),
+        ]
+    }
+}
+
+fn counter_family(name: &str, help: &str, value: u64) -> proto::MetricFamily {
+    let mut f = proto::MetricFamily::default();
+    f.set_name(name.to_string());
+    f.set_help(help.to_string());
+    let mut metric = proto::Metric::default();
+    let mut counter = proto::Counter::default();
+    counter.set_value(value as f64);
+    metric.set_counter(counter);
+    f.set_metric(vec![metric]);
+    f
+}
 
 /// Central metrics handle. All recording methods are cheap (lazy label vec);
 /// clone the handle (`Arc<Metrics>`) per request.
@@ -32,6 +97,9 @@ struct Inner {
     quota_soft_exceed: IntCounter,
     policy_applied: IntCounterVec,
     guardrail_blocked: IntCounterVec,
+    // R-11 (C3): TLS rotation detection (0.8 = no hot reload → restart needed).
+    tls_cert_change_detected: IntCounter,
+    tls_cert_requires_restart: IntCounter,
 }
 
 impl Metrics {
@@ -124,6 +192,17 @@ impl Metrics {
             &["side"],
         )
         .expect("guardrail_blocked");
+        // R-11 (C3): TLS rotation detection counters.
+        let tls_cert_change_detected = IntCounter::new(
+            "hygress_tls_cert_change_detected_total",
+            "Control-plane TLS content fingerprint changes detected at runtime.",
+        )
+        .expect("tls_cert_change_detected");
+        let tls_cert_requires_restart = IntCounter::new(
+            "hygress_tls_cert_requires_restart_total",
+            "TLS rotation events that require a container restart (pingora 0.8 has no hot reload).",
+        )
+        .expect("tls_cert_requires_restart");
 
         let collectors: Vec<Box<dyn Collector>> = vec![
             Box::new(requests_total.clone()),
@@ -140,6 +219,8 @@ impl Metrics {
             Box::new(quota_soft_exceed.clone()),
             Box::new(policy_applied.clone()),
             Box::new(guardrail_blocked.clone()),
+            Box::new(tls_cert_change_detected.clone()),
+            Box::new(tls_cert_requires_restart.clone()),
         ];
         for c in collectors {
             registry.register(c).expect("metric registration");
@@ -162,6 +243,8 @@ impl Metrics {
                 quota_soft_exceed,
                 policy_applied,
                 guardrail_blocked,
+                tls_cert_change_detected,
+                tls_cert_requires_restart,
             }),
         }
     }
@@ -256,6 +339,26 @@ impl Metrics {
             .inc();
     }
 
+    /// R-11 (C3): a TLS content fingerprint change was detected at runtime.
+    pub fn record_tls_cert_change_detected(&self) {
+        self.inner.tls_cert_change_detected.inc();
+    }
+
+    /// R-11 (C3): a TLS rotation event requiring a container restart (pingora
+    /// 0.8 has no hot reload).
+    pub fn record_tls_cert_requires_restart(&self) {
+        self.inner.tls_cert_requires_restart.inc();
+    }
+
+    /// Register an additional (custom) collector into this instance's registry
+    /// (R-4: the config reject/skip counters from core). A duplicate / invalid
+    /// registration is ignored (logged via the returned error, if any).
+    pub fn add_collector(&self, collector: Box<dyn Collector>) {
+        if let Err(e) = self.inner.registry.register(collector) {
+            tracing::warn!("registering config snapshot collector: {e}");
+        }
+    }
+
     /// Render all metrics in Prometheus text exposition format.
     pub fn encode(&self) -> String {
         let metric_families = self.inner.registry.gather();
@@ -285,5 +388,60 @@ mod tests {
         assert!(out.contains("hygress_requests_total"));
         assert!(out.contains("hygress_tokens_total"));
         assert!(out.contains("hygress_fallback_total"));
+    }
+
+    #[test]
+    fn config_snapshot_collector_exposes_core_counters() {
+        use hygress_core::prelude::{Destination, PathPred, RouteKind, RouteRule};
+        // Bump the core counters through real store calls.
+        let shared = Arc::new(hygress_core::SharedConfig::new(hygress_core::ConfigData::default()).unwrap());
+        // Per-object skips (bad empty-key route dropped, good kept).
+        let skipped = shared
+            .store(hygress_core::ConfigData {
+                routes: vec![
+                    RouteRule {
+                        key: String::new(),
+                        ..RouteRule::new(
+                            "m",
+                            RouteKind::Main,
+                            vec![PathPred::new("/")],
+                            vec![Destination::new("a.static:80")],
+                        )
+                        .unwrap()
+                    },
+                    RouteRule::new(
+                        "good",
+                        RouteKind::Main,
+                        vec![PathPred::new("/")],
+                        vec![Destination::new("b.static:80")],
+                    )
+                    .unwrap(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(skipped, 1);
+        // Structural rejection bumps the reject counter.
+        let structural = hygress_core::ConfigData {
+            routes: vec![RouteRule::new(
+                "bad",
+                RouteKind::Main,
+                vec![PathPred::new("([unclosed")],
+                vec![Destination::new("a.static:80")],
+            )
+            .unwrap()],
+            ..Default::default()
+        };
+        assert!(shared.store(structural).is_err());
+
+        let m = Metrics::new();
+        m.add_collector(Box::new(ConfigSnapshotCollector::new(shared.clone())));
+        let out = m.encode();
+        assert!(out.contains("hygress_config_reject_total"));
+        assert!(out.contains("hygress_config_object_skipped_total"));
+        // The prometheus text lines carry the values: NAME 1 / NAME 2 pattern
+        // (unlabeled counters: "NAME 1" or "NAME 2").
+        assert!(out.lines().any(|l| l.starts_with("hygress_config_reject_total") && l.ends_with('1')));
+        assert!(out.lines().any(|l| l.starts_with("hygress_config_object_skipped_total") && l.ends_with('1')));
     }
 }

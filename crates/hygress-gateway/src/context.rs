@@ -293,9 +293,17 @@ pub struct PreparedRequest {
 pub struct GatewayState {
     /// Hot-reload config centre (`ArcSwap<ConfigData>` + per-route-group SWRR).
     pub config: Arc<SharedConfigHandle>,
+    /// The SNI certificate store (fed from `Secret gpustack-tls-*`; R-9⑤ —
+    /// snapshot-reflected on bind for a future pingora SNI resolver; pingora
+    /// 0.8 serves the default-cert PEM on the listener).
+    pub tls: crate::tls_store::SniStore,
     /// Forward-auth client (`GET /token-auth`); `None` when auth is disabled.
     /// Contract: `hygress_egress::forward_auth::{Client, ForwardAuthRequest, ForwardAuthVerdict}`.
     pub auth: Option<std::sync::Arc<hygress_egress::forward_auth::Client>>,
+    /// R-12: reject when `/token-auth` is unavailable/5xx (`true`, default,
+    /// matches GPUStack/Higress `failure_mode_allow=false`); `false` =
+    /// legacy fail-open. Env `HYGRESS_EXT_AUTH_FAIL_MODE`.
+    pub auth_fail_closed: bool,
     /// Usage sink (`POST /v2/usage/gateway-metrics`); `None` when disabled.
     /// Contract: `hygress_egress::usage_sink::{GpustackSink, new, push}`.
     pub sink: Option<std::sync::Arc<hygress_egress::usage_sink::GpustackSink>>,

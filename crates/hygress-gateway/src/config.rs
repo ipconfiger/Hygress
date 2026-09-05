@@ -63,6 +63,12 @@ pub struct GatewayConfig {
     /// `HYGRESS_GUARDRAIL_URL`). `None` ⇒ the LLM guardrail is not configured
     /// (pass-through; `fail_mode` never applies — D-14).
     pub guardrail_url: Option<String>,
+    /// ext-auth failure mode (R-12): when `/token-auth` is unreachable or
+    /// answers 5xx, reject (403) when `true` (default — matches the
+    /// GPUStack/Higress `failure_mode_allow=false` baseline) or fail-open when
+    /// `false`. Env: `HYGRESS_EXT_AUTH_FAIL_MODE` = `closed` (default) |
+    /// `open`.
+    pub ext_auth_fail_closed: bool,
 }
 
 impl Default for GatewayConfig {
@@ -84,6 +90,7 @@ impl Default for GatewayConfig {
             policy_path: "/etc/hygress/policy.yaml".to_string(),
             quota_k: 4,
             guardrail_url: None,
+            ext_auth_fail_closed: true,
         }
     }
 }
@@ -155,6 +162,11 @@ impl GatewayConfig {
         }
         if let Some(v) = clean(get("HYGRESS_GUARDRAIL_URL")) {
             c.guardrail_url = Some(v);
+        }
+        if let Some(v) = clean(get("HYGRESS_EXT_AUTH_FAIL_MODE")) {
+            // `open` → fail-open; anything else (incl. `closed`) → fail-closed
+            // (the safe default matching the GPUStack/Higress baseline).
+            c.ext_auth_fail_closed = !v.eq_ignore_ascii_case("open");
         }
         c
     }
@@ -294,5 +306,17 @@ mod tests {
         assert!(parse(&[("HYGRESS_TOPOLOGY_B", "YES")]).topology_b);
         assert!(!parse(&[("HYGRESS_TOPOLOGY_B", "no")]).topology_b);
         assert!(!parse(&[("HYGRESS_TOPOLOGY_B", "")]).topology_b);
+    }
+
+    #[test]
+    fn ext_auth_fail_mode_env() {
+        // R-12: default fail-closed (matches GPUStack/Higress
+        // `failure_mode_allow=false`); `open` flips to fail-open; anything else
+        // (incl. `closed`) stays fail-closed.
+        assert!(parse(&[]).ext_auth_fail_closed, "default must be closed");
+        assert!(!parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "open")]).ext_auth_fail_closed);
+        assert!(!parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "OPEN")]).ext_auth_fail_closed);
+        assert!(parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "closed")]).ext_auth_fail_closed);
+        assert!(parse(&[("HYGRESS_EXT_AUTH_FAIL_MODE", "bogus")]).ext_auth_fail_closed, "unknown value stays closed");
     }
 }

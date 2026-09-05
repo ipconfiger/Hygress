@@ -69,6 +69,12 @@ pub fn order_route(
     if route.destinations.is_empty() {
         return Vec::new();
     }
+    // R-7: a single-destination route has nothing to weight — return it without
+    // touching the shared SWRR state (no DashMap shard lock on the hot path;
+    // concentrated single-instance routes are the GPUStack norm).
+    if route.destinations.len() == 1 {
+        return vec![route.destinations[0].clone()];
+    }
     // The SWRR round reorders its own operating copy of the (small) precomputed
     // candidate vec.
     let mut candidates = table.swrr_candidates(index).to_vec();

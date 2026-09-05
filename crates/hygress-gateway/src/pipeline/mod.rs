@@ -111,12 +111,42 @@ fn prepare_inner(
     // ② model-router: resolve the model + enforce the body cap; OVERWRITE the
     //    configured `targetHeader` (and the body `model` field) when resolved.
     let mut body = inbound.body.clone();
-    let mr = model_router::resolve(&inbound.path, &body, &inbound.content_type, ctx.router)?;
+    let content_type = inbound.content_type.as_str();
+
+    // ORA3-M14: ONE prepare-time no-DOM top-level scan for a well-formed JSON
+    // body — replacing up to three overlapping traversals (the model-router's
+    // body extraction in ②, R-5's `model_field_equals`, and the
+    // rewrite/extract fallback) — and capturing the AM-2 `stream` /
+    // `stream_options` flags + closing-brace offset on the same pass. The scan
+    // runs ONCE per request over the ORIGINAL body (before any model-value
+    // splice), so its model / stream verdicts remain valid for every
+    // downstream consumer. Multipart / empty / non-JSON / malformed bodies get
+    // `None` here and fall back to the classic per-step scans below
+    // (byte-identical to the pre-fusion path).
+    let profile = if crate::body::is_json(Some(content_type)) && !body.is_empty() {
+        crate::body::scan_top_level_profile(&body, &ctx.router.model_key).ok()
+    } else {
+        None
+    };
+    let scanned_model = profile
+        .as_ref()
+        .and_then(|p| p.model.as_ref().map(|(decoded, _)| decoded.as_str()));
+
+    // ② resolution: when the body was scanned above, the fused entry consumes
+    // the scan (cap + path-mode decision only — no body re-scan); otherwise
+    // the classic scanning entry keeps its exact behavior for multipart /
+    // non-JSON / malformed bodies.
+    let mr = if profile.is_some() {
+        model_router::resolve_fused(&inbound.path, &body, ctx.router, scanned_model)?
+    } else {
+        model_router::resolve(&inbound.path, &body, content_type, ctx.router)?
+    };
+
     // B4: the body's model value as of the end of prepare — the carrier for the
     // per-candidate model-mapper identity short-circuit. When prepare rewrote
-    // the body, use the resolved value (no re-scan); otherwise extract it once
-    // (amortized over every candidate), `None` covering missing / non-string /
-    // malformed (each candidate then skips its body-mapper scan entirely).
+    // the body, use the resolved value (no re-scan); otherwise reuse the
+    // prepare-time scan, `None` covering missing / non-string / malformed
+    // (each candidate then skips its body-mapper scan entirely).
     let body_model = if let Some(model) = &mr.model {
         base_headers.insert(ctx.router.target_header.as_str(), model);
         // The route-match key is canonically `x-higress-llm-model` (the Ingress
@@ -127,29 +157,65 @@ fn prepare_inner(
         if ctx.router.target_header != crate::context::hdr::LLM_MODEL {
             base_headers.insert(crate::context::hdr::LLM_MODEL, model);
         }
-        let content_type = Some(inbound.content_type.as_str());
-        // R-5 (identity short-circuit): when the body's `model` field already
-        // equals the resolved value, do NOT splice — skip the full-body rewrite
-        // (alloc + copy) and record the body as carrying `model`.
-        if crate::body::model_field_equals(&body, content_type, &ctx.router.model_key, model) {
-            Some(model.clone())
-        } else if let Some(nb) =
-            crate::body::rewrite_model_field(&body, content_type, &ctx.router.model_key, model)
-        {
-            body = nb;
-            Some(model.clone()) // rewritten → the body now carries `mr.model`
-        } else {
-            // Rewrite no-op'd (no string model field to splice): the body is
-            // unchanged, so its current model value is the extracted one.
-            crate::body::extract_model(&body, content_type, &ctx.router.model_key)
+        match &profile {
+            // Well-formed JSON object (the prepare scan ran): R-5 identity
+            // check and the model rewrite are pure compare / offset-splice
+            // operations on the scan result — no re-scan.
+            Some(p) => match &p.model {
+                Some((decoded, span)) if decoded == model => Some(model.clone()),
+                Some((_, span)) => {
+                    // R-5 rewrite: splice the located value token in place.
+                    body = crate::body::splice_json_string_at(&body, *span, model);
+                    Some(model.clone()) // rewritten → the body now carries `mr.model`
+                }
+                // Absent / non-string model member: there is no string token to
+                // splice; the classic R-5 chain would no-op and re-extract
+                // `None` — skip those re-scans (ORA3-M14).
+                None => None,
+            },
+            // Multipart / non-JSON / empty / malformed body (not scanned): the
+            // classic R-5 decision chain, byte-for-byte as before.
+            None => {
+                let content_type = Some(content_type);
+                // R-5 (identity short-circuit): when the body's `model` field
+                // already equals the resolved value, do NOT splice — skip the
+                // full-body rewrite (alloc + copy) and record the body as
+                // carrying `model`.
+                if crate::body::model_field_equals(
+                    &body,
+                    content_type,
+                    &ctx.router.model_key,
+                    model,
+                ) {
+                    Some(model.clone())
+                } else if let Some(nb) = crate::body::rewrite_model_field(
+                    &body,
+                    content_type,
+                    &ctx.router.model_key,
+                    model,
+                ) {
+                    body = nb;
+                    Some(model.clone()) // rewritten → the body now carries `mr.model`
+                } else {
+                    // Rewrite no-op'd (no string model field to splice): the body
+                    // is unchanged, so its current model value is the extracted
+                    // one.
+                    crate::body::extract_model(&body, content_type, &ctx.router.model_key)
+                }
+            }
         }
     } else {
         // No resolved model (path/header-driven): the body was not rewritten.
-        crate::body::extract_model(
-            &body,
-            Some(inbound.content_type.as_str()),
-            &ctx.router.model_key,
-        )
+        // Record its model value from the prepare scan when it ran (amortized
+        // over every candidate), else extract it as before.
+        match &profile {
+            Some(p) => p.model.as_ref().map(|(decoded, _)| decoded.clone()),
+            None => crate::body::extract_model(
+                &body,
+                Some(content_type),
+                &ctx.router.model_key,
+            ),
+        }
     };
 
     // ③ transformer-in: rename legacy model header, restore fallback path, backstop
@@ -312,6 +378,16 @@ pub fn build_outbound(
     // through a model route today (README/equivalence updated by the docs
     // agent). Revisit if generic or non-OpenAI destinations are ever routed
     // through model routes. Deliberately no behavior change.
+    //
+    // ORA3-M14 (PX-1): prepare's fused scan already validated this JSON top
+    // level once per request and produced the stream flags + closing brace
+    // (see `crate::body::scan_top_level_profile`); carrying that memo into
+    // this per-candidate step needs a memo field on `PreparedRequest`
+    // (context lane) — until then this gate re-derives the flags from the
+    // candidate's FINAL bytes (post-⑧), which is the byte-exact single point
+    // of injection. The profile verdicts are proven equal to this scan
+    // (`profile_and_specialized_scanners_agree_*` in body.rs), so adopting the
+    // memo later cannot change the outbound bytes.
     if let Some(nb) = crate::body::ensure_stream_include_usage(
         &out_body,
         Some(prepared.content_type.as_str()),
@@ -745,5 +821,139 @@ mod tests {
         assert_eq!(p.base_headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
         assert!(p.route.is_model_route);
         assert_eq!(p.route.model, "org1/llama-3-8b");
+    }
+
+    // ----- ORA3-M14: fused prepare-time scan drives R-5 + AM-2 byte-exact -----
+
+    /// Prepare a JSON request against a Main route keyed `route_model`, using
+    /// the given `gpustack-model-router` snapshot settings.
+    fn prepare_request(
+        body: &str,
+        path: &str,
+        route_model: &str,
+        router_settings: hygress_core::prelude::ModelRouterSettings,
+    ) -> PreparedRequest {
+        use hygress_core::prelude::{Destination, PathPred, Registry, RouteKind, RouteRule};
+
+        let data = ConfigData {
+            routes: vec![RouteRule::new(
+                route_model,
+                RouteKind::Main,
+                vec![PathPred::new(".*")],
+                vec![Destination::new("model-1-10.static:80")],
+            )
+            .unwrap()],
+            registries: vec![Registry::new("model-1-10.static:80", "10.0.0.5:8081").unwrap()],
+            model_router: router_settings,
+            ..ConfigData::default()
+        };
+        let router = ModelRouterConfig::from_settings(&data.model_router);
+        let table = RouteTable::rebuild(&data).unwrap();
+        let shared =
+            SharedConfigHandle::new(hygress_core::SharedConfig::new(data.clone()).unwrap());
+        let ctx = PipelineCtx {
+            data: &data,
+            table: &table,
+            config: &shared,
+            router: &router,
+        };
+        let inbound = InboundRequest {
+            method: "POST".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::from(body.to_string()),
+            content_type: "application/json".into(),
+            client_ip: String::new(),
+            host: String::new(),
+        };
+        prepare(&inbound, &ctx).unwrap()
+    }
+
+    #[test]
+    fn fused_prepare_identity_body_then_outbound_injects_stream_options_byte_exact() {
+        // The canonical flow: body-driven resolution, body model == resolved
+        // model → R-5 identity (prepare does NOT splice), then build_outbound
+        // splices `stream_options` exactly once before the closing `}`.
+        let p = prepare_request(
+            r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            "/v1/chat/completions",
+            "org1/llama-3-8b",
+            hygress_core::prelude::ModelRouterSettings {
+                enable_on_path_suffix: vec!["/v1/chat/completions".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.body_model.as_deref(), Some("org1/llama-3-8b"));
+        // Identity: prepare left the body byte-for-byte untouched.
+        assert_eq!(
+            String::from_utf8(p.body.to_vec()).unwrap(),
+            r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+        );
+        assert!(p.route.is_model_route);
+        let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
+        let got = String::from_utf8(out.body.to_vec()).unwrap();
+        let expected = r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#;
+        assert_eq!(got, expected);
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
+    }
+
+    #[test]
+    fn fused_prepare_rewritten_model_body_still_injects_exactly_once() {
+        // Invariant (a): a PATH alias resolves `mapped-model` ≠ the body's
+        // `client-model` → prepare's fused scan drives the R-5 SPLICE (offset
+        // splice from the profile span, longer value). The AM-2 verdict was
+        // computed on the PRE-splice body (a model-value splice cannot flip the
+        // stream/stream_options structure) — build_outbound must still inject
+        // exactly once, before the closing `}` of the REWRITTEN body.
+        let p = prepare_request(
+            r#"{"model":"client-model","stream":true}"#,
+            "/model/proxy/7/v1/chat/completions",
+            "mapped-model",
+            hygress_core::prelude::ModelRouterSettings {
+                alias_name_mapping: [("7".to_string(), "mapped-model".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.body_model.as_deref(), Some("mapped-model"));
+        let ub = String::from_utf8(p.body.to_vec()).unwrap();
+        assert!(ub.contains(r#""model":"mapped-model""#), "spliced body: {ub}");
+        assert!(!ub.contains("client-model"), "spliced body: {ub}");
+        assert!(p.route.is_model_route);
+        let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
+        let got = String::from_utf8(out.body.to_vec()).unwrap();
+        assert_eq!(
+            got,
+            r#"{"model":"mapped-model","stream":true,"stream_options":{"include_usage":true}}"#
+        );
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
+    }
+
+    #[test]
+    fn explicit_client_stream_options_survive_prepare_rewrite_uninjected() {
+        // Invariants (a)+(b): a client that explicitly sent `stream_options`
+        // keeps its own preference even when prepare's alias-driven model
+        // rewrite changes the body — the pre-splice scan flagged
+        // `has_stream_options`, so build_outbound never overrides/duplicates it.
+        let p = prepare_request(
+            r#"{"model":"client-model","stream":true,"stream_options":{"include_usage":false}}"#,
+            "/model/proxy/7/v1/chat/completions",
+            "mapped-model",
+            hygress_core::prelude::ModelRouterSettings {
+                alias_name_mapping: [("7".to_string(), "mapped-model".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
+        let got = String::from_utf8(out.body.to_vec()).unwrap();
+        assert_eq!(
+            got,
+            r#"{"model":"mapped-model","stream":true,"stream_options":{"include_usage":false}}"#
+        );
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
     }
 }

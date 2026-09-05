@@ -73,6 +73,7 @@ use tracing::{debug, warn};
 use crate::context::{
     hdr, GatewayState, GuardrailClientKey, InboundRequest, OutboundRequest, PreparedRequest,
 };
+use crate::error::GatewayError;
 use crate::pipeline;
 use crate::pipeline::PipelineCtx;
 use crate::policy_loader::{bare_ingress_name, MergedEntry, MergedPolicy};
@@ -276,11 +277,16 @@ impl ProxyHttp for HygressProxy {
             Ok(Some(b)) => b,
             Ok(None) => Bytes::new(),
             Err(failure) => {
-                if failure.is_abort() {
-                    // AM-3: truncated body — the request must not be treated as
-                    // whole. Close the connection (Pingora would anyway: the
-                    // body was never fully consumed) and answer 400 best-effort
-                    // (the write simply fails when the client is already gone).
+                // AM-3: a truncated read — [`GatewayError::BodyReadAborted`]
+                // (the peer closed / framing broke mid-body) — must not be
+                // treated as a whole request. Close the connection (Pingora
+                // would anyway: the body was never fully consumed) and answer
+                // 400 best-effort (the write simply fails when the client is
+                // already gone). [`GatewayError::BodyTooLarge`] — the clean
+                // oversized-body business 413 whose read was drained — is NOT
+                // an abort (ORA3-M13: both classes now live on `GatewayError`,
+                // one owner of the status + slug).
+                if matches!(&failure, GatewayError::BodyReadAborted { .. }) {
                     session.as_downstream_mut().set_keepalive(None);
                     warn!(
                         error = %failure,
@@ -853,68 +859,33 @@ struct InboundHead {
     headers: HeaderMap,
 }
 
-/// AM-3: why a downstream body read did not yield a **complete** request body.
-///
-/// The two failure classes are deliberately distinct — the AM-3 bug was that a
-/// downstream read `Err` (client closed / framing error → the buffered bytes
-/// are a truncated prefix) exited the old `while let Ok(Some(..))` loop and was
-/// returned as a complete body. Only [`BodyReadFailure::TooLarge`] is a
-/// *business* rejection of an oversized body (the read itself was fine up to
-/// the cap); [`BodyReadFailure::Read`] is an *abort* — the request must never
-/// dispatch upstream (AM-3), never reserve quota, never report usage.
-///
-/// Kept module-local: `GatewayError` (error.rs) is frozen and has no read-side
-/// variant — its closest matches (`DownstreamWrite`, `Egress`, `Other`) map to
-/// 502/500 with misleading reason slugs, which would corrupt the client error
-/// body and the metrics.
-enum BodyReadFailure {
-    /// The buffered body exceeded `max_body` — business 413 (the connection is
-    /// drained before the caller short-circuits, mirroring the old behavior).
-    TooLarge { len: usize, cap: usize },
-    /// The downstream read failed mid-body (`read_request_body` → `Err`):
-    /// client closed / protocol error. The buffered bytes are a truncated
-    /// prefix, not a body.
-    Read { detail: String },
-}
-
-impl BodyReadFailure {
-    /// The HTTP status this failed read short-circuits to: 413 for an
-    /// oversized body, 400 for a truncated (aborted) read.
-    fn status(&self) -> u16 {
-        match self {
-            BodyReadFailure::TooLarge { .. } => 413,
-            BodyReadFailure::Read { .. } => 400,
-        }
-    }
-
-    /// The stable client-facing reason slug (lowercase snake; unchanged per
-    /// class — it is what the short-circuit JSON body carries).
-    fn reason(&self) -> &'static str {
-        match self {
-            BodyReadFailure::TooLarge { .. } => "request_body_too_large",
-            BodyReadFailure::Read { .. } => "request_body_read_failed",
-        }
-    }
-
-    /// AM-3: `true` for a **truncated** read — the body is incomplete and the
-    /// request must be short-circuited **without** any pipeline / usage /
-    /// quota action; `false` for the oversized-body business 413 (whose read
-    /// itself was clean).
-    fn is_abort(&self) -> bool {
-        matches!(self, BodyReadFailure::Read { .. })
-    }
-}
-
-impl std::fmt::Display for BodyReadFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BodyReadFailure::TooLarge { len, cap } => {
-                write!(f, "request body too large: {len} bytes (cap {cap})")
-            }
-            BodyReadFailure::Read { detail } => write!(f, "request body read failed: {detail}"),
-        }
-    }
-}
+// -------------------------------------------------------------------------
+// AM-3: downstream body read — the failure classes live on the shared taxonomy
+// (ORA3-M13).
+// -------------------------------------------------------------------------
+//
+// Why a downstream body read did not yield a **complete** request body is
+// modeled by two [`GatewayError`] variants (error.rs) — the former module-local
+// `BodyReadFailure` was merged into the shared enum so no parallel per-variant
+// status/slug maps drift:
+//
+// - [`GatewayError::BodyTooLarge`] — the read was **clean** but the buffered
+//   body crossed `max_body`: the business 413 (the connection is drained before
+//   the caller short-circuits, mirroring the old behavior). The same variant is
+//   the model-router body-limit rejection (stage ②), so the two 413 producers
+//   share one status + slug.
+// - [`GatewayError::BodyReadAborted`] — the downstream read failed mid-body
+//   (`read_request_body` → `Err`): client closed / protocol error. The
+//   buffered bytes are a truncated prefix, never a complete request — an
+//   *abort* (AM-3): the request must never dispatch upstream, never reserve
+//   quota, never report usage.
+//
+// The AM-3 bug these classes prevent was that a downstream read `Err` exited
+// the old `while let Ok(Some(..))` loop and was returned as a complete body.
+// The classes are raised and consumed entirely inside `read_body` /
+// `request_filter` (before any pipeline stage runs — `prepare` never sees
+// them), which is why `read_body` returns them separately from `prepare` while
+// still using the shared enum.
 
 /// AM-3: the pure per-step decision for the downstream body read — extracted
 /// from [`HygressProxy::read_body`] so the abort-vs-end-vs-cap classification
@@ -999,11 +970,19 @@ impl HygressProxy {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         let mut headers = HeaderMap::new();
-        for (name, value) in req.headers.iter() {
-            if let Ok(v) = value.to_str() {
-                headers.append(name.as_str(), v.to_string());
-            }
-        }
+        // ORA3-M12: copy every inbound header through the ONE header-copy
+        // helper and the ONE non-UTF-8 policy (`utf8_header_value` drops with a
+        // warn — never silently, never lossy-converted). Hop-by-hop /
+        // connection headers are NOT stripped here: the canonical request
+        // strip list (`crate::pipeline::HOP_BY_HOP`) runs later in
+        // `build_outbound` (stage ⑧) on the outbound map.
+        copy_headers_excluding(
+            req.headers.iter().filter_map(|(name, value)| {
+                utf8_header_value(name.as_str(), value).map(|value| (name.as_str(), value))
+            }),
+            &[],
+            |name, value| headers.append(name, value),
+        );
         // Mirror `:path` so transformer-in can backstop / restore it (stage ③⑭).
         headers.insert(hdr::PATH, path.clone());
         InboundHead {
@@ -1023,19 +1002,25 @@ impl HygressProxy {
     ///
     /// AM-3: the result now distinguishes a **clean** body (`Ok(None)` = no
     /// body / read cleanly to an empty end; `Ok(Some(..))` = a complete body)
-    /// from a **failed** read (`Err([`BodyReadFailure`])`). Pingora's
-    /// `read_request_body` returns `Ok(None)` only when there is no (more)
-    /// body; an `Err` means the downstream connection died / the framing broke
-    /// **mid-body**, so whatever was buffered is a truncated prefix — never a
-    /// complete request. Previously the `Err` was swallowed by the loop and
-    /// the truncated prefix was returned as `Ok`, letting a cut-short request
-    /// dispatch upstream as if whole (AM-3).
+    /// from a **failed** read (`Err([`GatewayError`])`: [`GatewayError::BodyTooLarge`]
+    /// for an oversized clean read, [`GatewayError::BodyReadAborted`] for a
+    /// truncated read). Pingora's `read_request_body` returns `Ok(None)` only
+    /// when there is no (more) body; an `Err` means the downstream connection
+    /// died / the framing broke **mid-body**, so whatever was buffered is a
+    /// truncated prefix — never a complete request. Previously the `Err` was
+    /// swallowed by the loop and the truncated prefix was returned as `Ok`,
+    /// letting a cut-short request dispatch upstream as if whole (AM-3).
+    ///
+    /// ORA3-M13: the read-side failure classes live on the shared
+    /// [`GatewayError`] taxonomy (error.rs) — this function returns them
+    /// separately from `prepare` only because they are raised here, before any
+    /// pipeline stage runs; the status + reason slug ownership is unified.
     async fn read_body(
         session: &mut Session,
         method: &str,
         max_body: usize,
         content_length: Option<u64>,
-    ) -> Result<Option<Bytes>, BodyReadFailure> {
+    ) -> Result<Option<Bytes>, GatewayError> {
         let has_body = matches!(method, "POST" | "PUT" | "PATCH");
         // B1: when the peer declared a valid Content-Length, pre-reserve that
         // exact size (capped at max_body) so the buffer grows geometrically
@@ -1069,14 +1054,14 @@ impl HygressProxy {
                             Ok(Some(chunk)) => buf.len() + chunk.len(),
                             _ => buf.len(),
                         };
-                        return Err(BodyReadFailure::TooLarge { len, cap: max_body });
+                        return Err(GatewayError::BodyTooLarge(len, max_body));
                     }
                     BodyReadStep::ReadFailed => {
                         let detail = match step {
                             Err(e) => e.to_string(),
                             _ => unreachable!("ReadFailed implies an Err step"),
                         };
-                        return Err(BodyReadFailure::Read { detail });
+                        return Err(GatewayError::BodyReadAborted { detail });
                     }
                 }
             }
@@ -1352,6 +1337,102 @@ enum Final {
     Transport { detail: String },
 }
 
+// ---------------------------------------------------------------------------
+// Header copy (ORA3-M12): ONE helper + ONE non-UTF-8 policy + ONE strip list
+// per direction.
+// ---------------------------------------------------------------------------
+//
+// Strip-list layout (no duplicate lists):
+// - **Request direction** — the canonical list is
+//   [`crate::pipeline::HOP_BY_HOP`] (pipeline/mod.rs), applied ONCE in
+//   `build_outbound` (stage ⑧) while the outbound map is built. The dial sites
+//   below therefore receive already-stripped maps and only exclude
+//   `content-type` (`DIAL_SKIP` — it is set once, explicitly, after the copy:
+//   the map still carries the inbound original while
+//   `OutboundRequest::content_type` is the model-mapper-rewritten one) plus
+//   the internal `:path` pseudo-header in the direct-dial source.
+// - **Response direction** — [`RESPONSE_STRIP`] below is the response
+//   counterpart of `HOP_BY_HOP`: `connection` / `content-length` /
+//   `transfer-encoding` are hop-by-hop in both directions (the shared subset),
+//   and `server` / `via` are response-only origin headers.
+
+/// Dial-time exclusion shared by the two outbound dial paths (ORA3-M12):
+/// `content-type` is copied only via the explicit set below (`DIAL_SKIP`), so
+/// the map's inbound copy never doubles it.
+const DIAL_SKIP: &[&str] = &["content-type"];
+
+/// Response-direction hop-by-hop / connection headers never forwarded
+/// downstream (ORA3-M12 — the one response strip list; see the module comment
+/// above for how it relates to [`crate::pipeline::HOP_BY_HOP`]). Framing
+/// (`content-length`) is handled by `response_framing` (P1), and
+/// `content-encoding` IS forwarded verbatim (P5): the body is forwarded
+/// byte-for-byte and reqwest has no gzip feature, so stripping it would hand
+/// the client a mislabeled encoded body.
+const RESPONSE_STRIP: &[&str] = &[
+    "server",
+    "via",
+    "transfer-encoding",
+    "content-length",
+    "connection",
+];
+
+/// ONE non-UTF-8 header-value policy (ORA3-M12): decode `value` as UTF-8; a
+/// value that is not valid UTF-8 is **dropped with a warn** — never silently,
+/// never lossy-converted — matching the forward-auth write-back stance
+/// (egress `forward_auth::to_header_string`). Applied at every site that
+/// copies an `http::HeaderMap` value into a UTF-8 sink: `read_headers`, the
+/// provider dial, and the response copy. Core [`HeaderMap`] values are already
+/// `String` (can never be non-UTF-8) and bypass this.
+fn utf8_header_value(name: &str, value: &http::HeaderValue) -> Option<String> {
+    match value.to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(_) => {
+            warn!(
+                header = name,
+                "header value is not valid UTF-8; dropping the header (forwarded header values must be valid UTF-8)"
+            );
+            None
+        }
+    }
+}
+
+/// ONE private header-copy helper (ORA3-M12): append each pre-decoded
+/// `(name, value)` pair to `dst`, skipping every name in `skip`
+/// (case-insensitive). Used by both outbound dial paths and the response copy
+/// (plus the inbound copy in `read_headers`), so every site shares the same
+/// exclusion logic; the non-UTF-8 decode policy lives in [`utf8_header_value`]
+/// and is applied by each caller's source mapping before this runs.
+fn copy_headers_excluding<'a>(
+    pairs: impl IntoIterator<Item = (&'a str, String)>,
+    skip: &[&str],
+    mut dst: impl FnMut(&str, String),
+) {
+    for (name, value) in pairs {
+        if skip.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+            continue;
+        }
+        dst(name, value);
+    }
+}
+
+/// ORA3-M15 (PX-2): is this upstream response `Content-Type` a candidate for
+/// usage classification — JSON (`application/json`, ...) or SSE
+/// (`text/event-stream`, ...)? A response with neither marker can never carry
+/// a usage object, so plain-text / octet-stream / HTML bodies skip the usage
+/// accumulator entirely (no buffered tail, no inline DOM parse in the chunk
+/// loop). A missing / non-UTF-8 `Content-Type` is likewise not fed (nothing
+/// classifiable was declared). SSE + JSON responses are unaffected — they feed
+/// exactly as before.
+fn response_is_usage_bearing(content_type: Option<&http::HeaderValue>) -> bool {
+    match content_type.and_then(|v| v.to_str().ok()) {
+        Some(ct) => {
+            let ct = ct.to_ascii_lowercase();
+            ct.contains("json") || ct.contains("event-stream")
+        }
+        None => false,
+    }
+}
+
 impl HygressProxy {
     /// Send one candidate's outbound request over the long-lived client.
     ///
@@ -1392,22 +1473,33 @@ impl HygressProxy {
         if let Some(ms) = prepared.override_timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
         }
-        let names: Vec<&str> = outbound.headers.names().collect();
-        for name in names {
-            // Pseudo-headers (the core `:path` marker) are internal and are not
-            // valid HTTP request headers — drop them before building the request.
-            if name.starts_with(':') {
-                continue;
-            }
-            // `content-type` is set once, explicitly below (it is already
-            // forwarded in `outbound.headers` from the inbound copy — skip it so
-            // the header is not doubled). Mirrors the provider path.
-            if name.eq_ignore_ascii_case("content-type") {
-                continue;
-            }
-            for value in outbound.headers.get_all(name) {
-                req = req.header(name, value.clone());
-            }
+        // ORA3-M12: ONE header-copy helper for both dial paths. The map values
+        // are core `HeaderMap` strings (always UTF-8 — the decode policy in
+        // `utf8_header_value` does not apply here); `content-type` is skipped
+        // (set once, explicitly below) and pseudo-headers (the internal core
+        // `:path` marker) are dropped before building the request — they are
+        // not valid HTTP request headers. The helper's `FnMut` sink cannot
+        // consume the `RequestBuilder` (it moves per `.header` call), so the
+        // filtered pairs are collected first, then folded into `req`.
+        let src: Vec<(&str, String)> = outbound
+            .headers
+            .names()
+            .filter(|name| !name.starts_with(':'))
+            .flat_map(|name| {
+                outbound
+                    .headers
+                    .get_all(name)
+                    .iter()
+                    .cloned()
+                    .map(move |value| (name, value))
+            })
+            .collect();
+        let mut dial_headers: Vec<(String, String)> = Vec::new();
+        copy_headers_excluding(src, DIAL_SKIP, |name, value| {
+            dial_headers.push((name.to_string(), value));
+        });
+        for (name, value) in dial_headers {
+            req = req.header(name, value);
         }
         if !outbound.host.is_empty() {
             req = req.header("host", outbound.host.clone());
@@ -1509,17 +1601,26 @@ impl HygressProxy {
         if let Some(ms) = prepared.override_timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
         }
-        for (name, value) in upstream.headers.iter() {
-            // `content-type` is set once, explicitly below (it is already forwarded
-            // in `upstream.headers` from the inbound copy — skip it so the header
-            // is not doubled).
-            if name.as_str().eq_ignore_ascii_case("content-type") {
-                continue;
-            }
-            let Ok(v) = value.to_str() else {
-                continue;
-            };
-            req = req.header(name.as_str(), v);
+        // ORA3-M12: the same header-copy helper as the direct dial; the
+        // provider headers come pre-swapped / pseudo-stripped from
+        // `ProviderClient`. `content-type` is skipped (`DIAL_SKIP` — set once
+        // below) and a non-UTF-8 value is dropped WITH a warn
+        // (`utf8_header_value`), never silently.
+        let src: Vec<(&str, String)> = upstream
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                utf8_header_value(name.as_str(), value).map(|value| (name.as_str(), value))
+            })
+            .collect();
+        // The helper's `FnMut` sink cannot consume the `RequestBuilder` (moves per
+        // `.header` call) — collect filtered pairs first, then fold into `req`.
+        let mut dial_headers: Vec<(String, String)> = Vec::new();
+        copy_headers_excluding(src, DIAL_SKIP, |name, value| {
+            dial_headers.push((name.to_string(), value));
+        });
+        for (name, value) in dial_headers {
+            req = req.header(name, value);
         }
         if !outbound.content_type.is_empty() {
             req = req.header("content-type", outbound.content_type.clone());
@@ -1614,18 +1715,13 @@ impl HygressProxy {
         retained: &mut Option<UsageSnapshot>,
         compiled_static: Option<&std::sync::Arc<StaticRuleSet>>,
     ) -> PingoraResult<()> {
-        // Hop-by-hop / connection-negotiated headers are not forwarded. Framing
-        // (`content-length`) is handled by `response_framing` below (P1), and
-        // `content-encoding` IS forwarded verbatim (P5): the body is forwarded
-        // byte-for-byte and reqwest has no gzip feature, so stripping it would
-        // hand the client a mislabeled encoded body.
-        const SKIP: &[&str] = &[
-            "server",
-            "via",
-            "transfer-encoding",
-            "content-length",
-            "connection",
-        ];
+        // Hop-by-hop / connection-negotiated headers are not forwarded: the
+        // response strip list is [`RESPONSE_STRIP`] (ORA3-M12 — one list, the
+        // response counterpart of the request `crate::pipeline::HOP_BY_HOP`).
+        // Framing (`content-length`) is handled by `response_framing` below
+        // (P1), and `content-encoding` IS forwarded verbatim (P5): the body is
+        // forwarded byte-for-byte and reqwest has no gzip feature, so
+        // stripping it would hand the client a mislabeled encoded body.
         let status = resp.status().as_u16();
         // The upstream `content-length` is trusted for keep-alive framing when
         // the body passes through unmodified. A streamed upstream (SSE) has no
@@ -1637,17 +1733,29 @@ impl HygressProxy {
             .and_then(|v| v.parse::<u64>().ok());
         // Headers are read up front (immutably) so the borrow of `resp` ends
         // before the chunk loop mutates it via `resp.chunk()`.
-        let forwarded: Vec<(String, String)> = resp
-            .headers()
-            .iter()
-            .filter(|(name, _)| !SKIP.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)))
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
-            })
-            .collect();
+        // ORA3-M15 (PX-2): a 2xx body is only fed to the usage accumulator when
+        // a usage record can actually be reported AND the body could be a
+        // usage object. Mirror / passthrough never report (`prepared.usage` is
+        // `None` there by design — the ⑫ sink push is gated on it), so
+        // buffering their bodies and inline DOM-parsing them in the chunk loop
+        // (a TTFT cost on the first chunk) is pure waste. A response whose
+        // `Content-Type` is neither JSON nor `text/event-stream` can never
+        // carry a usage object either — plain-text / octet-stream bodies skip
+        // the classify path. SSE and JSON content types feed exactly as before.
+        let feed_usage = prepared.usage.is_some()
+            && response_is_usage_bearing(resp.headers().get("content-type"));
+        let forwarded = {
+            let mut fwd: Vec<(String, String)> = Vec::new();
+            // ORA3-M12: the ONE header-copy helper + ONE non-UTF-8 policy
+            // (drop WITH a warn — never silent, never lossy).
+            let src = resp.headers().iter().filter_map(|(name, value)| {
+                utf8_header_value(name.as_str(), value).map(|value| (name.as_str(), value))
+            });
+            copy_headers_excluding(src, RESPONSE_STRIP, |name, value| {
+                fwd.push((name.to_string(), value));
+            });
+            fwd
+        };
 
         let mut resp_header = ResponseHeader::build(status, None)?;
         for (name, value) in forwarded {
@@ -1689,7 +1797,14 @@ impl HygressProxy {
                 first = false;
                 ttft = Some(started.elapsed().as_secs_f64());
             }
-            usage.feed(chunk.as_ref());
+            // ORA3-M15: feed only when a usage record can be reported for this
+            // flow AND the declared content type could carry a usage object
+            // (see `feed_usage` above) — mirror/passthrough and non-JSON/SSE
+            // bodies never enter the accumulator (no buffered tail, no inline
+            // DOM parse on the classify path).
+            if feed_usage {
+                usage.feed(chunk.as_ref());
+            }
             // B4c (design §2.2 / §4.4): per-chunk judgment. A hit = stop
             // writing + cut the downstream + terminal path (D-11: release the
             // quota + report a `completed=false` usage row).
@@ -2453,24 +2568,111 @@ mod tests {
         );
     }
 
+    // NOTE (ORA3-M13): the read-side failure-class discrimination (413
+    // oversized-body business rejection vs 400 truncated-read abort, incl. the
+    // abort-only-never-dispatches semantic) now lives on the shared
+    // `GatewayError` taxonomy — see `error.rs::tests::read_failure_classes_are_not_conflated`.
+
+    // ----- ORA3-M12: shared header copy + single non-UTF-8 policy -----
+
     #[test]
-    fn body_read_failure_classes_are_not_conflated() {
-        // AM-3/AM-5: the oversized-body business rejection (413) and the
-        // truncated-read abort (400) must stay distinct — different statuses,
-        // client reason slugs, and abort semantics (only the abort must never
-        // dispatch / reserve quota / report usage).
-        let too_large = BodyReadFailure::TooLarge { len: 101, cap: 100 };
-        let aborted = BodyReadFailure::Read {
-            detail: "ConnectionClosed: peer prematurely closed".to_string(),
-        };
-        assert_eq!(too_large.status(), 413);
-        assert_eq!(too_large.reason(), "request_body_too_large");
-        assert!(!too_large.is_abort());
-        assert_eq!(aborted.status(), 400);
-        assert_eq!(aborted.reason(), "request_body_read_failed");
-        assert!(aborted.is_abort());
-        // The Display keeps the log/error message distinguishable.
-        assert!(too_large.to_string().contains("too large"));
-        assert!(aborted.to_string().contains("peer prematurely closed"));
+    fn header_copy_skips_listed_names_and_keeps_others_in_order() {
+        let mut src = http::HeaderMap::new();
+        src.append("x-multi", http::HeaderValue::from_static("1"));
+        src.append("x-multi", http::HeaderValue::from_static("2"));
+        src.append("x-single", http::HeaderValue::from_static("v"));
+        src.append("content-type", http::HeaderValue::from_static("text/plain"));
+        let mut out: Vec<(String, String)> = Vec::new();
+        copy_headers_excluding(
+            src.iter().filter_map(|(name, value)| {
+                utf8_header_value(name.as_str(), value).map(|value| (name.as_str(), value))
+            }),
+            &["content-type"],
+            |name, value| out.push((name.to_string(), value)),
+        );
+        // The skip list is case-insensitive and multi-values are preserved.
+        assert!(!out.iter().any(|(n, _)| n == "content-type"), "{out:?}");
+        let multi: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n == "x-multi")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(multi, ["1", "2"], "multi-value headers are copied in order");
+        assert!(out.iter().any(|(n, v)| n == "x-single" && v == "v"));
+    }
+
+    #[test]
+    fn header_copy_drops_non_utf8_with_warn_never_lossy() {
+        // The single non-UTF-8 policy: a value that `HeaderValue::to_str`
+        // rejects is dropped (a `warn!` fires — the tracing layer is not
+        // asserted here, only that the value never reaches the copy and is not
+        // lossy-converted into replacement-character garbage).
+        let mut src = http::HeaderMap::new();
+        src.append("x-ok", http::HeaderValue::from_static("ascii"));
+        src.append("x-bin", http::HeaderValue::from_bytes(b"a\xff\xfeb").unwrap());
+        let mut out: Vec<(String, String)> = Vec::new();
+        copy_headers_excluding(
+            src.iter().filter_map(|(name, value)| {
+                utf8_header_value(name.as_str(), value).map(|value| (name.as_str(), value))
+            }),
+            &[],
+            |name, value| out.push((name.to_string(), value)),
+        );
+        assert_eq!(out, vec![("x-ok".to_string(), "ascii".to_string())]);
+        assert!(
+            out.iter().all(|(_, v)| !v.contains('\u{fffd}')),
+            "no lossy conversion may reach the copied headers"
+        );
+        // The decode policy itself returns None (never a lossy string).
+        assert_eq!(
+            utf8_header_value("x-bin", &http::HeaderValue::from_bytes(b"\xff").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn response_strip_is_the_documented_response_counterpart_of_hop_by_hop() {
+        // ORA3-M12 strip-list unification: the response list shares exactly the
+        // hop-by-hop headers that can legally appear in BOTH directions
+        // (stripped by `pipeline::HOP_BY_HOP` on requests in `build_outbound`,
+        // by `RESPONSE_STRIP` on responses here); `server`/`via` are
+        // response-only origin headers. No other overlap may drift in.
+        let mut shared: Vec<&str> = RESPONSE_STRIP
+            .iter()
+            .copied()
+            .filter(|s| crate::pipeline::HOP_BY_HOP.contains(s))
+            .collect();
+        let mut extras: Vec<&str> = RESPONSE_STRIP
+            .iter()
+            .copied()
+            .filter(|s| !crate::pipeline::HOP_BY_HOP.contains(s))
+            .collect();
+        shared.sort_unstable();
+        extras.sort_unstable();
+        assert_eq!(shared, ["connection", "content-length", "transfer-encoding"]);
+        assert_eq!(extras, ["server", "via"]);
+    }
+
+    // ----- ORA3-M15 (PX-2): response-side usage feed gating -----
+
+    #[test]
+    fn usage_content_type_prefilter_only_feeds_json_or_sse() {
+        let ct = |s: &str| http::HeaderValue::from_str(s).expect("static header value");
+        // JSON family (incl. parameters / suffix case) and SSE feed.
+        assert!(response_is_usage_bearing(Some(&ct("application/json"))));
+        assert!(response_is_usage_bearing(Some(&ct("application/json; charset=utf-8"))));
+        assert!(response_is_usage_bearing(Some(&ct("application/vnd.some+json"))));
+        assert!(response_is_usage_bearing(Some(&ct("text/event-stream"))));
+        assert!(response_is_usage_bearing(Some(&ct("text/event-stream; charset=utf-8"))));
+        assert!(
+            response_is_usage_bearing(Some(&ct("TEXT/EVENT-STREAM"))),
+            "case-insensitive"
+        );
+        // Never-feedable bodies: plain text / octet-stream / HTML.
+        assert!(!response_is_usage_bearing(Some(&ct("text/plain"))));
+        assert!(!response_is_usage_bearing(Some(&ct("application/octet-stream"))));
+        assert!(!response_is_usage_bearing(Some(&ct("text/html"))));
+        // Absent (or non-decodable) content-type → nothing declared, not fed.
+        assert!(!response_is_usage_bearing(None));
     }
 }

@@ -3,6 +3,8 @@
 //! This crate is the **zero-I/O** contract foundation. All other crates depend on its types.
 //! Module layout (implementation lane owns this):
 //!
+//! - `bytes`        — shared byte/scan utilities (find_subseq / replace_bytes / multipart
+//!   part-value locator; one canonical copy for the gateway body + mapping helpers)
 //! - `route`        — `RouteRule`, `PathPred`, `Destination`, `FallbackLink`, `AuthScope`, `RuleSource`
 //! - `matcher`      — header + path matching predicates (match input -> matched RouteRule)
 //! - `registry`     — `Registry` (Static/Dns/Proxy/Tunnel) + `OutboundProxy` + `name.type[:port]` parsing
@@ -32,6 +34,7 @@
 //!
 //! TDD: unit tests live alongside modules; tests may use only real data, no mocks.
 
+pub mod bytes;
 pub mod config;
 pub mod destination;
 pub mod error;

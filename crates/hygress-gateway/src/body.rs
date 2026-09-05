@@ -4,11 +4,15 @@
 //! multipart boundary off the `Content-Type`.
 //!
 //! No I/O, no allocation beyond what serde / the returned strings need. The
-//! multipart handling is intentionally a small, robust parser — sufficient for
-//! the GPUStack model-router / model-mapper form (single `model` text part),
-//! mirroring `hygress_core::model_mapping`'s parser.
+//! multipart handling shares the canonical `hygress_core::bytes` part-value
+//! locator (the same one `hygress_core::model_mapping` uses), so the two
+//! crates cannot silently diverge on boundary semantics (ORA3-M10). The JSON
+//! top-level scans all run through ONE member-loop state machine
+//! ([`top_level_members`], ORA3-M11), with `serde`-rule handling in a single
+//! place.
 
 use bytes::Bytes;
+use hygress_core::bytes::{first_form_value_span, replace_bytes};
 // `Value` is only referenced by the test module (via `super::*`) — the
 // production model-router / model-mapper path is a bounded targeted scan.
 #[cfg(test)]
@@ -65,38 +69,13 @@ pub fn extract_model(body: &Bytes, content_type: Option<&str>, model_key: &str) 
 }
 
 /// Find the value of the first `name="model"` part in a basic multipart body.
+///
+/// Thin wrapper over the shared [`first_form_value_span`] locator (the merged
+/// multipart part scanner, ORA3-M10): same boundary / terminator /
+/// line-ending semantics the historic per-crate loops implemented.
 pub fn extract_multipart_model(body: &Bytes, boundary: &str) -> Option<String> {
-    let marker = format!("--{boundary}");
-    let marker = marker.as_bytes();
-    let slice = body.as_ref();
-
-    let mut search_from = 0usize;
-    while search_from <= slice.len() {
-        let start = find_subseq(slice, marker, search_from)?;
-        let after = start + marker.len();
-        // Terminator boundary (`--boundary--`) ends the body.
-        if slice.get(after..after + 2) == Some(b"--") {
-            return None;
-        }
-        let next = find_subseq(slice, marker, after).unwrap_or(slice.len());
-        let part = &slice[after..next];
-        if let Some(sep) = find_subseq(part, b"\r\n\r\n", 0) {
-            let header = &part[..sep];
-            if contains_field(header, "model") {
-                let value_start = after + sep + 4;
-                let value_end = if part.ends_with(b"\r\n") {
-                    next - 2
-                } else {
-                    next
-                };
-                if value_start <= value_end {
-                    return Some(String::from_utf8_lossy(&slice[value_start..value_end]).into_owned());
-                }
-            }
-        }
-        search_from = next;
-    }
-    None
+    let (start, end) = first_form_value_span(body.as_ref(), boundary, "model")?;
+    Some(String::from_utf8_lossy(&body[start..end]).into_owned())
 }
 
 /// Rewrite the top-level `model` field of a **JSON** body to `value`, returning
@@ -107,16 +86,7 @@ pub fn extract_multipart_model(body: &Bytes, boundary: &str) -> Option<String> {
 /// preserved byte-for-byte (whitespace and field ordering included).
 pub fn rewrite_json_model(body: &Bytes, model_key: &str, value: &str) -> Option<Bytes> {
     match scan_top_level_value(body, model_key) {
-        Ok(Some(v)) if v.decoded.is_some() => {
-            let (start, end) = v.span;
-            // The value token includes its quotes; replace the whole token.
-            let encoded = encode_json_string(value);
-            let mut out = Vec::with_capacity(body.len() - (end - start) + encoded.len());
-            out.extend_from_slice(&body[..start]);
-            out.extend_from_slice(encoded.as_bytes());
-            out.extend_from_slice(&body[end..]);
-            Some(Bytes::from(out))
-        }
+        Ok(Some(v)) if v.decoded.is_some() => Some(splice_json_string_at(body, v.span, value)),
         // Missing `model` field, malformed body, or a non-string value → no-op
         // (mirrors model_mapping::apply_json).
         _ => None,
@@ -126,41 +96,10 @@ pub fn rewrite_json_model(body: &Bytes, model_key: &str, value: &str) -> Option<
 /// Rewrite the value of the first `name="model"` part of a **basic multipart**
 /// body to `value`. Returns `None` when there is no matching part.
 pub fn rewrite_multipart_model(body: &Bytes, boundary: &str, value: &str) -> Option<Bytes> {
-    let marker = format!("--{boundary}");
-    let marker = marker.as_bytes();
-    let slice = body.as_ref();
-    let mut out = vec![0u8; body.len()];
-    out.copy_from_slice(slice);
-
-    let mut search_from = 0usize;
-    while search_from <= out.len() {
-        let Some(start) = find_subseq(&out, marker, search_from) else {
-            break;
-        };
-        let after = start + marker.len();
-        if out.get(after..after + 2) == Some(b"--") {
-            break;
-        }
-        let next = find_subseq(&out, marker, after).unwrap_or(out.len());
-        let part = &out[after..next];
-        if let Some(sep) = find_subseq(part, b"\r\n\r\n", 0) {
-            let header = &part[..sep];
-            if contains_field(header, "model") {
-                let value_start = after + sep + 4;
-                let value_end = if part.ends_with(b"\r\n") {
-                    next - 2
-                } else {
-                    next
-                };
-                if value_start <= value_end {
-                    replace_bytes(&mut out, value_start, value_end, value.as_bytes());
-                    return Some(Bytes::from(out));
-                }
-            }
-        }
-        search_from = next;
-    }
-    None
+    let mut out = body.to_vec();
+    let (start, end) = first_form_value_span(&out, boundary, "model")?;
+    replace_bytes(&mut out, start, end, value.as_bytes());
+    Some(Bytes::from(out))
 }
 
 /// Dispatch `extract_model` / `rewrite_model` on the `Content-Type`.
@@ -276,40 +215,6 @@ pub fn ensure_stream_include_usage(
 /// The member spliced before the top-level object's closing `}` (AM-2).
 const STREAM_OPTIONS_INJECTION: &[u8] = b",\"stream_options\":{\"include_usage\":true}";
 
-/// `true` when a multipart part header block carries `name="model"`.
-fn contains_field(header: &[u8], field: &str) -> bool {
-    let needle = format!("name=\"{field}\"");
-    find_subseq(header, needle.as_bytes(), 0).is_some()
-}
-
-/// Replace `hay[start..end]` with `new` (growing or shrinking the vec).
-fn replace_bytes(hay: &mut Vec<u8>, start: usize, end: usize, new: &[u8]) {
-    debug_assert!(start <= end, "replace_bytes: start > end");
-    let tail: Vec<u8> = hay[end..].to_vec();
-    hay.truncate(start);
-    hay.extend_from_slice(new);
-    hay.extend_from_slice(&tail);
-}
-
-/// Naive byte-subsequence search (small control-plane bodies; no `memchr` dep).
-fn find_subseq(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(from);
-    }
-    if hay.len() < from + needle.len() {
-        return None;
-    }
-    let last = hay.len() - needle.len();
-    let mut i = from.min(last);
-    while i <= last {
-        if &hay[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Bounded top-level JSON scanner (H4)
 // ---------------------------------------------------------------------------
@@ -337,19 +242,37 @@ struct TopLevelValue {
     decoded: Option<String>,
 }
 
-/// Scan the **top-level object** of `body` for `key`, skipping every other
-/// value without materializing the document.
+/// The one top-level member-loop state machine behind every scan in this
+/// module (ORA3-M11): ws / comma / string-key / colon / skip-value / close —
+/// the exact validate-and-advance semantics `serde_json::from_slice` applies
+/// to a JSON object, driven per member through a `visit` callback.
 ///
-/// Returns `Ok(None)` when the key is absent, `Ok(Some(..))` for the last
-/// occurrence (duplicate keys: last wins, like `serde_json::Map`), and `Err(())`
-/// when the body is not a well-formed JSON object.
-fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>, ()> {
+/// For each top-level member the **decoded** key (`String`, escapes resolved —
+/// one allocation per top-level key, the historic cost) and the byte offset of
+/// its value token (post-colon whitespace skipped) are passed to `visit`. The
+/// visitor returns:
+/// - `Ok(Some(end))` — it fully validated the value token itself, which ends
+///   at `end` (lets a target string be decoded once instead of parsed and then
+///   skipped again);
+/// - `Ok(None)` — the iterator must validate-and-advance the value with
+///   [`skip_json_value`] (the no-alloc skip path — bad escapes / numbers /
+///   nesting anywhere still reject the document);
+/// - `Err(())` — abort the scan as malformed.
+///
+/// Returns the byte offset of the object's closing `}` (the AM-2 splice
+/// point). `Err(())` when `body` is not a well-formed JSON object whose
+/// trailing content is whitespace-only (same strictness as
+/// `serde_json::from_slice`). Recursion is bounded by [`MAX_JSON_DEPTH`] via
+/// [`skip_json_value`]; all indexing is bounds-checked `get()` — never panics.
+fn top_level_members(
+    body: &[u8],
+    mut visit: impl FnMut(&str, usize) -> Result<Option<usize>, ()>,
+) -> Result<usize, ()> {
     let mut pos = skip_ws(body, 0);
     if body.get(pos) != Some(&b'{') {
         return Err(());
     }
     pos += 1;
-    let mut last: Option<TopLevelValue> = None;
     loop {
         pos = skip_ws(body, pos);
         match body.get(pos) {
@@ -360,7 +283,7 @@ fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>,
                 if skip_ws(body, pos + 1) != body.len() {
                     return Err(());
                 }
-                return Ok(last);
+                return Ok(pos);
             }
             Some(b',') => {
                 let after = skip_ws(body, pos + 1);
@@ -370,31 +293,55 @@ fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>,
                 pos = after;
             }
             Some(b'"') => {
-                let (k, after_key) = parse_json_string(body, pos).ok_or(())?;
+                let (key, after_key) = parse_json_string(body, pos).ok_or(())?;
                 pos = skip_ws(body, after_key);
                 if body.get(pos) != Some(&b':') {
                     return Err(());
                 }
                 pos = skip_ws(body, pos + 1);
-                if k == key {
-                    last = if body.get(pos) == Some(&b'"') {
-                        let (decoded, end) = parse_json_string(body, pos).ok_or(())?;
-                        Some(TopLevelValue {
-                            span: (pos, end),
-                            decoded: Some(decoded),
-                        })
-                    } else {
-                        Some(TopLevelValue {
-                            span: (pos, pos),
-                            decoded: None,
-                        })
-                    };
+                match visit(&key, pos)? {
+                    Some(end) => pos = end,
+                    None => pos = skip_json_value(body, pos, 0).ok_or(())?,
                 }
-                pos = skip_json_value(body, pos, 0).ok_or(())?;
             }
             _ => return Err(()),
         }
     }
+}
+
+/// Scan the **top-level object** of `body` for `key`, skipping every other
+/// value without materializing the document.
+///
+/// Returns `Ok(None)` when the key is absent, `Ok(Some(..))` for the last
+/// occurrence (duplicate keys: last wins, like `serde_json::Map`), and `Err(())`
+/// when the body is not a well-formed JSON object.
+fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>, ()> {
+    let mut last: Option<TopLevelValue> = None;
+    top_level_members(body, |k, value_start| {
+        if k != key {
+            return Ok(None);
+        }
+        if body.get(value_start) == Some(&b'"') {
+            // The located value is decoded here (the equality/rewrite callers
+            // need the `String`); returning `Some(end)` avoids the iterator
+            // re-skipping the same token.
+            let (decoded, end) = parse_json_string(body, value_start).ok_or(())?;
+            last = Some(TopLevelValue {
+                span: (value_start, end),
+                decoded: Some(decoded),
+            });
+            Ok(Some(end))
+        } else {
+            // Present but not a JSON string — still "present", just not
+            // rewritable; the iterator validates and advances the value.
+            last = Some(TopLevelValue {
+                span: (value_start, value_start),
+                decoded: None,
+            });
+            Ok(None)
+        }
+    })?;
+    Ok(last)
 }
 
 /// Scan the **top-level object** of `body` for the AM-2 streaming-metering
@@ -411,55 +358,106 @@ fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>,
 /// `Err(())` when the body is not a well-formed JSON object (same strict
 /// validate-and-advance semantics as [`scan_top_level_value`]: bad escapes,
 /// malformed numbers, trailing content, etc. all reject) — such bodies are
-/// never injected into. Recursion is bounded by [`MAX_JSON_DEPTH`] via
-/// [`skip_json_value`].
+/// never injected into.
 fn scan_top_level_stream(body: &[u8]) -> Result<(bool, bool, usize), ()> {
-    let mut pos = skip_ws(body, 0);
-    if body.get(pos) != Some(&b'{') {
-        return Err(());
-    }
-    pos += 1;
     let mut stream_true = false;
     let mut has_stream_options = false;
-    loop {
-        pos = skip_ws(body, pos);
-        match body.get(pos) {
-            Some(b'}') => {
-                // Trailing content must be whitespace-only (like serde); any
-                // other trailing byte makes the document malformed.
-                if skip_ws(body, pos + 1) != body.len() {
-                    return Err(());
-                }
-                return Ok((stream_true, has_stream_options, pos));
-            }
-            Some(b',') => {
-                let after = skip_ws(body, pos + 1);
-                if body.get(after) == Some(&b'}') {
-                    return Err(()); // trailing comma (serde rejects)
-                }
-                pos = after;
-            }
-            Some(b'"') => {
-                let (k, after_key) = parse_json_string(body, pos).ok_or(())?;
-                pos = skip_ws(body, after_key);
-                if body.get(pos) != Some(&b':') {
-                    return Err(());
-                }
-                pos = skip_ws(body, pos + 1);
-                if k == "stream" {
-                    // Only a top-level literal `true` gates; the value token is
-                    // still fully validated below (validate-and-advance).
-                    stream_true = body.get(pos..pos + 4) == Some(b"true");
-                } else if k == "stream_options" {
-                    // Presence alone counts (any value, incl. `null`/`false`):
-                    // the client explicitly controls usage reporting.
-                    has_stream_options = true;
-                }
-                pos = skip_json_value(body, pos, 0).ok_or(())?;
-            }
-            _ => return Err(()),
+    let closing_brace = top_level_members(body, |k, value_start| {
+        if k == "stream" {
+            // Only a top-level literal `true` gates; the value token is still
+            // fully validated below (validate-and-advance).
+            stream_true = body.get(value_start..value_start + 4) == Some(b"true");
+        } else if k == "stream_options" {
+            // Presence alone counts (any value, incl. `null`/`false`): the
+            // client explicitly controls usage reporting.
+            has_stream_options = true;
         }
-    }
+        Ok(None)
+    })?;
+    Ok((stream_true, has_stream_options, closing_brace))
+}
+
+/// The fused single-pass view of a well-formed **top-level JSON object**
+/// (ORA3-M14): everything the pipeline needs from the request body in one
+/// bounded top-level scan instead of several overlapping ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonObjectProfile {
+    /// The decoded value + quote-inclusive byte span of the **last** top-level
+    /// `model_key` member when it is a JSON string (serde last-wins; span is
+    /// the splice target for a model rewrite). `None` for an absent /
+    /// non-string (or duplicate-then-non-string) target — not rewritable.
+    pub model: Option<(String, (usize, usize))>,
+    /// The top-level `stream` value is the literal `true` (AM-2 gate 4).
+    pub stream_true: bool,
+    /// A top-level `stream_options` member exists with any value (AM-2 gate 5).
+    pub has_stream_options: bool,
+    /// Byte offset of the object's closing `}` — the AM-2 splice point.
+    pub closing_brace: usize,
+}
+
+/// Fused single-pass top-level scan (ORA3-M14): gathers the `model_key`
+/// value + quote-inclusive span, the AM-2 `stream` / `stream_options` flags,
+/// and the closing-`}` offset in ONE validate-and-advance pass.
+///
+/// `Ok(profile)` only for a well-formed JSON object; `Err(())` otherwise —
+/// exactly the verdicts of [`scan_top_level_value`] /
+/// [`scan_top_level_stream`] on the same bytes (see the agreement tests).
+///
+/// Note the verdict is computed on the **original** body: a later model-value
+/// splice (byte-identical member content, only the string token changes)
+/// cannot flip the `stream` / `stream_options` structure, so a caller that
+/// splices after this scan keeps these flags valid.
+#[allow(clippy::result_unit_err)] // internal scanner convention: `Err` = structurally invalid body
+pub fn scan_top_level_profile(
+    body: &[u8],
+    model_key: &str,
+) -> Result<JsonObjectProfile, ()> {
+    let mut model: Option<(String, (usize, usize))> = None;
+    let mut stream_true = false;
+    let mut has_stream_options = false;
+    let closing_brace = top_level_members(body, |k, value_start| {
+        if k == model_key {
+            if body.get(value_start) == Some(&b'"') {
+                let (decoded, end) = parse_json_string(body, value_start).ok_or(())?;
+                model = Some((decoded, (value_start, end)));
+                Ok(Some(end))
+            } else {
+                // A non-string member (or a duplicate key whose last value is
+                // non-string): last-wins, not a rewritable string.
+                model = None;
+                Ok(None)
+            }
+        } else if k == "stream" {
+            stream_true = body.get(value_start..value_start + 4) == Some(b"true");
+            Ok(None)
+        } else if k == "stream_options" {
+            has_stream_options = true;
+            Ok(None)
+        } else {
+            Ok(None)
+        }
+    })?;
+    Ok(JsonObjectProfile {
+        model,
+        stream_true,
+        has_stream_options,
+        closing_brace,
+    })
+}
+
+/// Splice the JSON string-value token at quote-inclusive `span` (from a
+/// [`JsonObjectProfile`] / [`TopLevelValue`]) with the JSON encoding of
+/// `value` — the offset form of [`rewrite_json_model`] for callers that
+/// already hold the located token from the fused prepare-time scan
+/// (ORA3-M14: no re-scan, no DOM; every other byte is preserved).
+pub fn splice_json_string_at(body: &[u8], span: (usize, usize), value: &str) -> Bytes {
+    let (start, end) = span;
+    let encoded = encode_json_string(value);
+    let mut out = Vec::with_capacity(body.len() - (end - start) + encoded.len());
+    out.extend_from_slice(&body[..start]);
+    out.extend_from_slice(encoded.as_bytes());
+    out.extend_from_slice(&body[end..]);
+    Bytes::from(out)
 }
 
 /// Decode a JSON string token at `from` (must point at `"`), returning the
@@ -1399,6 +1397,124 @@ mod tests {
             String::from_utf8(out.to_vec()).unwrap(),
             format!(r#"{{"\u0073tream":true{INJECT}}}"#)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // ORA3-M11/M14: the fused profile scan agrees with the two scanners it
+    // consolidates, and its model span drives byte-identical rewrites.
+    // -------------------------------------------------------------------
+
+    /// Run every scanner over `src` and return the profile view for assertions.
+    fn profile_of(src: &str, key: &str) -> JsonObjectProfile {
+        scan_top_level_profile(src.as_bytes(), key).expect("fixture must be a valid object")
+    }
+
+    #[test]
+    fn profile_and_specialized_scanners_agree_on_valid_objects() {
+        // The single-pass profile scan must reproduce, on the same fixtures,
+        // the exact verdicts of scan_top_level_value (model) and
+        // scan_top_level_stream (AM-2 gate + closing brace) — this is the
+        // ORA3-M11 "both scanners agree" proof.
+        let valid: &[&str] = &[
+            "{}",
+            r#"{"model":"m"}"#,
+            r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            r#"{"stream":true,"model":"m"}"#,
+            r#"{"\u0073tream":true}"#,
+            r#"{"stream":true,"stream_options":{"include_usage":false}}"#,
+            r#"{"stream_options":{},"stream":true}"#,
+            r#"{"stream":true,"stream_options":null}"#,
+            r#"{"model":5}"#,
+            r#"{"model":"a\"b\\c"}"#,
+            "{\"model\":\"模型-🚀\",\"stream\":false}",
+            r#"{"model":"dup","model":"dup2"}"#,
+            r#"{"model":"dup","model":7}"#,
+            r#"{"model":7,"model":"dup"}"#,
+            r#"{"stream":true,"stream":false}"#,
+            r#"{"stream":false,"stream":true}"#,
+            "{\"model\":\"m\"} \n\t ",
+            r#"{"a":[1,{"b":{"model":"nested"}}],"model":"top"}"#,
+        ];
+        for src in valid {
+            let b = src.as_bytes();
+            let profile = profile_of(src, "model");
+            // model value: last-wins decoded string, None for absent/non-string.
+            let expected_model = match scan_top_level_value(b, "model").unwrap() {
+                Some(v) => v.decoded,
+                None => None,
+            };
+            assert_eq!(
+                profile.model.as_ref().map(|(m, _)| m.clone()),
+                expected_model,
+                "model mismatch for {src}"
+            );
+            // AM-2 flags + closing brace match scan_top_level_stream exactly.
+            let (stream_true, has_stream_options, closing) =
+                scan_top_level_stream(b).expect("valid object");
+            assert_eq!(profile.stream_true, stream_true, "stream mismatch for {src}");
+            assert_eq!(
+                profile.has_stream_options, has_stream_options,
+                "stream_options mismatch for {src}"
+            );
+            assert_eq!(profile.closing_brace, closing, "closing brace for {src}");
+            // The profile's model span (when present) rewrites byte-identically
+            // to the re-scanning rewrite fn.
+            if let Some((_, span)) = &profile.model {
+                let spliced = splice_json_string_at(b, *span, "X");
+                let via_fn =
+                    rewrite_json_model(&Bytes::copy_from_slice(b), "model", "X").expect("rewrite");
+                assert_eq!(spliced, via_fn, "span splice mismatch for {src}");
+                assert!(
+                    serde_json::from_slice::<Value>(&spliced).is_ok(),
+                    "spliced body must stay valid for {src}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profile_custom_model_key_and_agreement_on_corpus() {
+        // A custom model key is honored by the profile exactly like the
+        // specialized scan.
+        let body = r#"{"llm":"gpt-4o","stream":true}"#;
+        let p = profile_of(body, "llm");
+        assert_eq!(p.model.as_ref().map(|(m, _)| m.as_str()), Some("gpt-4o"));
+        assert!(p.stream_true && !p.has_stream_options);
+        let p2 = profile_of(body, "model");
+        assert_eq!(p2.model, None);
+    }
+
+    #[test]
+    fn profile_and_scanners_reject_malformed_bodies_together() {
+        // Both scanners and the profile must Err on exactly the same inputs.
+        let invalid: &[&str] = &[
+            "{broken",
+            "",
+            r#"{"model":"x",}"#,
+            r#"{"stream":true"#,
+            r#"{"stream":true} garbage"#,
+            r#"{"stream":true}{"a":1}"#,
+            r#"{"bad":"\q","model":"x"}"#,
+            r#"{"bad":01,"model":"x"}"#,
+            r#"{"stream" true}"#,
+            "null",
+            "42",
+            r#"[{"stream":true}]"#,
+        ];
+        for src in invalid {
+            assert!(
+                scan_top_level_profile(src.as_bytes(), "model").is_err(),
+                "profile must reject {src:?}"
+            );
+            assert!(
+                scan_top_level_stream(src.as_bytes()).is_err(),
+                "stream scan must reject {src:?}"
+            );
+            assert!(
+                scan_top_level_value(src.as_bytes(), "model").is_err(),
+                "value scan must reject {src:?}"
+            );
+        }
     }
 }
 

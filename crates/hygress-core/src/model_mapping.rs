@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bytes::{first_form_value_span, replace_bytes};
+
 /// `name.type` service → outbound body model name.
 ///
 /// `rules` is an ordered list of `(service, model)` pairs; the **first**
@@ -79,80 +81,22 @@ impl ModelMapping {
     /// headers and all other parts are untouched. Returns `true` on rewrite.
     ///
     /// This is intentionally a small, robust parser — sufficient for the
-    /// GPUStack model-router multipart form (single `model` text part).
+    /// GPUStack model-router multipart form (single `model` text part). The
+    /// part scan itself is the shared `hygress_core::bytes` locator (the same
+    /// one `hygress_gateway::body`'s multipart extract/rewrite use), so the two
+    /// crates cannot silently diverge on boundary / line-ending semantics
+    /// (ORA3-M10).
     pub fn apply_multipart(&self, service: &str, body: &mut Vec<u8>, boundary: &str) -> bool {
         let Some(model) = self.lookup(service) else {
             return false;
         };
-        let marker = format!("--{boundary}");
-        let marker = marker.as_bytes();
-
-        let mut search_from = 0;
-        while search_from <= body.len() {
-            let Some(start) = find_subseq(body, marker, search_from) else {
-                break;
-            };
-            let after = start + marker.len();
-            // Terminator boundary (`--boundary--`) ends the body.
-            if body.get(after..after + 2) == Some(b"--") {
-                break;
-            }
-            let next = find_subseq(body, marker, after).unwrap_or(body.len());
-            let part = &body[after..next];
-            if let Some(sep) = find_subseq(part, b"\r\n\r\n", 0) {
-                let header = &part[..sep];
-                if header_contains_model_field(header) {
-                    let value_start = after + sep + 4;
-                    let value_end = if part.ends_with(b"\r\n") {
-                        next - 2
-                    } else {
-                        next
-                    };
-                    if value_start <= value_end {
-                        replace_bytes(body, value_start, value_end, model.as_bytes());
-                        return true;
-                    }
-                }
-            }
-            search_from = next;
+        if let Some((value_start, value_end)) = first_form_value_span(body, boundary, "model") {
+            replace_bytes(body, value_start, value_end, model.as_bytes());
+            true
+        } else {
+            false
         }
-        false
     }
-}
-
-/// `true` when a multipart part header block carries a `name="model"` field.
-fn header_contains_model_field(header: &[u8]) -> bool {
-    let needle = b"name=\"model\"";
-    find_subseq(header, needle, 0).is_some()
-}
-
-/// Replace `hay[start..end]` with `new` (growing or shrinking the vec).
-fn replace_bytes(hay: &mut Vec<u8>, start: usize, end: usize, new: &[u8]) {
-    debug_assert!(start <= end, "replace_bytes: start > end");
-    let tail: Vec<u8> = hay[end..].to_vec();
-    hay.truncate(start);
-    hay.extend_from_slice(new);
-    hay.extend_from_slice(&tail);
-}
-
-/// Naive byte-subsequence search (sufficient for the small control-plane
-/// bodies this crate touches; no `memchr` dependency allowed).
-fn find_subseq(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(from);
-    }
-    if hay.len() < from + needle.len() {
-        return None;
-    }
-    let last = hay.len() - needle.len();
-    let mut i = from.min(last);
-    while i <= last {
-        if &hay[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]

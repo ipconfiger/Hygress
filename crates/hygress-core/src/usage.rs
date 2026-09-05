@@ -49,6 +49,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bytes::find_subseq;
+
 /// MINOR-6 / F3: byte cap on the buffered-but-unclassified tail and on a single unterminated
 /// SSE `data:` line (1 MiB). A realistic usage-bearing frame is far smaller; larger unclassified
 /// bodies are dropped to the server's `completed = false` estimation fallback.
@@ -778,25 +780,6 @@ fn trim_ascii(b: &[u8]) -> &[u8] {
         end -= 1;
     }
     &b[start..end]
-}
-
-/// Naive byte-subsequence search (no memchr dependency in this crate).
-fn find_subseq(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return (from..=hay.len()).find(|_| true);
-    }
-    if hay.len() < from + needle.len() {
-        return None;
-    }
-    let last = hay.len() - needle.len();
-    let mut i = from.min(last);
-    while i <= last {
-        if &hay[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]

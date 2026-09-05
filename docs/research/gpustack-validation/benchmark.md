@@ -158,3 +158,27 @@ Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**�
   **P4**（adapter 每 1s 全量 kube LIST → 路由表重建 → ArcSwap store，无 resourceVersion 短路）——
   本表数据佐证该方向（P1 未消尾），其次候选 P6（`read_headers` 每请求 String 克隆）。
 - 证据：`fixtures-hygress/bench_after3_wrk_c{16,64}.txt`、`after3_image.txt`（提交随本报告）。
+
+## 9. P4 快照短路后重测（wrk，2026-09-05）：p99 尾部 −23-25%、吞吐继续上台阶
+
+跟进（P4 `493dc21`，oracle 复审 PASS）：adapter 每 1s 轮询改**指纹短路**——6 类 LIST 单遍 + 排序
+`(kind, ns, name, resourceVersion)` 指纹，未变则跳过 translate/RouteTable/正则重建与 store（消除每 1s
+与数据面争 CPU 的全量重建尖峰；rv==0 强制全量作为加固）。同 rig 重测（同主机/同 wrk/同 `:80/readyz`）：
+
+| 指标 | P1/P2 build（`ba0b467b`） | **P4 build（`b1c82601`）** | 变化 |
+|---|---|---|---|
+| c16 吞吐 | 1091.7 req/s | **1152.3**（重复 1100-1162） | **+5.5%** |
+| c16 avg / p50 | 28.1 / 13.6 ms | 22.8 / 13.0 ms | avg −19% |
+| c16 p99 | 388 ms | **299 ms** | **−23%** |
+| c64 吞吐 | 898.3 req/s | **968.3** | **+7.8%** |
+| c64 p50 / p99 | 53.1 / 539 ms | 51.3 / **403 ms** | −3.4% / **p99 −25%** |
+| Socket errors | 0 | 0 | P1 保持 |
+
+- **P4 确认真实收益**：1s 全量 translate + RouteTable/正则重建 + store 的 CPU 尖峰从稳态轮询中消失
+  （与数据面争 CPU → p99 尾部 −23-25%、吞吐与 avg 同步改善）。
+- **诚实记录（残余尾巴）**：p99 未归零（c16 重复 295/307/399ms）——仍存在周期性 ~300ms 级尖峰，与
+  P1（连接 churn）无关。ora-2 预判的下两个嫌疑与数据吻合：① 每 1s 仍有的 6 类 kube LIST（含对象全量
+  JSON decode 的 CPU，控制面运行时的次优开销）；② 共享镜像上游 / GPUStack worker `/readyz` 自身抖动
+  （§3 口径）。进一步方向：kube WATCH 替代周期 LIST、控制面轮询拉开到 ≤5s、或 P6（`read_headers`
+  每请求 String 克隆——数据面自身）。
+- 证据：`fixtures-hygress/bench_after4_wrk_c{16,64}.txt`、`after4_image.txt`（提交随本报告）。

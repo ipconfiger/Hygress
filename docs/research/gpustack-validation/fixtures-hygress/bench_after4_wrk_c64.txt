@@ -1,0 +1,13 @@
+Running 20s test @ http://127.0.0.1:80/readyz
+  8 threads and 64 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    90.16ms   92.08ms 409.74ms   85.81%
+    Req/Sec   142.55     41.14   242.00     85.20%
+  Latency Distribution
+     50%   51.34ms
+     75%   54.19ms
+     90%  265.96ms
+     99%  403.16ms
+  19403 requests in 20.04s, 2.50MB read
+Requests/sec:    968.31
+Transfer/sec:    127.66KB

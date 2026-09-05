@@ -1,17 +1,17 @@
-# Hygress — 基于 Pingora 的 GPUStack 内嵌 Higress 原位替换 AI Gateway
+# Hygress：基于 Pingora 的 GPUStack 内嵌 Higress 原位替换 AI Gateway
 
-> 一个用 Rust（Cloudflare **Pingora**）实现的轻量 AI Gateway，在 GPUStack 中**原位（in-place）替换**
+> 一个用 Rust（Cloudflare Pingora）实现的轻量 AI Gateway，在 GPUStack 中**原位（in-place）替换**
 > 其内嵌 Higress 三进程（pilot / controller / envoy gateway），**不修改 GPUStack 任何一行 Python**。
-> 更强的性能、更小的资源占用、更清晰的可观测性与原生多租户能力。
+> 资源占用、延迟、可观测性与多租户的具体对比见 §3 表。
 
-- 状态：**真机 A/B 验证通过**（live GPUStack v2.2.3 + RTX4090 worker + qwen2.5-0.5b-instruct）；
-  **升级延伸能力已实现并通过真机 e2e**
+- 状态：真机 A/B 验证通过（live GPUStack v2.2.3 + RTX4090 worker + qwen2.5-0.5b-instruct）；
+  升级延伸能力已实现并通过真机 e2e
 - 数据面：Pingora terminate-mode（单二进制，无 Wasm 运行时 / 无 Envoy）
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
-- 质量：**587 个测试全绿（B1-B3 审计修复批 + B7 ora-2 终审修复批后实测；此前 538/492 为批次快照）**· clippy 0 警告（all-targets 双模式）· **零 mock/stub** ·
+- 质量：587 个测试全绿（B1-B3 审计修复批 + B7 ora-2 终审修复批后实测；此前 538/492 为批次快照）· clippy 0 警告（all-targets 双模式）· 零 mock/stub ·
   经多轮 oracle 高精度交叉审核（Gate-1/Gate-2 9/10；升级设计两轮无阻塞；升级实现二轮 BLOCK 闭环；ora-2 五维第二方终审 ≈7.9/10 无 BLOCK，修复闭环）
-- **延伸能力**：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 热重载（文件轮询 ≤30s，admin `/reload` 即时） +
-  admin `/reload`；真机验证：限流 429/配额 429/护栏 403 实际生效）
+- 延伸能力：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 热重载：文件轮询 ≤30s，或 admin `/reload` 即时；
+  真机验证：限流 429/配额 429/护栏 403 实际生效）
 - 主要文档：`docs/design.md`（设计 v1.5）· `docs/research/plugin-contract-pin.md`（字节级外部契约）
   · `docs/research/gpustack-validation/REPORT.md`（真机验证证据）· `docs/dev-process.md`（开发全过程）
   · `docs/extensions-audit.md` + `docs/extensions-design.md`（延伸能力审核与设计/实现记录）
@@ -20,25 +20,24 @@
 
 ## 1. 开发目的
 
-GPUStack（开源 LLMOps 平台）默认把 [Higress](https://higress.cn) 作为其 **AI Gateway 数据面**：
+GPUStack（开源 LLMOps 平台）默认把 [Higress](https://higress.cn) 作为其 AI Gateway 数据面：
 负责模型路由（model-router）、鉴权（ext-auth）、用量计量（token-usage）、模型映射（model-mapper）、
-AI 代理（ai-proxy）、降级（fallback）等核心职责，以 4 个进程（`apiserver` / `pilot` / `controller` /
+AI 代理（ai-proxy）、降级（fallback）等职责，以 4 个进程（`apiserver` / `pilot` / `controller` /
 `gateway(envoy)`）通过 s6-overlay 内嵌在 server 容器中。
 
-Higress 体系非常庞大（Istio / Envoy / 9 个 Wasm 插件），带来如下工程问题：
+Higress 由 Istio / Envoy 与 9 个 Wasm 插件组成，带来五个工程问题：
 
-- **资源占用高**：4 个进程 + Envoy + Wasm 运行时，内存与镜像体积可观；
+- **资源占用高**：4 个进程 + Envoy + Wasm 运行时，内存与镜像体积可观。
 - **延迟与可控性受限**：Wasm 插件链（AUTHN→AUTHZ→ROUTE→TRANSFORM→TRAFFIC）执行路径长，
-  全文读取 / 精确改写能力受 Wasm 沙箱约束；
-- **可观测性弱**：插件内部状态难以采样，指标分散在 Envoy / Istio 各通道；
-- **多租户能力原始**：租户隔离主要依赖路由前缀命名约定，而非类型安全的原生隔离；
+  全文读取 / 精确改写能力受 Wasm 沙箱约束。
+- **可观测性弱**：插件内部状态难以采样，指标分散在 Envoy / Istio 各通道。
+- **多租户能力原始**：租户隔离主要依赖路由前缀命名约定，而非类型安全的原生隔离。
 - **扩展/维护成本高**：Go 插件需跨语言桥接，构建与分发链路复杂。
 
-**Hygress 的目标**：以 Cloudflare 生产级基础库 **Pingora**（Rust）实现一个等价 AI Gateway，
-与 GPUStack 内嵌 Higress **原位替换**（零代码改动替换，`gateway_mode=embedded` 默认路径直接可用），
-获得：更小的资源占用、更低的延迟、更强的可观测性与原生多租户能力。
+Hygress 以 Cloudflare 生产级基础库 Pingora（Rust）实现一个等价 AI Gateway，与 GPUStack 内嵌 Higress 原位替换
+（零代码改动替换，`gateway_mode=embedded` 默认路径直接可用）。
 
-**成功判据（DoD，全部达成 ✅）**
+**成功判据（DoD，全部达成）**
 
 | DoD | 内容 | 结果 |
 |---|---|---|
@@ -49,8 +48,8 @@ Higress 体系非常庞大（Istio / Envoy / 9 个 Wasm 插件），带来如下
 | 5 | `/v2/usage/gateway-metrics` 推送在 GPUStack DB 落为真实 usage 行 | ✅ `model_usage_details` 34/7（A/B 基线跑）与 e2e 完全一致 |
 | 6 | 可回滚：s6 镜像层保留三进程脚本（no-op 而非删除），`.dist` 原样快照 | ✅ |
 
-> 注：usage 数字为**跑次记录**——`34/7` = 2026-09-03 A/B 基线跑（`HELLO_HYGRESS_WORKS`，证据
-> `gpustack-validation/fixtures-hygress/usage_rows.txt`）；修复批 **B5 复跑**（2026-09-05，HEAD 19ee0fb，
+> 注：usage 数字为跑次记录：`34/7` = 2026-09-03 A/B 基线跑（`HELLO_HYGRESS_WORKS`，证据
+> `gpustack-validation/fixtures-hygress/usage_rows.txt`）；修复批 B5 复跑（2026-09-05，HEAD 19ee0fb，
 > 内容 `HYGRESS_B3_OK`）实测 `34/5`（`docs/research/audit-fix-report` §3.3）。两跑内容不同，各自如实记录。
 
 ---
@@ -88,8 +87,8 @@ Higress 体系非常庞大（Istio / Envoy / 9 个 Wasm 插件），带来如下
 | `hygress-egress` | 出向 HTTP 客户端：forward-auth（/token-auth）、usage sink（/v2/usage/gateway-metrics）、provider 客户端 | 39+8+4 |
 | `hygress-gateway` |数据面：Pingora 终止模式代理 + admin/metrics/15020 + **9 插件等价管道** + 容器 main()/bootstrap | 115+11 |
 
-> 注：上表分 crate 测试数与文中 368/492 等均为**对应阶段快照**（合计与最新总数会随批次演进），
-> **以 `cargo test --workspace --all-features` 当前实测为准**（最终批统一校准）。
+> 注：上表分 crate 测试数与文中 368/492 等均为对应阶段快照（合计与最新总数会随批次演进），
+> 以 `cargo test --workspace --all-features` 当前实测为准（最终批统一校准）。
 
 **9 个 Higress Wasm 插件 → 原生 Rust 管道**（相位与外部 wire 契约严格对齐，见 `plugin-contract-pin.md`）：
 `inbound strip → model-router（body→模型派生 + x-higress-llm-model 覆盖）→ transformer（头改写）→
@@ -98,10 +97,10 @@ destination 模型名映射）→ ai-proxy（provider 令牌交换）→ fallbac
 usage sink（`ModelUsageMetrics` 17 字段防丢行）→ 写回头（X-Mse-Consumer / Authorization / cache）`。
 
 **关键设计决策（D1-D10，见 `design.md`）**
-- **MVP 拓扑 = A（embedded 原位替换）**：以**镜像层**做 s6 手术，完全不触碰 GPUStack 的 Python
+- **MVP 拓扑 = A（embedded 原位替换）**：以镜像层做 s6 手术，完全不触碰 GPUStack 的 Python
   `determine_enabled_services`（零改动替换）。
 - **数据面延迟语义**：`ready()` 门控（首个 CRD 快照就绪前不绑 :80）+ `GPUSTACK_API_PORT` 有界就绪探测。
-- **端口纪律**：数据面 80/443；admin 127.0.0.1:8081；stats 15020；**永不停用/绑定** 9876/15010/15012/8888/15051。
+- **端口纪律**：数据面 80/443；admin 127.0.0.1:8081；stats 15020；永不停用/绑定 9876/15010/15012/8888/15051。
 - **认证/用量 wire 契约**：`/token-auth`（转发 7 头 + 注入派生 `X-GPUStack-Auth-Token`，AUTHED 模型额外
   转发客户端 `Authorization`）；usage 恰好 17 字段（operation/cluster_id/provider_name/provider_type 不上送）。
 
@@ -124,15 +123,15 @@ usage sink（`ModelUsageMetrics` 17 字段防丢行）→ 写回头（X-Mse-Cons
 
 **真机 A/B 结论**（GPUStack v2.2.3 + RTX4090 worker）：换入 Hygress 后，`/v1/chat/completions` 经
 :80 返回真实 Qwen 推理（200 / 0.47s），`model_usage_details` 落库行（34/7，A/B 基线跑）与响应 usage
-**逐位一致**（修复批 B5 复跑实测 34/5，见 §1 DoD 表注）；
-16 个 CRD 与基线**逐字节一致**（只读）；禁 5 端口零绑定；supercronic/admin/15020 全通；server 稳定。
+逐位一致（修复批 B5 复跑实测 34/5，见 §1 DoD 表注）；
+16 个 CRD 与基线逐字节一致（只读）；禁 5 端口零绑定；supercronic/admin/15020 全通；server 稳定。
 
 ---
 
 ## 4. 部署与配置（集成到 GPUStack 原位替换 Higress）
 
-> 前提：已有可用的 GPUStack 部署（本方案在 **GPUStack v2.2.3** + `gateway_mode=embedded` 上验证）。
-> 全程**不改 Python、不改端口、不改任何 GPUStack 环境变量**。
+> 前提：已有可用的 GPUStack 部署（本方案在 GPUStack v2.2.3 + `gateway_mode=embedded` 上验证）。
+> 全程不改 Python、不改端口、不改任何 GPUStack 环境变量。
 
 ### 4.1 构建 Hygress 镜像
 
@@ -148,7 +147,7 @@ docker build -f pack/Dockerfile.hygress -t gpustack:hygress .
 #      docker build --build-arg GPUSTACK_TAG=latest -f pack/Dockerfile.hygress -t gpustack:hygress .）
 ```
 
-`pack/Dockerfile.hygress` 做的事（s6 手术，全部在**镜像层**完成，见 `pack/hygress-s6/rootfs/.../run`）：
+`pack/Dockerfile.hygress` 做的事（s6 手术，全部在镜像层完成，见 `pack/hygress-s6/rootfs/.../run`）：
 
 | 文件 | 处理 |
 |---|---|
@@ -204,8 +203,8 @@ gpustack-server:
 | `KUBECONFIG`（或 launcher `HYGRESS_KUBECONFIG`） | `${EMBEDDED_KUBECONFIG_PATH}` 兜底文件 | 控制面 kubeconfig（launcher 已双名镜像导出） |
 | `GATEWAY_TLS_PORT` | 443（取 `GATEWAY_HTTPS_PORT` 兼容） | 数据面 TLS 端口（launcher 已双名镜像导出） |
 
-> `GPUSTACK_API_PORT` 默认值来源：二进制解析默认 **80**（`crates/hygress-gateway/src/config.rs`）；s6
-> launcher（`pack/hygress-s6/.../gateway/run`）显式导出默认 **30080**（对齐 GPUStack compose 映射）。
+> `GPUSTACK_API_PORT` 默认值来源：二进制解析默认 80（`crates/hygress-gateway/src/config.rs`）；s6
+> launcher（`pack/hygress-s6/.../gateway/run`）显式导出默认 30080（对齐 GPUStack compose 映射）。
 > 容器内生效值 = 30080（表内默认以 launcher 为准）；直接裸跑二进制且未设 env 时为 80。
 
 ### 4.4 验证（真机验证矩阵）
@@ -246,9 +245,9 @@ docker compose -f compose.yaml up -d gpustack-server
 
 ## 5. 延伸能力：token 配额 · 限流 · 路由策略 · 安全护栏
 
-> 本次升级新增的四类网关延伸能力（`docs/extensions-design.md`），**全部由 Hygress 自有配置文件驱动**
-> （`hygress.policy.yaml`），与 GPUStack 控制面**无新增契约**（CRD 只读不变）。配置经
-> **mtime 热重载**生效（文件轮询 ≤30s，R-8 起；亦可 admin `POST /reload` 即时生效，token 门禁）；
+> 本次升级新增的四类网关延伸能力（`docs/extensions-design.md`），全部由 Hygress 自有配置文件驱动
+> （`hygress.policy.yaml`），与 GPUStack 控制面无新增契约（CRD 只读不变）。配置经
+> mtime 热重载生效（文件轮询 ≤30s，R-8 起；亦可 admin `POST /reload` 即时生效，token 门禁）；
 > 缺文件/坏文件 → 默认放行 / 保留上次有效（fail-safe）。
 
 ### 5.1 能力清单
@@ -302,10 +301,10 @@ routes:
 ---
 
 **文档索引**
-- `docs/design.md` — 设计 v1.5（现状分析 / 契约 / 架构 / 相位 / 部署与运维 / 兼容性矩阵）
-- `docs/dev-process.md` — 开发全过程记录（设计→实现→门禁→打包→真机 A/B→修复清单）
-- `docs/extensions-audit.md` — 网关延伸能力审核（token 配额 / 限流 / 路由策略 / 安全护栏的「已实现 / 需实现 / 不必实现」与配置来源边界）
-- `docs/extensions-design.md` — 升级开发设计（终版，经 @oracle 两轮高精度交叉审核，**无阻塞**；M0–M4 已实现并真机验证，见该文档 §10）
-- `docs/research/plugin-contract-pin.md` — 字节级外部 wire 契约（9 插件 / ext-auth / usage / 头）
-- `docs/research/gpustack-validation/` — 真机验证（REPORT、CRD fixtures、hygress 日志、usage 行）
-- `pack/` — 可部署产物（Dockerfile.hygress + s6 手术脚本）
+- `docs/design.md`：设计 v1.5（现状分析 / 契约 / 架构 / 相位 / 部署与运维 / 兼容性矩阵）
+- `docs/dev-process.md`：开发全过程记录（设计→实现→门禁→打包→真机 A/B→修复清单）
+- `docs/extensions-audit.md`：网关延伸能力审核（token 配额 / 限流 / 路由策略 / 安全护栏的「已实现 / 需实现 / 不必实现」与配置来源边界）
+- `docs/extensions-design.md`：升级开发设计（终版，经 @oracle 两轮高精度交叉审核，无阻塞；M0–M4 已实现并真机验证，见该文档 §10）
+- `docs/research/plugin-contract-pin.md`：字节级外部 wire 契约（9 插件 / ext-auth / usage / 头）
+- `docs/research/gpustack-validation/`：真机验证（REPORT、CRD fixtures、hygress 日志、usage 行）
+- `pack/`：可部署产物（Dockerfile.hygress + s6 手术脚本）

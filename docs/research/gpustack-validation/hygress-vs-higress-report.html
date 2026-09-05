@@ -425,22 +425,22 @@
 
     <div class="takeaways">
       <article class="tk" data-reveal>
-        <div class="tk-no">KEY TAKEAWAY 01</div>
+        <div class="tk-no"></div>
         <h3>性能持平或反超</h3>
         <p>同 rig wrk 对比（同一 GPUStack 主机、同 wrk、同 <code>:80/readyz</code>，顺序 hygress→higress→hygress），吞吐 <span class="num chl">c16 +4.8%、c64 +20.3%</span>，p50 <span class="num che">−7.8% / −12.0%</span>、p99 <span class="num che">−5.3% / −20.6%</span>（证据 <span class="num">bench_final_*.txt</span>，构建 <span class="num">3b6beabc</span> vs <span class="num">55ecc762</span>）。</p>
       </article>
       <article class="tk" data-reveal>
-        <div class="tk-no">KEY TAKEAWAY 02</div>
+        <div class="tk-no"></div>
         <h3>内核平坦 · 尾非网关</h3>
         <p><span class="big">13.6k req/s</span> 下限、p99 <span class="num chc">6ms 平坦</span>（§11 自服务 healthz 判定器）：<code>:80/readyz</code> 的 ~1.1k req/s 与周期性 p99 尾部<b>归因于共享镜像上游</b>，非网关内核——两侧在镜像路径上呈现同款尾部。</p>
       </article>
       <article class="tk" data-reveal>
-        <div class="tk-no">KEY TAKEAWAY 03</div>
+        <div class="tk-no"></div>
         <h3>资源数量级优势</h3>
         <p>数据面 <span class="num chl">1</span> 进程 / ~108MB RSS vs <span class="num che">4</span> 进程 / ~2.54GB（<b>≈23×</b>）；镜像内网关二进制 <span class="num chl">27MB</span> vs <span class="num che">~905MB</span>（≈34×）。</p>
       </article>
       <article class="tk" data-reveal>
-        <div class="tk-no">KEY TAKEAWAY 04</div>
+        <div class="tk-no"></div>
         <h3>可运维 · 原位替换</h3>
         <p>单二进制原位替换（零 Python 改动、s6 一键回滚）、<b>9 插件等价</b>原生 Rust 管线、控制面 WATCH 事件化热更（稳态零 LIST）、限流/配额/路由策略/护栏真机验证通过。</p>
       </article>
@@ -575,7 +575,7 @@
     </div>
 
     <p class="note">
-      hygress 全部四项主指标（吞吐/p50/p99）<b class="chl">均优于原生 envoy</b>；c64 优势（+20.3%）大于 c16（+4.8%），与 c64 更吃单请求 CPU/连接效率一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。两侧在 <code>:80/readyz</code> 上都有<b>周期性 ~300-500ms p99 尾</b>——见 §1.2 的归因判定：<b>非网关内核所致</b>。
+      hygress 全部四项主指标（吞吐/p50/p99）<b class="chl">均优于原生 envoy</b>；c64 优势（+20.3%）大于 c16（+4.8%），与 c64 更吃单请求 CPU/连接效率一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。两侧在 <code>:80/readyz</code> 上都有周期性 ~300-500ms p99 尾——见 §1.2 的归因判定：<b>非网关内核所致</b>。
     </p>
 
     <!-- charts: req/s & latency -->
@@ -706,7 +706,7 @@
         </div>
       </div>
       <p class="note">
-        <b class="chc">判定（决定性）</b>：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）<b>平坦且快 ~12×</b>——p99 个位数毫秒、无周期尾。<code>:80/readyz</code> 的吞吐天花板（~1.1k）与周期性尾部<b>归因于共享镜像上游</b>（GPUStack worker 的 <code>/readyz</code> 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧同等“taily”。这解释了 §8→§10 的现象链：P1（连接churn）/P2（单线程）/P4（控制面轮询）逐一消除网关侧开销后，<code>:80/readyz</code> 的 p99 只随上游波动。<br>
+        <b class="chc">判定（决定性）</b>：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）平坦且快 ~12×——p99 个位数毫秒、无周期尾。<code>:80/readyz</code> 的吞吐天花板（~1.1k）与周期性尾部<b>归因于共享镜像上游</b>（GPUStack worker 的 <code>/readyz</code> 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧同等“taily”。回看 §8→§10 的现象链：P1（连接churn）/P2（单线程）/P4（控制面轮询）逐一消除网关侧开销后，<code>:80/readyz</code> 的 p99 只随上游波动。<br>
         <b>诚实说明</b>：admin 端点当前仍为 close-delimited 响应（<code>read errors ≈ 全量</code>，P1 nitpick #1）——即 13.6k req/s 是在<b>每请求 TCP 拆建</b>的不利条件下测得的内核下限，只会低估；如需 keep-alive 口径属一行 CL 修复（非热路径、可选）。跨网关“纯内核对纯内核”的正式对比（envoy admin 端点等效测量）留作 Phase 3.2 可选待办。
       </p>
     </div>
@@ -729,7 +729,7 @@
       <div id="curveA" class="curve-svg" role="img" aria-label="优化全程曲线：c16 req/s 从修复前 518，经 857d21b 的 1093、5df02f2 的 1099.3、815ebd3 的 1091.7、493dc21 的 1152.3、cf4f6c5 WATCH 区间 1119 至 1143、最终 3b6beabc 的 1127.4；原生 envoy 参照线 1075.3；内核下限 13598.67 离域标注"></div>
       <div id="curveA-labels" class="curve-labels"></div>
       <p class="curve-note">
-        <b>判读链</b>：① P1 根治 read-errors（close-delimited framing 根因，pingora <code>init_close_delimited</code> 实证）；② P2 消除单 worker 串行化（c64 +7.7%）；③ P4 消除控制面周期重建尖峰（p99 −23/−25%）；④ WATCH 后尾未扁平 + §11 内核平坦 → <b>周期尾最终归因共享上游</b>（非网关）；⑤ 同 rig 下 hygress 全指标 ≥ envoy。<br>
+        <b>判读链</b>：① P1 根治 read-errors（close-delimited framing 根因，pingora <code>init_close_delimited</code> 实证）；② P2 消除单 worker 串行化（c64 +7.7%）；③ P4 消除控制面周期重建尖峰（p99 −23/−25%）；④ WATCH 后尾未扁平 + §11 内核平坦 → 周期尾最终归因共享上游（非网关）；⑤ 同 rig 下 hygress 全指标 ≥ envoy。<br>
         <b>离域说明</b>：内核下限 <span class="num">13,598.67 req/s</span>（p50 0.74ms / p99 6.1ms 平坦；c64 14,537）超出本图刻度约 12×，故以离域标记单独标注，不入主纵轴。
       </p>
     </div>
@@ -887,7 +887,7 @@
         </div>
         <p style="font-family:var(--font-mono);font-size:9.5px;color:var(--faint);margin-top:4px">—— 对数示意 · 108MB → 2.54GB ≈ 23× ——</p>
         <p class="note" style="margin-top:16px">
-          <b>诚实更新</b>：早期报告（benchmark.md §1，P2 多线程之前）实测 hygress RSS ≈22MB；当前 ~108MB 的增长来自 P2 的数据面多线程（threads=vCPU=16，3 个 pingora service + 控制面 runtime，实测 <code>ps -eLf</code> ≈68 线程/进程）与 WATCH 任务。以 ~16× 线程换取 c64 +20% 吞吐与尾延迟改善，属<b>有意权衡</b>；<b>即便如此仍 ≈23× 低于 envoy 套件</b>。早期 server 容器级口径（§1：794MiB vs 2.514GiB，净省 ≈1.7GB/68%）未在最终轮重测，引用时注意其为 P2 前数据。
+          <b>诚实更新</b>：早期报告（benchmark.md §1，P2 多线程之前）实测 hygress RSS ≈22MB；当前 ~108MB 的增长来自 P2 的数据面多线程（threads=vCPU=16，3 个 pingora service + 控制面 runtime，实测 <code>ps -eLf</code> ≈68 线程/进程）与 WATCH 任务。以 ~16× 线程换取 c64 +20% 吞吐与尾延迟改善，属<b>有意权衡</b>；即便如此仍 ≈23× 低于 envoy 套件。早期 server 容器级口径（§1：794MiB vs 2.514GiB，净省 ≈1.7GB/68%）未在最终轮重测，引用时注意其为 P2 前数据。
         </p>
       </div>
 
@@ -1076,7 +1076,7 @@
       <span class="sec-rule"></span>
     </div>
     <div class="lim-head-wrap">
-      <span class="flag">务必读 · 9 项</span>
+      <span class="flag">局限 · 共 9 项</span>
       <span style="font-size:13px;color:var(--faint)">以下局限如实记录，不构成对上述性能结论的反驳，但决定选用边界。</span>
     </div>
     <div class="lim-list">

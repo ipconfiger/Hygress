@@ -1,0 +1,1457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hygress vs 原生 Higress（envoy）— 最终同 rig 对比报告</title>
+<meta name="description" content="Hygress 对比原生 Higress（envoy）最终同 rig 基准：性能持平或反超、内核下限 13.6k req/s、资源 ≈23×、9 插件等价原生 Rust 管线。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#090B12;
+    --bg-2:#0D1019;
+    --panel:#121623;
+    --panel-2:#161B29;
+    --panel-3:#1A2030;
+    --line:rgba(255,255,255,.08);
+    --line-2:rgba(255,255,255,.16);
+    --ink:#E9ECF5;
+    --ink-2:#C7CDDC;
+    --muted:#9AA4BB;
+    --faint:#6B7690;
+    --hi:#D3F36B;      /* hygress */
+    --hi-dim:rgba(211,243,107,.14);
+    --env:#F2B25C;     /* envoy  */
+    --env-dim:rgba(242,178,92,.12);
+    --cyl:#6AC6F2;     /* 内核/中性 */
+    --cyl-dim:rgba(106,198,242,.12);
+    --rose:#E78A7E;    /* 诚实局限 */
+    --rose-dim:rgba(231,138,126,.10);
+    --lav:#A9B2CE;
+    --radius:18px;
+    --radius-s:10px;
+    --font-disp:"Space Grotesk","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+    --font-body:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,-apple-system,sans-serif;
+    --font-mono:"IBM Plex Mono","SFMono-Regular","Menlo","Consolas",monospace;
+    --maxw:1180px;
+    --shadow:0 20px 60px -24px rgba(0,0,0,.7);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth;overflow-x:hidden}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--font-body);
+    font-size:15.5px;
+    line-height:1.72;
+    letter-spacing:.01em;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+  }
+  body::before{
+    content:"";
+    position:fixed;inset:0;z-index:-3;
+    background:
+      radial-gradient(900px 520px at 12% -6%, rgba(211,243,107,.07), transparent 60%),
+      radial-gradient(820px 500px at 92% 4%, rgba(106,198,242,.06), transparent 55%),
+      radial-gradient(900px 700px at 50% 120%, rgba(242,178,92,.05), transparent 60%),
+      var(--bg);
+  }
+  body::after{
+    content:"";
+    position:fixed;inset:0;z-index:-2;pointer-events:none;opacity:.5;
+    background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);
+    background-size:44px 44px;
+    mask-image:radial-gradient(ellipse 90% 70% at 50% 0%, #000 30%, transparent 78%);
+    -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 0%, #000 30%, transparent 78%);
+  }
+  ::selection{background:var(--hi);color:#090B12}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 26px}
+  .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+  .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  code{
+    font-family:var(--font-mono);
+    font-size:.86em;
+    background:rgba(255,255,255,.06);
+    border:1px solid var(--line);
+    padding:.06em .42em;border-radius:6px;
+    color:var(--cyl);
+    white-space:nowrap;
+  }
+  .chl{color:var(--hi)}  .che{color:var(--env)}  .chc{color:var(--cyl)}
+  b,strong{color:#FFF;font-weight:600}
+  em{font-style:normal;color:var(--muted)}
+
+  /* ---------- reveal ---------- */
+  [data-reveal]{opacity:0;transform:translateY(16px);transition:opacity .7s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1)}
+  [data-reveal].in{opacity:1;transform:none}
+  @media (prefers-reduced-motion:reduce){
+    [data-reveal]{opacity:1;transform:none;transition:none}
+    html{scroll-behavior:auto}
+  }
+
+  /* ---------- hero ---------- */
+  header.hero{padding:88px 0 40px;position:relative}
+  .kicker{
+    display:inline-flex;align-items:center;gap:10px;
+    font-family:var(--font-mono);font-size:12.5px;letter-spacing:.22em;
+    color:var(--hi);
+    border:1px solid rgba(211,243,107,.28);
+    background:var(--hi-dim);
+    padding:7px 14px;border-radius:999px;
+    margin-bottom:26px;
+  }
+  .kicker .dot{width:7px;height:7px;border-radius:50%;background:var(--hi);box-shadow:0 0 12px var(--hi);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  h1.hero-title{
+    font-family:var(--font-disp);
+    font-size:clamp(32px,5.2vw,58px);
+    line-height:1.08;font-weight:700;letter-spacing:-.01em;
+    max-width:16em;
+  }
+  h1.hero-title .accent{color:var(--hi)}
+  .hero-sub{
+    margin-top:20px;max-width:57em;color:var(--ink-2);
+    font-size:clamp(15px,2vw,17.5px);line-height:1.82;
+  }
+  .hero-meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;
+    font-family:var(--font-mono);font-size:12.5px;color:var(--ink-2);
+    border:1px solid var(--line);background:rgba(255,255,255,.03);
+    padding:7px 13px;border-radius:999px;
+  }
+  .chip b{color:var(--ink)}
+  .chip .k{color:var(--faint)}
+  .chip .val{color:var(--cyl)}
+
+  /* key takeaways */
+  .takeaways{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:44px}
+  .tk{
+    position:relative;overflow:hidden;border-radius:var(--radius);
+    border:1px solid var(--line);background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    padding:20px 18px 18px;
+    transition:transform .35s ease,border-color .35s ease,box-shadow .35s ease;
+  }
+  .tk:hover{transform:translateY(-4px);border-color:var(--line-2);box-shadow:var(--shadow)}
+  .tk::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--hi),transparent 70%);opacity:.85}
+  .tk .tk-no{font-family:var(--font-mono);font-size:11px;letter-spacing:.18em;color:var(--faint)}
+  .tk h3{font-family:var(--font-disp);font-size:15.5px;margin:8px 0 8px;color:#FFF;line-height:1.45}
+  .tk p{font-size:13.2px;color:var(--muted);line-height:1.66}
+  .tk .big{font-family:var(--font-mono);font-size:16px;color:var(--hi);font-weight:600}
+
+  /* ---------- section ---------- */
+  section{margin-top:88px}
+  .sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:26px;flex-wrap:wrap}
+  .sec-num{font-family:var(--font-disp);font-weight:700;font-size:20px;color:var(--hi)}
+  .sec-num small{display:block;font-family:var(--font-mono);font-size:10px;letter-spacing:.22em;color:var(--faint);font-weight:500}
+  h2.sec-title{font-family:var(--font-disp);font-size:clamp(21px,3vw,29px);font-weight:700;letter-spacing:-.01em}
+  .sec-desc{width:100%;color:var(--muted);font-size:14px;max-width:60em}
+  .sec-rule{flex:1;height:1px;background:linear-gradient(90deg,var(--line-2),transparent);align-self:center}
+
+  .panel{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--line);border-radius:var(--radius);padding:26px}
+  .panel-label{
+    display:inline-flex;align-items:center;gap:8px;
+    font-family:var(--font-mono);font-size:11px;letter-spacing:.16em;color:var(--faint);
+    margin-bottom:16px;
+  }
+  .panel-label::before{content:"";width:8px;height:8px;border-radius:2px;background:var(--hi)}
+
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:16px}
+  .legend span{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .sw-h{width:12px;height:12px;border-radius:3px;background:var(--hi);display:inline-block}
+  .sw-e{width:12px;height:12px;border-radius:3px;background:var(--env);display:inline-block}
+
+  /* ---------- spec strip ---------- */
+  .spec-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .spec{border:1px solid var(--line);border-radius:var(--radius-s);background:rgba(255,255,255,.025);padding:16px 16px 15px}
+  .spec .s-k{font-family:var(--font-mono);font-size:11px;letter-spacing:.14em;color:var(--hi);margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .spec .s-k svg{width:13px;height:13px;flex:none}
+  .spec p{font-size:13px;color:var(--ink-2);line-height:1.7}
+  .spec p .m{color:var(--faint);font-size:12px}
+  .note{
+    margin-top:14px;border:1px dashed var(--line-2);border-radius:var(--radius-s);
+    padding:12px 16px;font-size:13px;color:var(--muted);background:rgba(255,255,255,.02);
+  }
+  .note b{color:var(--hi)}
+
+  .spec,.stat,.feat,.ops,.tk,.proc-side,.e2e-side,.arch-col,.chart-card,.kc-col{min-width:0}
+
+  /* ---------- tables ---------- */
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius-s);background:rgba(255,255,255,.02)}
+  table{width:100%;border-collapse:collapse;min-width:640px}
+  th,td{text-align:left;padding:12px 16px;font-size:13.5px;border-bottom:1px solid var(--line);vertical-align:top}
+  thead th{font-family:var(--font-mono);font-size:11.5px;letter-spacing:.1em;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line-2)}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(255,255,255,.025)}
+  td:first-child{color:var(--ink-2)}
+  td .num{font-weight:500}
+  .d-hi{color:var(--hi)} .d-en{color:var(--env)} .d-ne{color:var(--muted)}
+  .pos{color:var(--hi)} .pos2{color:var(--cyl)} .neg{color:var(--env)} .flat{color:var(--muted)}
+
+  /* ---------- charts ---------- */
+  .chart-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  .chart-card{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:22px 22px 14px}
+  .chart-card .c-title{font-family:var(--font-disp);font-size:15.5px;color:#FFF;font-weight:600}
+  .chart-card .c-sub{font-family:var(--font-mono);font-size:11px;color:var(--faint);margin:3px 0 16px}
+
+  .bars-c{display:flex;flex-direction:column;gap:18px}
+  .bars-group .bg-label{font-family:var(--font-mono);font-size:12px;color:var(--ink-2);margin-bottom:8px;display:flex;justify-content:space-between}
+  .bars-group .bg-label .tag{color:var(--faint)}
+  .bars-row{display:flex;align-items:flex-end;gap:22px;height:150px;padding:0 4px}
+  .bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;height:100%;justify-content:flex-end}
+  .bar-col .b-val{font-family:var(--font-mono);font-size:14px;font-weight:600;line-height:1}
+  .bar-col .b-track{
+    width:100%;max-width:88px;height:0;border-radius:6px 6px 3px 3px;position:relative;
+    transition:height 1s cubic-bezier(.16,1,.3,1);
+  }
+  .bar-col .b-cap{font-family:var(--font-mono);font-size:11px;color:var(--muted)}
+  .bar-hy{background:linear-gradient(180deg,var(--hi),rgba(211,243,107,.5));box-shadow:0 0 24px -6px rgba(211,243,107,.5)}
+  .bar-en{background:linear-gradient(180deg,var(--env),rgba(242,178,92,.45));box-shadow:0 0 24px -8px rgba(242,178,92,.4)}
+  .bars-y{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10.5px;color:var(--faint);margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+
+  /* stat row */
+  .stat-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .stat{border:1px solid var(--line);border-radius:var(--radius-s);background:rgba(255,255,255,.025);padding:18px 18px 14px;text-align:left;position:relative;overflow:hidden}
+  .stat .st-k{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;color:var(--faint)}
+  .stat .st-v{font-family:var(--font-disp);font-size:clamp(24px,3.2vw,34px);font-weight:700;color:var(--cyl);margin:6px 0 2px;line-height:1.05}
+  .stat .st-v .unit{font-size:.55em;color:var(--muted);font-weight:500}
+  .stat .st-d{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.55}
+  .stat.accent .st-v{color:var(--hi)}
+  .stat::after{content:"";position:absolute;inset:0;background:radial-gradient(220px 90px at 88% -10%,rgba(255,255,255,.06),transparent)}
+
+  /* kernel panel */
+  .kernel-panel{border:1px solid rgba(106,198,242,.25);background:linear-gradient(180deg,rgba(106,198,242,.07),rgba(106,198,242,.02) 45%),var(--panel)}
+  .kernel-panel .panel-label::before{background:var(--cyl)}
+  .kernel-compare{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0;margin-top:8px}
+  .kc-col{padding:18px 22px;font-size:13px;color:var(--muted)}
+  .kc-col + .kc-col{border-left:1px dashed var(--line-2)}
+  .kc-col h4{font-family:var(--font-mono);font-size:12.5px;color:var(--ink);margin-bottom:10px;letter-spacing:.04em}
+  .kc-col ul{list-style:none;display:grid;gap:8px}
+  .kc-col li{display:flex;justify-content:space-between;gap:12px;border-bottom:1px dotted var(--line);padding-bottom:8px}
+  .kc-col li:last-child{border-bottom:none;padding-bottom:0}
+  .kc-col li b{font-weight:600}
+
+  /* line chart */
+  .curve-card{padding:24px 22px 14px}
+  .curve-legend{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:8px;font-size:12.5px;color:var(--muted)}
+  .curve-legend span{display:inline-flex;align-items:center;gap:7px}
+  .lg-line{width:18px;height:2.5px;border-radius:2px;background:var(--hi)}
+  .lg-line.en{background:var(--env)}
+  .lg-band{width:18px;height:9px;border-radius:2px;background:var(--hi-dim);border:1px solid rgba(211,243,107,.4)}
+  .lg-marker{width:18px;height:2px;background:repeating-linear-gradient(90deg,var(--cyl) 0 4px,transparent 4px 7px)}
+  .curve-svg{width:100%;height:auto;display:block}
+  .curve-labels{display:flex;justify-content:space-between;margin-top:4px;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+  .curve-labels span{flex:1;text-align:center}
+  .curve-note{font-size:12.5px;color:var(--muted);background:rgba(255,255,255,.03);border:1px dashed var(--line-2);border-radius:var(--radius-s);padding:10px 14px;margin-top:14px}
+  .curve-note b{color:var(--cyl)}
+
+  /* e2e */
+  .e2e-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  .e2e-side{border:1px solid var(--line);border-radius:var(--radius-s);padding:16px 20px;background:rgba(255,255,255,.025)}
+  .e2e-side .head{display:flex;align-items:center;gap:9px;font-family:var(--font-disp);font-weight:600;color:#FFF;font-size:14.5px;margin-bottom:12px}
+  .e2e-side .dot{width:9px;height:9px;border-radius:50%}
+  .e2e-side.hy .dot{background:var(--hi)} .e2e-side.en .dot{background:var(--env)}
+  .samples{display:flex;gap:10px;flex-wrap:wrap}
+  .smp{font-family:var(--font-mono);font-size:14.5px;color:var(--ink);background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:8px;padding:8px 12px;line-height:1}
+  .smp .s{color:var(--faint);font-size:10.5px;display:block;margin-bottom:5px;line-height:1}
+  .smp.hot{color:var(--hi)}
+
+  /* ---------- resource ---------- */
+  .res-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:16px}
+  .r-top{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11.5px;color:var(--faint);margin-bottom:6px;flex-wrap:wrap;gap:4px}
+  .r-bar-track{position:relative;height:52px;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.02);overflow:hidden;margin:0 0 6px}
+  .r-bar{position:absolute;top:0;bottom:0;border-radius:9px;width:0;transition:width 1.1s cubic-bezier(.16,1,.3,1)}
+  .r-bar.hy{left:0;background:linear-gradient(90deg,rgba(211,243,107,.45),var(--hi));box-shadow:0 0 26px -6px rgba(211,243,107,.55)}
+  .r-bar.en{left:0;background:linear-gradient(90deg,rgba(242,178,92,.4),var(--env));box-shadow:0 0 26px -8px rgba(242,178,92,.45)}
+  .r-bar .tag{font-family:var(--font-mono);font-size:12.5px;font-weight:600;color:#090B12;white-space:nowrap;line-height:52px;position:absolute;top:0}
+  .r-scale{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10px;color:var(--faint);flex-wrap:wrap}
+  .proc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:0}
+  .proc-side{border:1px solid var(--line);border-radius:var(--radius-s);padding:16px 18px;background:rgba(255,255,255,.025)}
+  .proc-side .pnum{font-family:var(--font-disp);font-size:36px;font-weight:700;line-height:1}
+  .proc-side.hy .pnum{color:var(--hi)} .proc-side.en .pnum{color:var(--env)}
+  .proc-side .plabel{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.7}
+  .res-mini{padding:18px 20px}
+  .res-mini ul{list-style:none;display:grid;gap:10px;font-size:13.5px;color:var(--ink-2)}
+  .res-mini ul dw{color:var(--muted)}
+
+  /* ---------- two-column arch ---------- */
+  .arch-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  .arch-col{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+  .arch-col .a-head{padding:16px 20px;font-family:var(--font-disp);font-weight:700;font-size:16px;display:flex;align-items:center;gap:10px}
+  .arch-col .a-head .tag{font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;opacity:.85}
+  .arch-col.hy .a-head{background:var(--hi-dim);color:var(--hi);border-bottom:1px solid rgba(211,243,107,.22)}
+  .arch-col.en .a-head{background:var(--env-dim);color:var(--env);border-bottom:1px solid rgba(242,178,92,.2)}
+  .arch-col .a-body{padding:4px 20px 14px;background:rgba(255,255,255,.015)}
+  .a-row{padding:13px 0;border-bottom:1px dotted var(--line)}
+  .a-row:last-child{border-bottom:none}
+  .a-row .a-k{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;color:var(--faint);margin-bottom:5px}
+  .a-row .a-v{font-size:13.5px;color:var(--ink-2);line-height:1.72}
+  .a-row .a-v b{color:#FFF}
+
+  /* ---------- feature grid (§4) ---------- */
+  .fgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .feat{border:1px solid var(--line);border-radius:var(--radius-s);background:rgba(255,255,255,.025);padding:18px 18px 14px;position:relative;overflow:hidden}
+  .feat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--hi);opacity:0;transition:opacity .3s}
+  .feat:hover::before{opacity:1}
+  .feat .f-tag{font-family:var(--font-mono);font-size:10px;letter-spacing:.16em;color:var(--hi);margin-bottom:8px;display:block}
+  .feat h4{font-family:var(--font-disp);font-size:15px;color:#FFF;font-weight:600;margin-bottom:8px}
+  .feat p{font-size:13px;color:var(--muted);line-height:1.72}
+  .feat p b{color:var(--ink-2)}
+  .feat.pipe{grid-column:1 / -1}
+  .pipe-flow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px}
+  .pipe-node{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-2);border:1px solid var(--line-2);background:rgba(255,255,255,.04);padding:5px 9px;border-radius:7px}
+  .pipe-arr{color:var(--hi);font-family:var(--font-mono);font-size:13px}
+
+  /* ---------- ops ---------- */
+  .ops-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .ops{border:1px solid var(--line);border-radius:var(--radius-s);background:rgba(255,255,255,.025);padding:18px}
+  .ops .o-ico{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;background:var(--cyl-dim);border:1px solid rgba(106,198,242,.25);margin-bottom:12px}
+  .ops .o-ico svg{width:17px;height:17px;stroke:var(--cyl);stroke-linecap:round}
+  .ops h4{font-family:var(--font-disp);font-size:14.5px;color:#FFF;font-weight:600;margin-bottom:7px}
+  .ops p{font-size:12.5px;color:var(--muted);line-height:1.68}
+  .ops p code{font-size:.9em}
+
+  /* ---------- honest limitations ---------- */
+  .lim-head-wrap{display:flex;align-items:center;gap:14px;margin-bottom:20px;flex-wrap:wrap}
+  .lim-head-wrap .flag{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:12px;letter-spacing:.1em;color:var(--rose);border:1px solid rgba(231,138,126,.35);background:var(--rose-dim);padding:6px 12px;border-radius:999px}
+  .lim-list{display:grid;gap:12px}
+  .lim{border:1px dashed rgba(231,138,126,.28);border-radius:var(--radius-s);background:linear-gradient(180deg,rgba(231,138,126,.045),rgba(231,138,126,.015));padding:16px 18px;display:grid;grid-template-columns:52px 1fr;gap:14px;align-items:start}
+  .lim .l-no{font-family:var(--font-disp);font-weight:700;font-size:22px;color:rgba(231,138,126,.55);line-height:1.2}
+  .lim h4{font-size:14.5px;color:var(--ink);font-weight:600;margin-bottom:5px;font-family:var(--font-disp)}
+  .lim p{font-size:13px;color:var(--ink-2);opacity:.85;line-height:1.74}
+  .lim p b{color:#FFF}
+
+  /* ---------- conclusion ---------- */
+  .decision{border-radius:var(--radius);background:linear-gradient(160deg,var(--hi-dim),transparent 46%),var(--panel);border:1px solid rgba(211,243,107,.3);padding:30px;position:relative;overflow:hidden}
+  .decision::before{content:"";position:absolute;top:-60px;right:-60px;width:240px;height:240px;border-radius:50%;background:radial-gradient(circle,rgba(211,243,107,.14),transparent 70%)}
+  .verdict{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px;position:relative}
+  .verdict .v-badge{font-family:var(--font-disp);font-weight:700;font-size:15px;color:#090B12;background:var(--hi);padding:8px 16px;border-radius:999px;box-shadow:0 6px 24px -8px rgba(211,243,107,.6)}
+  .verdict h3{font-family:var(--font-disp);font-size:clamp(18px,2.4vw,24px);color:#FFF}
+  .decision p{font-size:14px;color:var(--ink-2);line-height:1.8;margin-top:6px;position:relative}
+  .decision p b{color:#FFF}
+  .decision .dul{margin-top:18px;padding-top:16px;border-top:1px dashed rgba(211,243,107,.25);position:relative}
+  .decision .dul h4{font-family:var(--font-disp);font-size:13.5px;color:var(--hi);margin-bottom:10px}
+  .keep-native{margin-top:16px;border-radius:var(--radius-s);border:1px solid var(--line);background:rgba(255,255,255,.025);padding:18px 20px;position:relative}
+  .keep-native h4{font-family:var(--font-disp);font-size:14.5px;color:var(--env);margin-bottom:9px}
+  .keep-native ul{list-style:none;display:grid;gap:7px}
+  .keep-native li{font-size:13.5px;color:var(--ink-2);padding-left:20px;position:relative}
+  .keep-native li::before{content:"→";position:absolute;left:0;color:var(--env);font-family:var(--font-mono)}
+  .keep-native li b{color:#FFF}
+  .followups{margin-top:16px;display:flex;flex-wrap:wrap;gap:8px;position:relative}
+  .fchip{font-family:var(--font-mono);font-size:12px;color:var(--muted);border:1px dashed var(--line-2);border-radius:999px;padding:6px 12px}
+  .fchip .k{color:var(--cyl)}
+
+  /* ---------- evidence ---------- */
+  .gitchain{margin-top:14px;border:1px dashed var(--line-2);border-radius:var(--radius-s);padding:16px 18px;font-size:12.5px;color:var(--muted);background:rgba(255,255,255,.02)}
+  .gitchain .chain{display:flex;flex-wrap:wrap;align-items:center}
+  .gitchain .g-label{font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;color:var(--faint);margin-right:10px}
+  .gitchain .gh{font-family:var(--font-mono);color:var(--cyl);border:1px solid var(--line);background:rgba(255,255,255,.04);border-radius:6px;padding:2px 7px;font-size:11.5px}
+  .gitchain .gsep{color:var(--faint);margin:0 3px;font-family:var(--font-mono)}
+  .gitchain .ghtip{font-size:11px;color:var(--faint)}
+
+  /* ---------- footer ---------- */
+  footer{margin-top:90px;border-top:1px solid var(--line);padding:34px 0 64px;color:var(--faint);font-size:12.5px}
+  footer .f-row{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  footer .mono{font-size:11.5px;line-height:2}
+  footer a{color:var(--cyl);text-decoration:none}
+  footer .gennote{max-width:52em;margin-top:14px;line-height:1.8}
+
+  .anchor{height:0;display:block;position:relative;top:-36px}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:1020px){
+    .takeaways{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .stat-row{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .chart-grid,.res-grid,.arch-grid,.e2e-row{grid-template-columns:minmax(0,1fr)}
+    .spec-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .fgrid{grid-template-columns:minmax(0,1fr)}
+    .ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .kc-col{padding:4px 2px}
+    .kc-col+.kc-col{border-left:none;border-top:1px dashed var(--line-2);padding-top:16px;margin-top:10px}
+  }
+  @media (max-width:640px){
+    .wrap{padding:0 16px}
+    .takeaways,.stat-row,.spec-grid,.ops-grid{grid-template-columns:minmax(0,1fr)}
+    code{white-space:normal;overflow-wrap:anywhere}
+    .mono{overflow-wrap:anywhere}
+    .res-mini ul, footer .mono{overflow-wrap:anywhere}
+    .gitchain .gh{white-space:nowrap}
+    .lim{grid-template-columns:1fr;gap:6px}
+    header.hero{padding:56px 0 28px}
+    .feat.pipe{grid-column:auto}
+  }
+
+  /* ---------- print ---------- */
+  @media print{
+    :root{
+      --bg:#fff;--bg-2:#fff;--panel:#fafafa;--panel-2:#fff;
+      --line:#ddd;--line-2:#bbb;--ink:#111;--ink-2:#222;--muted:#444;--faint:#666;
+      --hi:#2e7d32;--env:#a35a00;--cyl:#0a67b7;--rose:#a33b2a;
+      --hi-dim:#eef6e0;--env-dim:#fbf1e0;--cyl-dim:#e7f2fb;--rose-dim:#fbeae6;
+    }
+    body::before,body::after{display:none}
+    [data-reveal]{opacity:1 !important;transform:none !important}
+    section{margin-top:36px}
+    .bar-hy,.bar-en,.r-bar.hy,.r-bar.en{box-shadow:none !important}
+    .tk,.panel,.chart-card,.decision,.stat,.spec,.feat,.ops,.lim,.keep-native{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="wrap">
+    <div class="kicker" data-reveal><span class="dot"></span>GPUStack VALIDATION · FINAL SAME-RIG REPORT</div>
+    <h1 class="hero-title" data-reveal>Hygress <span class="accent">vs</span> 原生 Higress（envoy）</h1>
+    <p class="hero-sub" data-reveal>
+      最终同 rig 对比报告——同一 GPUStack 主机、同 wrk、同 <code>:80/readyz</code>，顺序 hygress→higress→hygress 一次会话完成。
+      吞吐 <b class="chl">c16 +4.8%、c64 +20.3%</b>，p50 −7.8% / −12.0%、p99 −5.3% / −20.6%，
+      数据面 <b class="chl">1 进程 / ~108MB RSS</b> vs <b class="che">4 进程 / ~2.54GB</b>（≈23×），网关内核下限 <b class="chc">13.6k req/s、p99 6ms 平坦</b>。
+    </p>
+    <div class="hero-meta" data-reveal>
+      <span class="chip"><span class="k">日期</span>&nbsp;<b>2026-09-05</b></span>
+      <span class="chip"><span class="k">hygress 构建</span>&nbsp;<span class="val">3b6beabc</span></span>
+      <span class="chip"><span class="k">原生 higress</span>&nbsp;<span class="val">55ecc762</span></span>
+      <span class="chip"><span class="k">路径</span>&nbsp;<b>GET :80/readyz</b></span>
+      <span class="chip"><span class="k">wrk</span>&nbsp;<b>盒内 · c16/c64</b></span>
+    </div>
+
+    <div class="takeaways">
+      <article class="tk" data-reveal>
+        <div class="tk-no">KEY TAKEAWAY 01</div>
+        <h3>性能持平或反超</h3>
+        <p>同 rig wrk 对比（同一 GPUStack 主机、同 wrk、同 <code>:80/readyz</code>，顺序 hygress→higress→hygress），吞吐 <span class="num chl">c16 +4.8%、c64 +20.3%</span>，p50 <span class="num che">−7.8% / −12.0%</span>、p99 <span class="num che">−5.3% / −20.6%</span>（证据 <span class="num">bench_final_*.txt</span>，构建 <span class="num">3b6beabc</span> vs <span class="num">55ecc762</span>）。</p>
+      </article>
+      <article class="tk" data-reveal>
+        <div class="tk-no">KEY TAKEAWAY 02</div>
+        <h3>内核平坦 · 尾非网关</h3>
+        <p><span class="big">13.6k req/s</span> 下限、p99 <span class="num chc">6ms 平坦</span>（§11 自服务 healthz 判定器）：<code>:80/readyz</code> 的 ~1.1k req/s 与周期性 p99 尾部<b>归因于共享镜像上游</b>，非网关内核——两侧在镜像路径上呈现同款尾部。</p>
+      </article>
+      <article class="tk" data-reveal>
+        <div class="tk-no">KEY TAKEAWAY 03</div>
+        <h3>资源数量级优势</h3>
+        <p>数据面 <span class="num chl">1</span> 进程 / ~108MB RSS vs <span class="num che">4</span> 进程 / ~2.54GB（<b>≈23×</b>）；镜像内网关二进制 <span class="num chl">27MB</span> vs <span class="num che">~905MB</span>（≈34×）。</p>
+      </article>
+      <article class="tk" data-reveal>
+        <div class="tk-no">KEY TAKEAWAY 04</div>
+        <h3>可运维 · 原位替换</h3>
+        <p>单二进制原位替换（零 Python 改动、s6 一键回滚）、<b>9 插件等价</b>原生 Rust 管线、控制面 WATCH 事件化热更（稳态零 LIST）、限流/配额/路由策略/护栏真机验证通过。</p>
+      </article>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ============ §0 测量环境与方法 ============ -->
+  <span class="anchor" id="env"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§0<small>SCOPE</small></span>
+      <h2 class="sec-title">测量环境与方法</h2>
+      <span class="sec-rule"></span>
+    </div>
+    <div class="spec-grid">
+      <div class="spec">
+        <div class="s-k">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          同 rig 测试机
+        </div>
+        <p>同一 GPUStack 主机 <span class="mono m">gpu-14c528e0-…</span>（Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker）。server 先后以 <span class="mono m">gpustack:hygress</span>（构建 <span class="mono m">3b6beabc</span>）与原生 <span class="mono m">quay.io/gpustack/gpustack:latest</span>（<span class="mono m">55ecc762</span>）运行；worker/模型实例（qwen2.5-0.5b-instruct）/数据卷不动；顺序 <b>A/B/A</b> 一次会话完成，切换后健康验证通过。</p>
+      </div>
+      <div class="spec">
+        <div class="s-k">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          负载与参数
+        </div>
+        <p>盒内 wrk，<span class="mono m">GET :80/readyz</span>（镜像透传路径，两端均实时 200）。<b>c16</b> = <span class="mono m">-t4 -c16 -d30s</span>，<b>c64</b> = <span class="mono m">-t8 -c64 -d20s</span>；内核下限 <span class="mono m">:8081/healthz</span>（hygress 自服务，无上游）。</p>
+      </div>
+      <div class="spec">
+        <div class="s-k">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+          口径与判据
+        </div>
+        <p>req/s 为主判据（envoy 的 <span class="mono m">/readyz</span> 响应体约 <b>1.9×</b> 大：<span class="mono m">249 B/req</span> vs <span class="mono m">134 B/req</span>，Transfer 不可直接比）；p50/p99/avg 并列列出。</p>
+      </div>
+      <div class="spec">
+        <div class="s-k">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/><path d="M9 12l2 2 4-4"/></svg>
+          P1 修复生效确认
+        </div>
+        <p>hygress 侧 wrk <span class="mono m">Socket errors: read</span> 已从“≈全量”（§6/§7）降为 <b class="chl">0</b>（本组 final 文件无 errors 行）；envoy 侧同为 0。两侧同为 keep-alive 口径，对比公平。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §1 性能对比 ============ -->
+  <span class="anchor" id="perf"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§1<small>PERFORMANCE</small></span>
+      <h2 class="sec-title">性能对比</h2>
+      <span class="sec-rule"></span>
+    </div>
+
+    <!-- 1.1 A/B -->
+    <div class="sec-head" style="margin-bottom:16px">
+      <span style="font-family:var(--font-disp);font-weight:700;color:var(--hi);font-size:15px">1.1</span>
+      <h3 style="font-family:var(--font-disp);font-weight:700;font-size:19px;color:var(--ink)">最终同 rig A/B/A（<span class="mono">:80/readyz</span> 镜像路径，2026-09-05）</h3>
+    </div>
+
+    <div class="legend">
+      <span><span class="sw-h"></span> hygress（<span class="mono">3b6beabc</span>，threads=16）</span>
+      <span><span class="sw-e"></span> 原生 higress/envoy（<span class="mono">55ecc762</span>）</span>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <caption style="position:absolute;left:-9999px">1.1 最终同 rig A/B/A 对比：hygress 与原生 higress/envoy 的 c16/c64 吞吐、p50/p99、avg、Socket errors 与 Transfer。</caption>
+        <thead>
+          <tr>
+            <th scope="col">指标</th>
+            <th scope="col">hygress（3b6beabc，threads=16）</th>
+            <th scope="col">原生 higress/envoy（55ecc762）</th>
+            <th scope="col">差值（hygress vs envoy）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>c16 吞吐</td>
+            <td><span class="num d-hi">1127.4 req/s</span><br><span style="color:var(--faint);font-size:12px">33,884 req/30s</span></td>
+            <td><span class="num d-en">1075.3 req/s</span><br><span style="color:var(--faint);font-size:12px">32,304 req/30s</span></td>
+            <td class="pos"><b>+4.8%</b></td>
+          </tr>
+          <tr>
+            <td>c16 p50 / p99</td>
+            <td><span class="num d-hi">12.73 / 385.78 ms</span></td>
+            <td><span class="num d-en">13.80 / 407.21 ms</span></td>
+            <td class="pos2"><b>−7.8% / −5.3%</b></td>
+          </tr>
+          <tr>
+            <td>c16 avg</td>
+            <td><span class="num">31.75 ms</span></td>
+            <td><span class="num">28.23 ms</span></td>
+            <td class="neg">+12.5%<br><span style="color:var(--faint);font-size:12px">（尾部质量拖高均值，见 p99 分布）</span></td>
+          </tr>
+          <tr>
+            <td>c64 吞吐</td>
+            <td><span class="num d-hi">916.1 req/s</span><br><span style="color:var(--faint);font-size:12px">18,373 req/20s</span></td>
+            <td><span class="num d-en">761.7 req/s</span><br><span style="color:var(--faint);font-size:12px">15,276 req/20s</span></td>
+            <td class="pos"><b>+20.3%</b></td>
+          </tr>
+          <tr>
+            <td>c64 p50 / p99</td>
+            <td><span class="num d-hi">51.82 / 421.53 ms</span></td>
+            <td><span class="num d-en">58.90 / 530.55 ms</span></td>
+            <td class="pos2"><b>−12.0% / −20.6%</b></td>
+          </tr>
+          <tr>
+            <td>c64 avg</td>
+            <td><span class="num d-hi">99.05 ms</span></td>
+            <td><span class="num d-en">118.35 ms</span></td>
+            <td class="pos2">−16.3%</td>
+          </tr>
+          <tr>
+            <td>Socket errors: read</td>
+            <td><span class="num d-hi">0</span>（无 errors 行）</td>
+            <td><span class="num">0</span>（无 errors 行）</td>
+            <td class="flat">P1 keep-alive 两侧均健康</td>
+          </tr>
+          <tr>
+            <td>Transfer/run</td>
+            <td><span class="num">~4.4 MB</span></td>
+            <td><span class="num">~7.7 MB</span></td>
+            <td class="flat">envoy 响应体更大（见口径说明）</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">
+      hygress 全部四项主指标（吞吐/p50/p99）<b class="chl">均优于原生 envoy</b>；c64 优势（+20.3%）大于 c16（+4.8%），与 c64 更吃单请求 CPU/连接效率一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。两侧在 <code>:80/readyz</code> 上都有<b>周期性 ~300-500ms p99 尾</b>——见 §1.2 的归因判定：<b>非网关内核所致</b>。
+    </p>
+
+    <!-- charts: req/s & latency -->
+    <div class="chart-grid" style="margin-top:16px">
+      <div class="chart-card" data-reveal>
+        <div class="c-title">吞吐对比 · req/s</div>
+        <div class="c-sub mono">:80/readyz · hygress vs envoy · 柱高按最大值归一</div>
+        <div class="bars-c">
+          <div class="bars-group">
+            <div class="bg-label"><span>c16（-t4 -c16 -d30s）</span><span class="tag">t4 · 30s</span></div>
+            <div class="bars-row" data-bar="16">
+              <div class="bar-col">
+                <div class="b-val" style="color:var(--hi)">1127.4</div>
+                <div class="b-track bar-hy" data-h="100%"></div>
+                <div class="b-cap">hygress</div>
+              </div>
+              <div class="bar-col">
+                <div class="b-val" style="color:var(--env)">1075.3</div>
+                <div class="b-track bar-en" data-h="95.4%"></div>
+                <div class="b-cap">envoy</div>
+              </div>
+            </div>
+          </div>
+          <div class="bars-group">
+            <div class="bg-label"><span>c64（-t8 -c64 -d20s）</span><span class="tag">t8 · 20s</span></div>
+            <div class="bars-row" data-bar="64">
+              <div class="bar-col">
+                <div class="b-val" style="color:var(--hi)">916.1</div>
+                <div class="b-track bar-hy" data-h="81.3%"></div>
+                <div class="b-cap">hygress</div>
+              </div>
+              <div class="bar-col">
+                <div class="b-val" style="color:var(--env)">761.7</div>
+                <div class="b-track bar-en" data-h="67.6%"></div>
+                <div class="b-cap">envoy</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="bars-y"><span>0</span><span>400</span><span>800</span><span>1200</span></div>
+      </div>
+
+      <div class="chart-card" data-reveal>
+        <div class="c-title">延迟对比 · p50 / p99（ms）</div>
+        <div class="c-sub mono">:80/readyz · hygress vs envoy · 同刻度（尾越短越优）</div>
+        <div class="bars-c">
+          <div class="bars-group">
+            <div class="bg-label"><span>c16 · p50</span><span class="tag">ms</span></div>
+            <div class="bars-row" data-bar="p5016">
+              <div class="bar-col"><div class="b-val" style="color:var(--hi)">12.73</div><div class="b-track bar-hy" data-h="2.4%"></div><div class="b-cap">hygress</div></div>
+              <div class="bar-col"><div class="b-val" style="color:var(--env)">13.80</div><div class="b-track bar-en" data-h="2.6%"></div><div class="b-cap">envoy</div></div>
+            </div>
+          </div>
+          <div class="bars-group">
+            <div class="bg-label"><span>c16 · p99</span><span class="tag">ms</span></div>
+            <div class="bars-row" data-bar="p9916">
+              <div class="bar-col"><div class="b-val" style="color:var(--hi)">385.78</div><div class="b-track bar-hy" data-h="72.7%"></div><div class="b-cap">hygress</div></div>
+              <div class="bar-col"><div class="b-val" style="color:var(--env)">407.21</div><div class="b-track bar-en" data-h="76.8%"></div><div class="b-cap">envoy</div></div>
+            </div>
+          </div>
+          <div class="bars-group">
+            <div class="bg-label"><span>c64 · p50</span><span class="tag">ms</span></div>
+            <div class="bars-row" data-bar="p5064">
+              <div class="bar-col"><div class="b-val" style="color:var(--hi)">51.82</div><div class="b-track bar-hy" data-h="9.8%"></div><div class="b-cap">hygress</div></div>
+              <div class="bar-col"><div class="b-val" style="color:var(--env)">58.90</div><div class="b-track bar-en" data-h="11.1%"></div><div class="b-cap">envoy</div></div>
+            </div>
+          </div>
+          <div class="bars-group">
+            <div class="bg-label"><span>c64 · p99</span><span class="tag">ms</span></div>
+            <div class="bars-row" data-bar="p9964">
+              <div class="bar-col"><div class="b-val" style="color:var(--hi)">421.53</div><div class="b-track bar-hy" data-h="79.5%"></div><div class="b-cap">hygress</div></div>
+              <div class="bar-col"><div class="b-val" style="color:var(--env)">530.55</div><div class="b-track bar-en" data-h="100%"></div><div class="b-cap">envoy</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="bars-y"><span>0</span><span>~180</span><span>~360</span><span>~530</span></div>
+      </div>
+    </div>
+
+    <!-- 1.2 内核下限 -->
+    <div class="sec-head" style="margin:36px 0 16px">
+      <span style="font-family:var(--font-disp);font-weight:700;color:var(--hi);font-size:15px">1.2</span>
+      <h3 style="font-family:var(--font-disp);font-weight:700;font-size:19px;color:var(--ink)">网关内核下限（<span class="mono">:8081/healthz</span> 自服务端点，无上游，Phase 3.1）</h3>
+    </div>
+
+    <div class="kernel-panel panel" data-reveal>
+      <div class="panel-label">PURE KERNEL · PINGORA ACCEPT+PARSE+RESPOND</div>
+      <div class="stat-row">
+        <div class="stat accent">
+          <div class="st-k">c16 吞吐</div>
+          <div class="st-v num">13,598.67<span class="unit"> req/s</span></div>
+          <div class="st-d">vs <code>:80/readyz</code> 1,127.4 req/s —— 内核 <b>平坦且快 ~12×</b></div>
+        </div>
+        <div class="stat">
+          <div class="st-k">c16 p50</div>
+          <div class="st-v num">0.736<span class="unit"> ms</span></div>
+          <div class="st-d">vs 12.73 ms（镜像路径）</div>
+        </div>
+        <div class="stat">
+          <div class="st-k">c16 p99（30s + 重复×3）</div>
+          <div class="st-v num">6.07<span class="unit"> ms</span></div>
+          <div class="st-d">重复 5.6–6.9，<b>平坦</b>·无周期尾；vs 385.8 ms（周期性尖峰）</div>
+        </div>
+        <div class="stat accent" style="--cyl:var(--cyl)">
+          <div class="st-k">c64 吞吐 / p50 / p99</div>
+          <div class="st-v" style="color:var(--cyl)"><span style="font-size:.6em">14,537</span></div>
+          <div class="st-d">c64 吞吐 14,537 · p50 2.49 ms · p99 24.4 ms</div>
+        </div>
+      </div>
+      <div class="kernel-compare">
+        <div class="kc-col">
+          <h4>▍ hygress 内核（admin :8081/healthz）</h4>
+          <ul>
+            <li><span>c16 吞吐</span><b>13,598.67 req/s</b></li>
+            <li><span>c16 p50</span><b>0.736 ms</b></li>
+            <li><span>c16 p99（30s + 重复×3）</span><b>6.07 ms（5.6–6.9，平坦）</b></li>
+            <li><span>c64 吞吐 / p50 / p99</span><b>14,537 / 2.49 / 24.4 ms</b></li>
+          </ul>
+        </div>
+        <div class="kc-col">
+          <h4>▍ :80/readyz（含共享镜像上游）</h4>
+          <ul>
+            <li><span>c16 吞吐</span><b>1,127.4 req/s</b></li>
+            <li><span>c16 p50</span><b>12.73 ms</b></li>
+            <li><span>c16 p99</span><b>385.8 ms（周期性尖峰）</b></li>
+            <li><span>c64 吞吐 / p50 / p99</span><b>916.1 / 51.8 / 421.5 ms</b></li>
+          </ul>
+        </div>
+      </div>
+      <p class="note">
+        <b class="chc">判定（决定性）</b>：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）<b>平坦且快 ~12×</b>——p99 个位数毫秒、无周期尾。<code>:80/readyz</code> 的吞吐天花板（~1.1k）与周期性尾部<b>归因于共享镜像上游</b>（GPUStack worker 的 <code>/readyz</code> 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧同等“taily”。这解释了 §8→§10 的现象链：P1（连接churn）/P2（单线程）/P4（控制面轮询）逐一消除网关侧开销后，<code>:80/readyz</code> 的 p99 只随上游波动。<br>
+        <b>诚实说明</b>：admin 端点当前仍为 close-delimited 响应（<code>read errors ≈ 全量</code>，P1 nitpick #1）——即 13.6k req/s 是在<b>每请求 TCP 拆建</b>的不利条件下测得的内核下限，只会低估；如需 keep-alive 口径属一行 CL 修复（非热路径、可选）。跨网关“纯内核对纯内核”的正式对比（envoy admin 端点等效测量）留作 Phase 3.2 可选待办。
+      </p>
+    </div>
+
+    <!-- 1.3 优化曲线 -->
+    <div class="sec-head" style="margin:36px 0 16px">
+      <span style="font-family:var(--font-disp);font-weight:700;color:var(--hi);font-size:15px">1.3</span>
+      <h3 style="font-family:var(--font-disp);font-weight:700;font-size:19px;color:var(--ink)">优化全程曲线（同 rig wrk，<span class="mono">:80/readyz</span>）</h3>
+    </div>
+
+    <div class="chart-card curve-card" data-reveal>
+      <div class="c-title">c16 req/s · 修复前 → 最终 A/B</div>
+      <div class="c-sub mono">6a1e155e(旧) → 857d21b → 5df02f2 → 815ebd3 → 493dc21 → cf4f6c5(WATCH) → 3b6beabc(最终) · envoy 参照</div>
+      <div class="curve-legend">
+        <span><span class="lg-line"></span> hygress（c16 req/s）</span>
+        <span><span class="lg-line en"></span> 原生 envoy 参照（1075.3）</span>
+        <span><span class="lg-band"></span> WATCH 阶段区间 1119–1143</span>
+        <span><span class="lg-marker"></span> 内核下限（离域标注 13,598.67）</span>
+      </div>
+      <div id="curveA" class="curve-svg" role="img" aria-label="优化全程曲线：c16 req/s 从修复前 518，经 857d21b 的 1093、5df02f2 的 1099.3、815ebd3 的 1091.7、493dc21 的 1152.3、cf4f6c5 WATCH 区间 1119 至 1143、最终 3b6beabc 的 1127.4；原生 envoy 参照线 1075.3；内核下限 13598.67 离域标注"></div>
+      <div id="curveA-labels" class="curve-labels"></div>
+      <p class="curve-note">
+        <b>判读链</b>：① P1 根治 read-errors（close-delimited framing 根因，pingora <code>init_close_delimited</code> 实证）；② P2 消除单 worker 串行化（c64 +7.7%）；③ P4 消除控制面周期重建尖峰（p99 −23/−25%）；④ WATCH 后尾未扁平 + §11 内核平坦 → <b>周期尾最终归因共享上游</b>（非网关）；⑤ 同 rig 下 hygress 全指标 ≥ envoy。<br>
+        <b>离域说明</b>：内核下限 <span class="num">13,598.67 req/s</span>（p50 0.74ms / p99 6.1ms 平坦；c64 14,537）超出本图刻度约 12×，故以离域标记单独标注，不入主纵轴。
+      </p>
+    </div>
+
+    <div class="tbl-wrap" style="margin-top:14px" data-reveal>
+      <table>
+        <caption style="position:absolute;left:-9999px">1.3 优化全程曲线明细表：各阶段 c16/c64 req/s、p50/p99、read-errors 与关键变化。</caption>
+        <thead>
+          <tr>
+            <th scope="col">阶段（提交）</th>
+            <th scope="col">c16 req/s</th>
+            <th scope="col">c16 p50 / p99</th>
+            <th scope="col">c64 req/s</th>
+            <th scope="col">c64 p50 / p99</th>
+            <th scope="col">read-errors</th>
+            <th scope="col">关键变化</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>旧 hygress（修复前 <span class="mono">6a1e155e</span>，§6）</td>
+            <td><span class="num d-hi">518</span></td>
+            <td><span class="num">28.5 / 83 ms</span></td>
+            <td><span class="num">525</span></td>
+            <td><span class="num">111.6 / —</span></td>
+            <td class="neg">≈全量</td>
+            <td>每请求路由表重建 + 响应无 keep-alive</td>
+          </tr>
+          <tr>
+            <td><b>857d21b</b>（H1-H4/M5-M8，§6）</td>
+            <td><span class="num d-hi">1093</span></td>
+            <td><span class="num">13.4 / 417</span></td>
+            <td><span class="num">831</span></td>
+            <td><span class="num">57.0 / —</span></td>
+            <td class="neg">≈全量</td>
+            <td>路由表缓存 + keep-alive + body/SSE/SWRR/registry</td>
+          </tr>
+          <tr>
+            <td><b>5df02f2</b>（B1-B4 零拷贝，§7）</td>
+            <td><span class="num d-hi">1099.3</span></td>
+            <td><span class="num">13.4 / 390</span></td>
+            <td><span class="num">834.4</span></td>
+            <td><span class="num">56.6 / 548</span></td>
+            <td class="neg">≈全量</td>
+            <td>热路径零拷贝（大 body/SSE 受益，readyz 轻路径持平）</td>
+          </tr>
+          <tr>
+            <td><b>815ebd3</b>（P1/P2/P5，§8）</td>
+            <td><span class="num d-hi">1091.7</span></td>
+            <td><span class="num">— / 388</span></td>
+            <td><span class="num d-hi">898.3</span></td>
+            <td><span class="num">53.1 / 539</span></td>
+            <td class="pos"><b>0</b></td>
+            <td>响应 framing（keep-alive 真实生效）+ 数据面 16 线程</td>
+          </tr>
+          <tr>
+            <td><b>493dc21</b>（P4 指纹短路，§9）</td>
+            <td><span class="num d-hi">1152.3</span></td>
+            <td><span class="num">13.0 / 299</span></td>
+            <td><span class="num d-hi">968.3</span></td>
+            <td><span class="num">51.3 / 403</span></td>
+            <td class="pos">0</td>
+            <td>控制 1s 全量 LIST+重建消除 → p99 −23/−25%</td>
+          </tr>
+          <tr>
+            <td><b>cf4f6c5</b>（Phase 1.1 WATCH，§10）</td>
+            <td><span class="num d-hi">1119-1143</span></td>
+            <td><span class="num">12.6 / 388-481</span></td>
+            <td><span class="num">824</span></td>
+            <td><span class="num">50.0 / 577</span></td>
+            <td class="pos">0</td>
+            <td>控制面稳态零 LIST；尾未扁平 → 尾源非控制面</td>
+          </tr>
+          <tr>
+            <td><b>fc25a87</b>（§11 内核下限）</td>
+            <td><span class="num chc">13,598.67</span><br><span style="color:var(--faint);font-size:12px">p50 0.74ms / p99 6.1ms 平坦</span></td>
+            <td><span class="num">—</span></td>
+            <td><span class="num chc">14,537</span>（c64）</td>
+            <td><span class="num">—</span></td>
+            <td class="flat">（admin close-delimited）</td>
+            <td>归因判定器：尾源 = 共享上游</td>
+          </tr>
+          <tr>
+            <td><b>最终 A/B</b>（本报告，<span class="mono">3b6beabc</span>）</td>
+            <td><span class="num d-hi">1127.4</span></td>
+            <td><span class="num">12.73 / 385.78</span></td>
+            <td><span class="num d-hi">916.1</span></td>
+            <td><span class="num">51.8 / 421.5</span></td>
+            <td class="pos">0</td>
+            <td>对 envoy：+4.8%/+20.3%，p50/p99 全优</td>
+          </tr>
+          <tr>
+            <td>原生 envoy（同 rig）</td>
+            <td><span class="num d-en">1075.3</span></td>
+            <td><span class="num">13.8 / 407.2</span></td>
+            <td><span class="num d-en">761.7</span></td>
+            <td><span class="num">58.9 / 530.6</span></td>
+            <td class="pos">0</td>
+            <td>—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 1.4 e2e -->
+    <div class="sec-head" style="margin:36px 0 16px">
+      <span style="font-family:var(--font-disp);font-weight:700;color:var(--hi);font-size:15px">1.4</span>
+      <h3 style="font-family:var(--font-disp);font-weight:700;font-size:19px;color:var(--ink)">e2e 推理（<span class="mono">/v1/chat/completions</span>，GPU 受限，纯参考）</h3>
+    </div>
+    <div class="e2e-row">
+      <div class="e2e-side hy" data-reveal>
+        <div class="head"><span class="dot"></span> hygress · 三次采样 time_total</div>
+        <div class="samples">
+          <span class="smp hot"><span class="s">首采样含冷态</span>2.60<sup>*</sup> s</span>
+          <span class="smp"><span class="s">sample</span>0.169 s</span>
+          <span class="smp"><span class="s">sample</span>0.154 s</span>
+        </div>
+      </div>
+      <div class="e2e-side en" data-reveal>
+        <div class="head"><span class="dot"></span> 原生 envoy · 三次采样 time_total</div>
+        <div class="samples">
+          <span class="smp"><span class="s">sample</span>0.474 s</span>
+          <span class="smp"><span class="s">sample</span>0.184 s</span>
+          <span class="smp"><span class="s">sample</span>0.188 s</span>
+        </div>
+      </div>
+    </div>
+    <p class="note">
+      GPU/模型实例决定推理时长，网关增量（ms 级）不可从此分离；走势 hygress <b>不劣</b>。功能判据见 §4（usage 落库、CRD 一致）。
+    </p>
+  </section>
+
+  <!-- ============ §2 资源占用 ============ -->
+  <span class="anchor" id="res"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§2<small>RESOURCES</small></span>
+      <h2 class="sec-title">资源占用</h2>
+      <span class="sec-rule"></span>
+    </div>
+
+    <div class="res-grid">
+      <div class="panel" data-reveal>
+        <div class="panel-label">DATA-PLANE RSS · LOG-SCALE 示意（≈23×）</div>
+        <div class="r-top"><span>hygress 数据面</span><span>~108 MB（VmRSS 111,152 kB）</span></div>
+        <div class="r-bar-track">
+          <div class="r-bar hy" data-w="13%"><span class="tag" style="left:10px">~108 MB</span></div>
+        </div>
+        <div class="r-top" style="margin-top:16px"><span>原生 higress/envoy 套件</span><span>~2.54 GB（≈23×）</span></div>
+        <div class="r-bar-track">
+          <div class="r-bar en" data-w="100%"><span class="tag" style="right:10px">~2.54 GB</span></div>
+        </div>
+        <div class="r-scale">
+          <span>0 MB</span><span>108 MB</span><span>0.25G</span><span>0.5G</span><span>1G</span><span>2.54 GB</span>
+        </div>
+        <p style="font-family:var(--font-mono);font-size:9.5px;color:var(--faint);margin-top:4px">—— 对数示意 · 108MB → 2.54GB ≈ 23× ——</p>
+        <p class="note" style="margin-top:16px">
+          <b>诚实更新</b>：早期报告（benchmark.md §1，P2 多线程之前）实测 hygress RSS ≈22MB；当前 ~108MB 的增长来自 P2 的数据面多线程（threads=vCPU=16，3 个 pingora service + 控制面 runtime，实测 <code>ps -eLf</code> ≈68 线程/进程）与 WATCH 任务。以 ~16× 线程换取 c64 +20% 吞吐与尾延迟改善，属<b>有意权衡</b>；<b>即便如此仍 ≈23× 低于 envoy 套件</b>。早期 server 容器级口径（§1：794MiB vs 2.514GiB，净省 ≈1.7GB/68%）未在最终轮重测，引用时注意其为 P2 前数据。
+        </p>
+      </div>
+
+      <div>
+        <div class="proc-grid">
+          <div class="proc-side hy" data-reveal>
+            <div class="pnum num">1</div>
+            <div class="plabel">数据面进程数 · <b>hygress</b><br><span style="color:var(--faint);font-size:11.5px">单二进制 hygress（supercronic 除外，两侧同）</span></div>
+          </div>
+          <div class="proc-side en" data-reveal>
+            <div class="pnum num">4</div>
+            <div class="plabel">数据面进程数 · <b>原生 envoy 套件</b><br><span style="color:var(--faint);font-size:11.5px">4 → 1</span></div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:16px" data-reveal>
+          <div class="panel-label">PROCESS BREAKDOWN · envoy 套件</div>
+          <div class="tbl-wrap" style="border:none;background:transparent">
+            <table style="min-width:0">
+              <tbody>
+                <tr><td>envoy</td><td class="num" style="text-align:right">1.83 GB</td></tr>
+                <tr><td>pilot-agent</td><td class="num" style="text-align:right">0.51 GB</td></tr>
+                <tr><td>pilot-discovery</td><td class="num" style="text-align:right">85 MB</td></tr>
+                <tr><td>higress</td><td class="num" style="text-align:right">87 MB</td></tr>
+                <tr><td style="border-top:1px solid var(--line-2)"><b>合计 ≈</b></td><td class="num" style="text-align:right;border-top:1px solid var(--line-2)"><b class="che">~2.54 GB</b></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel res-mini" style="margin-top:16px" data-reveal>
+          <div class="panel-label">IMAGE / CONTAINER</div>
+          <ul>
+            <li>镜像内网关相关二进制：hygress <b class="chl">27 MB</b> vs envoy 套件 <b class="che">~905 MB</b>（envoy 734M + higress 91M + pilot-discovery 80M）≈ <b>34×</b>（§1 口径）。</li>
+            <li>容器内存（含 postgres/gpustack/prometheus/grafana 公共组件）：<span class="num">794MiB</span> vs <span class="num">2.514GiB</span>（§1 早期口径，净省 ≈1.7GB）。</li>
+            <li>镜像 ID 留档：hygress <span class="num chl">3b6beabc…</span>、higress <span class="num che">55ecc762…</span>（<code>final_*_image.txt</code>）。</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §3 架构与交付 ============ -->
+  <span class="anchor" id="arch"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§3<small>ARCHITECTURE</small></span>
+      <h2 class="sec-title">架构与交付</h2>
+      <span class="sec-rule"></span>
+    </div>
+
+    <div class="arch-grid">
+      <div class="arch-col en" data-reveal>
+        <div class="a-head">原生 Higress（envoy）</div>
+        <div class="a-body">
+          <div class="a-row"><div class="a-k">进程模型</div><div class="a-v">s6 托管 <b>4 进程</b>（apiserver / pilot / controller / envoy）</div></div>
+          <div class="a-row"><div class="a-k">数据面运行时</div><div class="a-v">Envoy + Wasm 运行时 + xDS</div></div>
+          <div class="a-row"><div class="a-k">控制面</div><div class="a-v">Istio/pilot 全量 <b>xDS 推送</b></div></div>
+          <div class="a-row"><div class="a-k">配置热更</div><div class="a-v">xDS</div></div>
+          <div class="a-row"><div class="a-k">扩展模型</div><div class="a-v">Wasm 插件（Go / 跨语言桥接）</div></div>
+          <div class="a-row"><div class="a-k">交付 / 回滚</div><div class="a-v">官方镜像体系</div></div>
+        </div>
+      </div>
+      <div class="arch-col hy" data-reveal>
+        <div class="a-head">Hygress</div>
+        <div class="a-body">
+          <div class="a-row"><div class="a-k">进程模型</div><div class="a-v"><b>单进程单二进制</b>（Pingora terminate-mode；pilot/controller 槽位 no-op + <code>notification-fd:3</code> 就绪字节）</div></div>
+          <div class="a-row"><div class="a-k">数据面运行时</div><div class="a-v">纯 Rust（pingora 0.8），<b>无 Wasm / 无 xDS</b></div></div>
+          <div class="a-row"><div class="a-k">控制面</div><div class="a-v">kube <b>WATCH 事件驱动</b>（Phase 1.1 <code>cf4f6c5</code>）：6 类 CRD 各一 watcher，事件 → 去抖 → 全量快照重建（rv 指纹幂等短路 + 30s 安全网 tick）；<b>稳态零 LIST / 零 JSON decode</b>，配置生效 ≤ 一个事件周期</div></div>
+          <div class="a-row"><div class="a-k">配置热更</div><div class="a-v">CRD WATCH（秒级内）+ <code>hygress.policy.yaml</code> 1s mtime 热重载 + admin <code>POST /reload</code></div></div>
+          <div class="a-row"><div class="a-k">扩展模型</div><div class="a-v">原生 Rust 管线（见 §4），<code>hygress.policy.yaml</code> 声明式延伸能力</div></div>
+          <div class="a-row"><div class="a-k">交付 / 回滚</div><div class="a-v">镜像层 s6 手术（<code>.dist</code> 原脚本快照），<b>换回镜像即回滚</b>；端口契约不变（80/443 数据面、127.0.0.1:8081 admin、15020 stats；永绑禁端口 9876/15010/15012/8888/15051 <b>零绑定</b>）</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §4 GPUStack 用到的部分 ============ -->
+  <span class="anchor" id="usecase"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§4<small>GPUStack SURFACE</small></span>
+      <h2 class="sec-title">GPUStack 用到的部分全景</h2>
+      <span class="sec-rule"></span>
+    </div>
+    <p class="sec-desc" style="margin-bottom:18px">全部原生 Rust，<b class="chl">零 Python 改动</b>。</p>
+
+    <div class="fgrid">
+      <div class="feat pipe" data-reveal>
+        <span class="f-tag">PLUGIN-EQUIVALENT PIPELINE · WIRE 逐字节对齐</span>
+        <h4>9 插件等价管道</h4>
+        <p>相位与 wire 契约逐字节对齐（<code>plugin-contract-pin.md</code>）：</p>
+        <div class="pipe-flow">
+          <span class="pipe-node">inbound strip</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">model-router</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">transformer</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">ext-auth</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">model-mapper</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">ai-proxy</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">fallback ×N</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">数据面转发</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">usage sink</span><span class="pipe-arr">→</span>
+          <span class="pipe-node">头写回</span>
+        </div>
+        <p style="margin-top:10px">
+          inbound strip（去等前缀）→ model-router（body→模型派生 + <code>x-higress-llm-model</code> 覆盖）→ transformer（头改写）→ ext-auth（forward-auth → GPUStack <code>/token-auth</code>，<code>ai-route-route-</code> 作用域）→ model-mapper（目标模型名映射，零拷贝 B1-B4）→ ai-proxy（provider 令牌交换）→ fallback 重定向 ×N 组 → 数据面转发 → usage sink → 头写回（<code>X-Mse-Consumer</code> / <code>Authorization</code> / cache）。
+        </p>
+      </div>
+
+      <div class="feat" data-reveal>
+        <span class="f-tag">ROUTING</span>
+        <h4>模型路由 / 多实例</h4>
+        <p>RouteTable 按快照缓存（H2，请求路径单 Arc 读取）、SWRR O(1) 选择（M7）、fallback 链（D7）、provider 密钥换写（D6）。</p>
+      </div>
+
+      <div class="feat" data-reveal>
+        <span class="f-tag">USAGE</span>
+        <h4>usage 落库</h4>
+        <p><code>ModelUsageMetrics</code> 17 字段推送 <code>/v2/usage/gateway-metrics</code> → GPUStack DB <code>model_usage_details</code> 真实行（DoD5：34/7 行与响应 usage 逐位一致）；流式 SSE 逐块计量（B2）。</p>
+      </div>
+
+      <div class="feat" data-reveal>
+        <span class="f-tag">CRD CONSUME</span>
+        <h4>managed CRD 只读消费</h4>
+        <p>Ingress / EnvoyFilter / WasmPlugin / McpBridge（无 label 例外）/ Secret / ConfigMap —— WATCH 事件化 + 指纹幂等；CRD fixture 与基线<b>逐字节一致</b>（DoD2）。</p>
+      </div>
+
+      <div class="feat" data-reveal>
+        <span class="f-tag">MIRROR · 15020</span>
+        <h4>mirror 透传 · :15020 浅兼容</h4>
+        <p><code>:80/readyz</code> 等 mirror 路由原样转发（本报告全部 wrk 数据的路径）；<code>:15020</code> 浅兼容：GPUStack pilot-agent 的 <code>/stats/prometheus</code>、<code>/stats</code> 探活面等价实现。</p>
+      </div>
+
+      <div class="feat" data-reveal>
+        <span class="f-tag">真机验证</span>
+        <h4>延伸能力（真机验证）</h4>
+        <p><b>限流</b>（IP/consumer 令牌桶，429+Retry-After）、<b>token 配额</b>（固定窗口 reserve/commit/release，429）、<b>路由策略</b>（override/pin/头增删/超时重试）、<b>安全护栏</b>（静态规则 + LLM fail-closed + 输出侧 per-chunk 断流，403）—— <code>hygress.policy.yaml</code> 热更即点即用（真机 429/429/403 复现，§5.3）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §5 可运维性 ============ -->
+  <span class="anchor" id="ops"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§5<small>OPERABILITY</small></span>
+      <h2 class="sec-title">可运维性</h2>
+      <span class="sec-rule"></span>
+    </div>
+    <div class="ops-grid">
+      <div class="ops" data-reveal>
+        <div class="o-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </div>
+        <h4>可观测</h4>
+        <p>Prometheus 文本指标（<code>:15020/stats/prometheus</code>，<code>hygress_*</code> 家族：requests/duration/tokens/ttft/retries/upstream_errors/fallback/auth/rate_limit/quota/policy/guardrail）；admin <code>127.0.0.1:8081</code>（<code>/healthz</code>、<code>/metrics</code>、token 门禁 <code>/reload</code>）；tracing 结构化日志。</p>
+      </div>
+      <div class="ops" data-reveal>
+        <div class="o-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        </div>
+        <h4>升级 / 回滚</h4>
+        <p>单二进制镜像层替换；s6 <code>.dist</code> 快照保底，<code>docker compose</code> 切回官方镜像即回滚（README §4.5）。</p>
+      </div>
+      <div class="ops" data-reveal>
+        <div class="o-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>
+        </div>
+        <h4>热更</h4>
+        <p>CRD 变更 WATCH 事件驱动（≤1 事件周期）；策略文件 1s mtime 轮询 + admin 强制 reload；均无需重启进程。</p>
+      </div>
+      <div class="ops" data-reveal>
+        <div class="o-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+        </div>
+        <h4>运行面自检</h4>
+        <p>启动 fail-fast（<code>GPUSTACK_API_PORT</code> 探测 + 首快照 bind-ready 门控）；admin/stats 独立监听器与数据面隔离。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §6 诚实局限 ============ -->
+  <span class="anchor" id="limits"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num" style="color:var(--rose)">§6<small>HONEST LIMITS</small></span>
+      <h2 class="sec-title">诚实局限</h2>
+      <span class="sec-rule"></span>
+    </div>
+    <div class="lim-head-wrap">
+      <span class="flag">务必读 · 9 项</span>
+      <span style="font-size:13px;color:var(--faint)">以下局限如实记录，不构成对上述性能结论的反驳，但决定选用边界。</span>
+    </div>
+    <div class="lim-list">
+      <div class="lim" data-reveal>
+        <div class="l-no">01</div>
+        <div><h4>生态成熟度</h4><p>envoy/Istio 生态的 Wasm 插件市场、完整 Istio 配置语义、多集群/多租户/fleet 管理、xDS 动态配置广度、envoy 丰富遥测与 hot-restart 升级，hygress <b>均无对等物</b>。GPUStack 内嵌场景只消费 9 插件等价能力（§4），这些能力在该场景未被使用——<b>超出该场景的网关需求仍应选原生 Higress</b>。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">02</div>
+        <div><h4>terminate-mode 全量缓冲</h4><p>模型路由/fallback/配额/输入护栏需要对 body 的全文读取（上限 <code>max_body</code>，超出 413）；mirror/GET 透传与 SSE 为流式。对超大非流式请求的内存占用高于 envoy 的流式模型（B1-B4 已消除多余拷贝，但缓冲语义是设计取舍）。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">03</div>
+        <div><h4>无 Wasm 扩展机制</h4><p>第三方以 Wasm/Go 扩展网关的方式不可用；扩展须走 hygress 原生管线 + policy.yaml（v1 边界见 extensions-design §10.2：响应侧 <code>mode: buffer</code> 未实现、路由级 <code>limits.ip</code> 覆盖不生效、async LLM 护栏为旁路记录）。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">04</div>
+        <div><h4>单集群单机聚焦</h4><p>面向 GPUStack 内嵌单 apiserver 命名空间（只读 CRD）；<b>无多集群/多命名空间联邦</b>。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">05</div>
+        <div><h4>admin/stats 端点 close-delimited</h4><p>（P1 nitpick #1，§11 实测 <code>read-errors = 全量</code>）：<code>ServeHttp</code> 响应未带 CL/chunked framing——非数据面热路径（仅 8081/15020 管理面），一行 CL 修复可选；<b>不影响 <code>:80</code> 数据面</b>（P1 后 keep-alive 实测 0 错误）。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">06</div>
+        <div><h4>:80/readyz 周期尾为上游所致（非网关）</h4><p>§11 内核平坦（p99 6.1ms）+ envoy 同款尾部（407/530ms）已归因共享 GPUStack worker；该尾<b>不在 hygress 可修复范围</b>。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">07</div>
+        <div><h4>跨网关纯内核对比未完成</h4><p>envoy 无等效 admin 基准被测（Phase 3.2 静态 sink 可选待办）。当前内核结论（13.6k req/s、p99 6ms 平坦）仅 hygress 单侧；跨网关内核对比留待需要时补测。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">08</div>
+        <div><h4>e2e 采样噪声</h4><p>GPU 受限路径单次采样（首采样 2.60s 冷态）不构成网关判据（§3 口径）。</p></div>
+      </div>
+      <div class="lim" data-reveal>
+        <div class="l-no">09</div>
+        <div><h4>RSS 增长</h4><p>~22MB → ~108MB（threads=16 + WATCH），仍 ≈23× 优于 envoy 套件（§2.1）；如需常驻内存最小化可调 <code>threads</code>，但以 c64 吞吐为代价（§8 实证 +7.7% 来自多线程）。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §7 结论与选用建议 ============ -->
+  <span class="anchor" id="conclusion"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§7<small>DECISION</small></span>
+      <h2 class="sec-title">结论与选用建议</h2>
+      <span class="sec-rule"></span>
+    </div>
+
+    <div class="decision" data-reveal>
+      <div class="verdict">
+        <span class="v-badge">推荐 · 选 Hygress</span>
+        <h3>GPUStack 内嵌网关原位替换场景</h3>
+      </div>
+      <p>
+        同 rig wrk <b>全主指标 ≥ envoy</b>（吞吐 +4.8%/+20.3%，p50/p99 全优）；内核下限 <b>13.6k req/s</b>（≈12× 于镜像路径实测负载，余量充足）；资源 <b>1 进程/108MB vs 4 进程/2.54GB</b>（≈23×）、镜像二进制 <b>34×</b>；<b>9 插件等价</b> + 限流/配额/策略/护栏真机验证；CRD/usage/端口契约<b>逐字节一致</b>、零 Python 改动、一键回滚；优化全程可复现（§6→§11 曲线，每步 oracle 复审 + 双模式全绿）。
+      </p>
+      <div class="dul">
+        <h4>决策依据速览</h4>
+        <div class="stat-row" style="grid-template-columns:repeat(4,1fr)">
+          <div class="stat accent"><div class="st-k">c16 / c64 吞吐</div><div class="st-v" style="color:var(--hi)">+4.8%<span style="font-size:.6em;color:var(--muted)">&nbsp;/ +20.3%</span></div></div>
+          <div class="stat accent"><div class="st-k">内核下限</div><div class="st-v num">13.6k<span class="unit"> req/s</span></div><div class="st-d">≈12× 于镜像路径实测负载</div></div>
+          <div class="stat accent"><div class="st-k">数据面资源</div><div class="st-v">≈23×</div><div class="st-d">1 进程 108MB vs 4 进程 2.54GB</div></div>
+          <div class="stat accent"><div class="st-k">镜像二进制</div><div class="st-v">34×</div><div class="st-d">27MB vs ~905MB</div></div>
+        </div>
+      </div>
+
+      <div class="keep-native" data-reveal>
+        <h4>仍选原生 Higress/envoy 的场景（能力域差异，非性能差异）</h4>
+        <ul>
+          <li>需要 <b>Wasm/Go 插件生态</b>或自定义 envoy filter；</li>
+          <li>需要 <b>Istio/xDS 多集群 fleet 语义</b>；</li>
+          <li>需要 <b>envoy 热重启</b>（不切镜像的进程级升级）；</li>
+          <li>或 <b>GPUStack 之外的独立网关拓扑</b>。</li>
+        </ul>
+        <p style="margin-top:8px;font-size:12.5px;color:var(--faint)">本报告的性能结论在 GPUStack 内嵌场景内成立。</p>
+      </div>
+
+      <div class="followups" data-reveal>
+        <span class="fchip"><span class="k">Phase 3.2</span> · 静态 sink 跨网关内核对比</span>
+        <span class="fchip"><span class="k">admin/stats</span> · CL 一行修复</span>
+        <span class="fchip"><span class="k">RSS/线程</span> · 权衡参数化</span>
+        <span class="fchip" style="color:var(--faint)">后续可选项 · 不阻塞结论</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ §8 证据索引 ============ -->
+  <span class="anchor" id="evidence"></span>
+  <section data-reveal>
+    <div class="sec-head">
+      <span class="sec-num">§8<small>EVIDENCE</small></span>
+      <h2 class="sec-title">数据与证据索引</h2>
+      <span class="sec-rule"></span>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <caption style="position:absolute;left:-9999px">8. 数据与证据索引：各阶段证据文件路径（fixtures-hygress/）与对应提交。</caption>
+        <thead>
+          <tr>
+            <th scope="col">证据</th>
+            <th scope="col">文件（docs/research/gpustack-validation/fixtures-hygress/）</th>
+            <th scope="col">提交</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>最终 A/B/A wrk（本报告 §1.1）</td><td><span class="mono">bench_final_hygress_c{16,64}.txt</span>、<span class="mono">bench_final_higress_c{16,64}.txt</span>、<span class="mono">final_hygress_image.txt</span>、<span class="mono">final_higress_image.txt</span></td><td><span class="mono chc">本报告提交</span></td></tr>
+          <tr><td>内核下限（§1.2/§11）</td><td><span class="mono">bench_final_hygress_kernel_c16.txt</span>、<span class="mono">bench_kernel_healthz_c{16,64}.txt</span></td><td><span class="mono chc">fc25a87</span></td></tr>
+          <tr><td>WATCH 重测（§10）</td><td><span class="mono">bench_after5_wrk_c{16,64}.txt</span>、<span class="mono">after5_image.txt</span></td><td><span class="mono chc">81502ac</span></td></tr>
+          <tr><td>P4 重测（§9）</td><td><span class="mono">bench_after4_wrk_c{16,64}.txt</span>、<span class="mono">after4_image.txt</span></td><td><span class="mono chc">663d6fe</span></td></tr>
+          <tr><td>P1/P2 重测（§8）</td><td><span class="mono">bench_after3_wrk_c{16,64}.txt</span>、<span class="mono">after3_image.txt</span></td><td><span class="mono chc">e42b8af</span></td></tr>
+          <tr><td>首次同 rig A/B（§7）</td><td><span class="mono">bench_after2_*</span>、<span class="mono">bench_higress_wrk_c{16,64}.txt</span>、<span class="mono">higress_image.txt</span>、<span class="mono">higress_ps.txt</span></td><td><span class="mono chc">346f201</span></td></tr>
+          <tr><td>修复前/后首测（§6）</td><td><span class="mono">bench_{before,after}_wrk_*.txt</span>、<span class="mono">bench_after_e2e_chat.txt</span>、<span class="mono">after_image.txt</span></td><td><span class="mono chc">85c407c</span></td></tr>
+          <tr><td>早期资源/真机验证（§1-§5）</td><td><span class="mono">containers_before/after.txt</span>、<span class="mono">ps_after.txt</span>、<span class="mono">usage_rows*.txt</span>、<span class="mono">chat_hygress_*.json</span>、<span class="mono">server_logs.txt</span>、<span class="mono">hygress.log</span></td><td><span class="mono chc">c7ccaf5</span>/<span class="mono chc">5491de7</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="gitchain" data-reveal>
+      <span class="g-label">提交链</span>
+      <div class="chain">
+        <span class="gh">c7ccaf5</span><span class="gsep">首测</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">7552e7b</span><span class="gsep">差距归因</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">85c407c</span><span class="gsep">§6</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">857d21b</span><span class="gsep">H1-H4/M5-M8</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">5df02f2</span><span class="gsep">B1-B4</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">346f201</span><span class="gsep">§7 A/B</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">815ebd3</span><span class="gsep">P1/P2/P5</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">e42b8af</span><span class="gsep">§8</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">493dc21</span><span class="gsep">P4</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">663d6fe</span><span class="gsep">§9</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">cf4f6c5</span><span class="gsep">WATCH</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">81502ac</span><span class="gsep">§10</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">fc25a87</span><span class="gsep">§11</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh">4ba507e</span><span class="gsep">perf-tail-plan 归档</span><span class="gsep" style="color:var(--faint)">→</span>
+        <span class="gh" style="border-color:var(--hi);color:var(--hi)">本报告</span>
+      </div>
+      <p style="margin-top:10px;font-size:12px;color:var(--faint);line-height:1.8">方法与口径细节（wrk 参数、判定规则、各阶段诚实记录）见 <code>benchmark.md</code> §6-§11；本报告为其最终横向汇总。</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="wrap">
+    <div class="f-row">
+      <div>
+        <div class="mono" style="color:var(--ink-2);font-weight:600;letter-spacing:.06em">HYGRESS × GPUStack VALIDATION</div>
+        <div class="mono">最终同 rig 对比报告 · 2026-09-05 · hygress <span class="chl">3b6beabc</span> vs 原生 higress/envoy <span class="che">55ecc762</span></div>
+      </div>
+      <div class="mono" style="text-align:right">
+        <div>生成来源：docs/research/gpustack-validation/hygress-vs-higress-report.md</div>
+        <div>证据：fixtures-hygress/ · 提交链见 §8</div>
+      </div>
+    </div>
+    <p class="gennote">
+      本页全部数值、表值、构建号（<span class="mono">3b6beabc</span>/<span class="mono">55ecc762</span>/<span class="mono">6a1e155e</span>/<span class="mono">857d21b</span>/<span class="mono">5df02f2</span>/<span class="mono">815ebd3</span>/<span class="mono">493dc21</span>/<span class="mono">cf4f6c5</span>/<span class="mono">fc25a87</span>）、镜像 ID（<span class="mono">3b6beabc…</span>/<span class="mono">55ecc762…</span>）与事实性表述均逐项取自权威报告原文，未做四舍五入或改写；图表数值与报告一致（RSS 对比为对数示意）。诚实局限共 9 项如实呈现，未擅删。自包含单文件，无构建依赖；图表为纯 CSS/SVG。
+    </p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- scroll reveal ---------- */
+  var revealEls = document.querySelectorAll('[data-reveal]');
+  if (reduce || !('IntersectionObserver' in window)) {
+    for (var i = 0; i < revealEls.length; i++) revealEls[i].classList.add('in');
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    revealEls.forEach(function(el){ io.observe(el); });
+
+    /* bar growth once in view */
+    var barIO = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (!e.isIntersecting) return;
+        barIO.unobserve(e.target);
+        var row = e.target;
+        var tracks = row.querySelectorAll('.b-track');
+        Array.prototype.forEach.call(tracks, function(t){
+          t.style.height = reduce ? t.getAttribute('data-h') : '0px';
+          requestAnimationFrame(function(){ t.style.height = t.getAttribute('data-h'); });
+        });
+      });
+    }, { threshold: 0.2 });
+    Array.prototype.forEach.call(document.querySelectorAll('.bars-row'), function(r){ barIO.observe(r); });
+
+    /* RSS horizontal bars */
+    var rssIO = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (!e.isIntersecting) return;
+        rssIO.unobserve(e.target);
+        var b = e.target;
+        var w = b.getAttribute('data-w');
+        requestAnimationFrame(function(){ b.style.width = w; });
+      });
+    }, { threshold: 0.2 });
+    Array.prototype.forEach.call(document.querySelectorAll('.r-bar'), function(r){ rssIO.observe(r); });
+  }
+
+  /* ---------- 优化曲线 SVG ---------- */
+  function buildCurve(){
+    var el = document.getElementById('curveA');
+    if (!el) return;
+    var W = 1000, H = 330, padL = 46, padR = 20, padT = 30, padB = 52;
+    var pw = W - padL - padR, ph = H - padT - padB;
+    var stages = [
+      { label:'旧 hygress', sub:'6a1e155e', v:518 },
+      { label:'857d21b',    sub:'H1-H4/M5-M8', v:1093 },
+      { label:'5df02f2',    sub:'B1-B4', v:1099.3 },
+      { label:'815ebd3',    sub:'P1/P2/P5', v:1091.7 },
+      { label:'493dc21',    sub:'P4', v:1152.3 },
+      { label:'cf4f6c5',    sub:'WATCH', lo:1119, hi:1143, v:1131 },
+      { label:'3b6beabc',   sub:'最终 A/B', v:1127.4 }
+    ];
+    var envoy = 1075.3, kernel = 13598.67, ymax = 1200;
+    var n = stages.length;
+    function px(i){ return padL + i * (pw / (n - 1)); }
+    function py(v){ return padT + ph * (1 - v / ymax); }
+
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('role', 'img');
+
+    /* grid lines */
+    for (var g = 0; g <= 4; g++) {
+      var gv = g * 300, gy = py(gv);
+      var gl = document.createElementNS(ns, 'line');
+      gl.setAttribute('x1', padL); gl.setAttribute('x2', W - padR);
+      gl.setAttribute('y1', gy); gl.setAttribute('y2', gy);
+      gl.setAttribute('stroke', 'rgba(255,255,255,.06)'); gl.setAttribute('stroke-width', '1');
+      svg.appendChild(gl);
+      var gt = document.createElementNS(ns, 'text');
+      gt.setAttribute('x', padL - 8); gt.setAttribute('y', gy + 4);
+      gt.setAttribute('text-anchor', 'end'); gt.setAttribute('font-family', 'IBM Plex Mono, monospace');
+      gt.setAttribute('font-size', '12'); gt.setAttribute('fill', '#6B7690');
+      gt.textContent = gv;
+      svg.appendChild(gt);
+    }
+
+    /* read-errors ≈全量 band (before 815ebd3) */
+    var bandX0 = px(0), bandX1 = px(3.5);
+    var rb = document.createElementNS(ns, 'rect');
+    rb.setAttribute('x', bandX0); rb.setAttribute('y', padT);
+    rb.setAttribute('width', bandX1 - bandX0); rb.setAttribute('height', ph);
+    rb.setAttribute('fill', 'rgba(242,178,92,.05)');
+    rb.setAttribute('stroke', 'rgba(242,178,92,.18)'); rb.setAttribute('stroke-dasharray', '3 4');
+    svg.appendChild(rb);
+    var rt = document.createElementNS(ns, 'text');
+    rt.setAttribute('x', bandX0 + 8); rt.setAttribute('y', padT + 16);
+    rt.setAttribute('font-family', 'IBM Plex Mono, monospace'); rt.setAttribute('font-size', '11');
+    rt.setAttribute('fill', '#F2B25C'); rt.setAttribute('opacity', '.75');
+    rt.textContent = 'P1 修复前 · read-errors ≈全量';
+    svg.appendChild(rt);
+
+    /* envoy reference line */
+    var el1 = document.createElementNS(ns, 'line');
+    el1.setAttribute('x1', padL); el1.setAttribute('x2', W - padR);
+    el1.setAttribute('y1', py(envoy)); el1.setAttribute('y2', py(envoy));
+    el1.setAttribute('stroke', '#F2B25C'); el1.setAttribute('stroke-width', '1.6');
+    el1.setAttribute('stroke-dasharray', '6 5'); el1.setAttribute('opacity', '.85');
+    svg.appendChild(el1);
+    var et = document.createElementNS(ns, 'text');
+    et.setAttribute('x', W - padR); et.setAttribute('y', py(envoy) - 7);
+    et.setAttribute('text-anchor', 'end'); et.setAttribute('font-family', 'IBM Plex Mono, monospace');
+    et.setAttribute('font-size', '11.5'); et.setAttribute('fill', '#F2B25C');
+    et.textContent = 'envoy 1075.3';
+    svg.appendChild(et);
+
+    /* kernel out-of-scale marker (top right) */
+    var kx = W - 300, ky = padT - 8;
+    var kt = document.createElementNS(ns, 'text');
+    kt.setAttribute('x', W - padR); kt.setAttribute('y', padT + 2);
+    kt.setAttribute('text-anchor', 'end'); kt.setAttribute('font-family', 'IBM Plex Mono, monospace');
+    kt.setAttribute('font-size', '12'); kt.setAttribute('fill', '#6AC6F2'); kt.setAttribute('font-weight', '600');
+    kt.textContent = '内核下限 13,598.67（≈12×，离域）';
+    svg.appendChild(kt);
+    var kl = document.createElementNS(ns, 'line');
+    kl.setAttribute('x1', padL); kl.setAttribute('x2', W - padR);
+    kl.setAttribute('y1', padT - 8); kl.setAttribute('y2', padT - 8);
+    kl.setAttribute('stroke', 'rgba(106,198,242,.5)'); kl.setAttribute('stroke-width', '1');
+    kl.setAttribute('stroke-dasharray', '2 6'); kl.setAttribute('opacity', '.6');
+    svg.appendChild(kl);
+
+    /* area under hygress line */
+    var fillPts = 'M' + px(0) + ',' + py(stages[0].v);
+    for (var i = 1; i < n; i++) fillPts += ' L' + px(i) + ',' + py(stages[i].v);
+    fillPts += ' L' + px(n - 1) + ',' + py(0) + ' L' + px(0) + ',' + py(0) + ' Z';
+    var area = document.createElementNS(ns, 'path');
+    area.setAttribute('d', fillPts);
+    area.setAttribute('fill', 'url(#curveGrad)');
+    area.setAttribute('opacity', '.28');
+    svg.appendChild(area);
+    var defs = document.createElementNS(ns, 'defs');
+    var grad = document.createElementNS(ns, 'linearGradient');
+    grad.setAttribute('id', 'curveGrad'); grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0'); grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+    var st1 = document.createElementNS(ns, 'stop'); st1.setAttribute('offset', '0%'); st1.setAttribute('stop-color', '#D3F36B'); st1.setAttribute('stop-opacity', '.55');
+    var st2 = document.createElementNS(ns, 'stop'); st2.setAttribute('offset', '100%'); st2.setAttribute('stop-color', '#D3F36B'); st2.setAttribute('stop-opacity', '0');
+    grad.appendChild(st1); grad.appendChild(st2); defs.appendChild(grad);
+    svg.appendChild(defs);
+
+    /* line through points */
+    var linePts = 'M' + px(0) + ',' + py(stages[0].v);
+    for (var j = 1; j < n; j++) linePts += ' L' + px(j) + ',' + py(stages[j].v);
+    var line = document.createElementNS(ns, 'path');
+    line.setAttribute('d', linePts);
+    line.setAttribute('fill', 'none'); line.setAttribute('stroke', '#D3F36B'); line.setAttribute('stroke-width', '2.6');
+    line.setAttribute('stroke-linecap', 'round'); line.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(line);
+
+    /* WATCH range band */
+    var wi = 5;
+    var wbx = px(wi) - 16, wby = py(stages[wi].hi), wbw = 32, wbh = py(stages[wi].lo) - py(stages[wi].hi);
+    var wb = document.createElementNS(ns, 'rect');
+    wb.setAttribute('x', wbx); wb.setAttribute('y', wby); wb.setAttribute('width', wbw); wb.setAttribute('height', Math.max(wbh, 4));
+    wb.setAttribute('fill', 'rgba(211,243,107,.14)'); wb.setAttribute('stroke', 'rgba(211,243,107,.45)');
+    wb.setAttribute('rx', '3');
+    svg.appendChild(wb);
+    var wl = document.createElementNS(ns, 'line');
+    wl.setAttribute('x1', wbx); wl.setAttribute('x2', wbx + wbw);
+    wl.setAttribute('y1', py(1131)); wl.setAttribute('y2', py(1131));
+    wl.setAttribute('stroke', '#D3F36B'); wl.setAttribute('stroke-width', '1.4'); wl.setAttribute('opacity', '.8');
+    svg.appendChild(wl);
+    var wbt = document.createElementNS(ns, 'text');
+    wbt.setAttribute('x', wbx + wbw / 2); wbt.setAttribute('y', wby - 6);
+    wbt.setAttribute('text-anchor', 'middle'); wbt.setAttribute('font-family', 'IBM Plex Mono, monospace');
+    wbt.setAttribute('font-size', '11'); wbt.setAttribute('fill', '#F2B25C');
+    wbt.textContent = '1119–1143';
+    svg.appendChild(wbt);
+
+    /* points + labels */
+    for (var k = 0; k < n; k++) {
+      var s = stages[k];
+      var cx = px(k), cy = py(s.v);
+      var cir = document.createElementNS(ns, 'circle');
+      cir.setAttribute('cx', cx); cir.setAttribute('cy', cy); cir.setAttribute('r', '4.5');
+      cir.setAttribute('fill', k === 0 ? '#E78A7E' : '#D3F36B');
+      cir.setAttribute('stroke', '#090B12'); cir.setAttribute('stroke-width', '1.5');
+      svg.appendChild(cir);
+      var lb = document.createElementNS(ns, 'text');
+      lb.setAttribute('x', cx); lb.setAttribute('y', cy - 10);
+      lb.setAttribute('text-anchor', 'middle'); lb.setAttribute('font-family', 'IBM Plex Mono, monospace');
+      lb.setAttribute('font-size', '12'); lb.setAttribute('font-weight', '600');
+      lb.setAttribute('fill', k === 0 ? '#E78A7E' : '#D3F36B');
+      lb.textContent = (k === 0 ? '' : '+') + s.v;
+      svg.appendChild(lb);
+      /* x labels */
+      var xlb = document.createElementNS(ns, 'text');
+      xlb.setAttribute('x', cx); xlb.setAttribute('y', H - 16);
+      xlb.setAttribute('text-anchor', 'middle'); xlb.setAttribute('font-family', 'IBM Plex Mono, monospace');
+      xlb.setAttribute('font-size', '11.5'); xlb.setAttribute('fill', '#9AA4BB');
+      xlb.textContent = s.label;
+      svg.appendChild(xlb);
+      var sub = document.createElementNS(ns, 'text');
+      sub.setAttribute('x', cx); sub.setAttribute('y', H - 2);
+      sub.setAttribute('text-anchor', 'middle'); sub.setAttribute('font-family', 'IBM Plex Mono, monospace');
+      sub.setAttribute('font-size', '9.5'); sub.setAttribute('fill', '#6B7690');
+      sub.textContent = s.sub;
+      svg.appendChild(sub);
+    }
+
+    el.appendChild(svg);
+  }
+  buildCurve();
+})();
+</script>
+</body>
+</html>

@@ -29,9 +29,34 @@
 //! buffered and reassembled across [`feed`] calls, so arbitrary packet
 //! fragmentation never double-counts. A usage object is absorbed only when it
 //! is the **top-level** `"usage"` field of the SSE event's JSON payload.
+//!
+//! # Boundedness (MINOR-6 / F3)
+//!
+//! The accumulation is bounded so a hostile / pathological response cannot
+//! make the snapshot grow without limit or re-parse its whole buffer on every
+//! chunk:
+//! - while a response is still **unclassified** (no SSE `data:` seen, no
+//!   complete JSON object yet) the buffered tail is capped at
+//!   [`MAX_TAIL_BYTES`]; past it the response is marked [`Mode::Oversized`]
+//!   and the rest is ignored (flush still yields `completed = false`, the
+//!   server's byte/chunk-estimation fallback);
+//! - full-JSON parse attempts in that state are gated on a possible closing
+//!   `}` and limited to [`MAX_JSON_PARSE_ATTEMPTS`];
+//! - in the SSE state a **single data line** may only grow the persistent tail
+//!   up to [`MAX_TAIL_BYTES`]; an unterminated line beyond that is dropped and
+//!   skipped to its `\n` instead of being buffered forever.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// MINOR-6 / F3: byte cap on the buffered-but-unclassified tail and on a single unterminated
+/// SSE `data:` line (1 MiB). A realistic usage-bearing frame is far smaller; larger unclassified
+/// bodies are dropped to the server's `completed = false` estimation fallback.
+const MAX_TAIL_BYTES: usize = 1024 * 1024;
+/// Budget of full-DOM JSON parse attempts while the response is still unclassified. Each attempt
+/// costs O(tail), so the budget bounds the worst-case re-parse cost of a hostile fragmented body;
+/// any real response classifies in a handful of attempts.
+const MAX_JSON_PARSE_ATTEMPTS: u32 = 128;
 
 /// One `POST /v2/usage/gateway-metrics` payload (wire form).
 ///
@@ -288,6 +313,10 @@ enum Mode {
     Sse,
     /// A single non-streaming JSON body (already consumed).
     Json,
+    /// The buffered tail exceeded [`MAX_TAIL_BYTES`] while still unclassified — this is not a
+    /// usage-bearing body. The rest of the response is ignored (boundedness, MINOR-6/F3); flush
+    /// still works and reports `completed = false`.
+    Oversized,
 }
 
 /// Pure per-response usage accumulator.
@@ -315,6 +344,14 @@ pub struct UsageSnapshot {
     /// For the non-streaming JSON body: counted exactly once, even when it
     /// arrives across several `feed` calls.
     json_counted: bool,
+    /// Tail length already scanned for an anchored `data:` marker while `mode == Unknown`
+    /// (incremental probe so a fragmented response is not re-scanned from index 0 per feed).
+    data_probe: usize,
+    /// Full-JSON parse attempts made while still `Unknown` (bounded by [`MAX_JSON_PARSE_ATTEMPTS`]).
+    json_parse_attempts: u32,
+    /// `true` while an oversized SSE line (past [`MAX_TAIL_BYTES`], unterminated) is being
+    /// skipped up to its `\n` (single-line unbounded-buffer guard, MINOR-6/F3).
+    skip_until_newline: bool,
 }
 
 /// Locate the `usage` object within a parsed **payload object** (the
@@ -344,6 +381,9 @@ impl UsageSnapshot {
             tail: Vec::new(),
             mode: Mode::Unknown,
             json_counted: false,
+            data_probe: 0,
+            json_parse_attempts: 0,
+            skip_until_newline: false,
         }
     }
 
@@ -362,9 +402,10 @@ impl UsageSnapshot {
             return false;
         }
         match self.mode {
-            Mode::Json => {
-                // The single non-streaming body is already consumed; drop any
-                // trailing bytes and ignore the rest of the response.
+            Mode::Json | Mode::Oversized => {
+                // Already consumed (Json) or deliberately ignored (Oversized — the tail exceeded
+                // MAX_TAIL_BYTES before classification): drop any trailing bytes and ignore the
+                // rest of the response.
                 self.tail.clear();
                 false
             }
@@ -373,22 +414,39 @@ impl UsageSnapshot {
                 // (transition) chunk is appended to the tail and processed
                 // there — a one-time full-chunk copy.
                 self.tail.extend_from_slice(chunk);
-                if has_anchored_data(&self.tail) {
+                if probe_anchored_data(&self.tail, &mut self.data_probe) {
                     self.mode = Mode::Sse;
                     let (consumed, found) = self.consume_sse();
                     if consumed > 0 {
                         self.discard_prefix(consumed);
                     }
                     found
-                } else if let Ok(value) = serde_json::from_slice::<Value>(&self.tail) {
-                    if value.is_object() {
-                        self.mode = Mode::Json;
-                        let absorbed = self.finish_json(&value);
-                        self.tail.clear();
-                        absorbed
-                    } else {
-                        // Valid JSON but not an object: not a usage body.
-                        false
+                } else if self.tail.len() > MAX_TAIL_BYTES {
+                    // MINOR-6/F3: still unclassified after a full MiB — neither an SSE stream nor
+                    // a parseable JSON object. Stop buffering/re-parsing it (a hostile
+                    // unclassifiable response must not grow the buffer without bound or keep the
+                    // snapshot re-parsing the whole tail per feed). Flush still works and reports
+                    // `completed = false` (the server's byte-estimation fallback).
+                    self.tail.clear();
+                    self.mode = Mode::Oversized;
+                    false
+                } else if json_may_have_completed(&self.tail)
+                    && self.json_parse_attempts < MAX_JSON_PARSE_ATTEMPTS
+                {
+                    // A JSON object can only be parseable once its final `}` has arrived — skip
+                    // the O(tail) full-DOM parse on fragments that cannot be complete. The attempt
+                    // budget bounds the worst-case cost of a hostile `}`-per-feed stream.
+                    self.json_parse_attempts += 1;
+                    match serde_json::from_slice::<Value>(&self.tail) {
+                        Ok(value) if value.is_object() => {
+                            self.mode = Mode::Json;
+                            let absorbed = self.finish_json(&value);
+                            self.tail.clear();
+                            absorbed
+                        }
+                        // Valid JSON that is not an object (not a usage body) or an incomplete
+                        // prefix: keep holding for reassembly.
+                        Ok(_) | Err(_) => false,
                     }
                 } else {
                     // Incomplete (fragmented) prefix: hold for reassembly.
@@ -494,21 +552,45 @@ impl UsageSnapshot {
     /// there. The `"usage"` prefilter runs on the **reassembled** cross-buffer
     /// line, so a `"usage"` token split across chunk boundaries is still seen.
     /// The incomplete trailing sliver of the chunk becomes the new tail.
+    ///
+    /// A single SSE data line may only grow the persistent tail up to
+    /// [`MAX_TAIL_BYTES`] (MINOR-6/F3): an unterminated line past the cap is
+    /// dropped (it can never be counted/parsed as a whole) and the stream
+    /// skips to the line's `\n` before resuming — an adversarial never-ending
+    /// line cannot grow the buffer without bound.
     /// Returns `true` when at least one usage object was absorbed.
     fn consume_sse_slice(&mut self, chunk: &[u8]) -> bool {
         let mut found = false;
         let mut start = 0usize;
 
-        // If a partial (newline-less) tail line is pending, the first line of
-        // this chunk completes it — one bounded splice into the persistent tail.
-        if !self.tail.is_empty() {
+        // An oversized unterminated line was dropped in an earlier feed: discard the rest of that
+        // line (everything up to its first `\n`), then resume normal line processing.
+        if self.skip_until_newline {
             match find_subseq(chunk, b"\n", 0) {
+                Some(nl) => {
+                    self.skip_until_newline = false;
+                    start = nl + 1;
+                }
+                None => return found, // the whole chunk is still inside the dropped line
+            }
+        }
+
+        // If a partial (newline-less) tail line is pending, the first line of this chunk completes
+        // it — one bounded splice into the persistent tail.
+        if !self.tail.is_empty() {
+            match find_subseq(chunk, b"\n", start) {
+                Some(nl) if self.tail.len().saturating_add(nl - start) > MAX_TAIL_BYTES => {
+                    // The reassembled line would exceed the cap: drop it (single-line guard) and
+                    // continue right after its `\n` — it is never counted.
+                    self.tail.clear();
+                    start = nl + 1;
+                }
                 Some(nl) => {
                     // Detach the partial tail so the joined line never aliases
                     // the mutable borrow of `self`; the buffer allocation is
                     // carried back (capacity reused for future splices).
                     let mut joined = std::mem::take(&mut self.tail);
-                    joined.extend_from_slice(&chunk[..nl]);
+                    joined.extend_from_slice(&chunk[start..nl]);
                     if self.process_sse_line(&joined) {
                         found = true;
                     }
@@ -517,8 +599,16 @@ impl UsageSnapshot {
                     start = nl + 1;
                 }
                 None => {
-                    // The whole chunk continues the partial line.
-                    self.tail.extend_from_slice(chunk);
+                    // The whole remainder continues the pending line without a terminator.
+                    let sliver = &chunk[start..];
+                    if self.tail.len().saturating_add(sliver.len()) > MAX_TAIL_BYTES {
+                        // MINOR-6/F3: past the cap the line can never be counted/parsed whole —
+                        // drop it and skip to its `\n` instead of buffering without bound.
+                        self.tail.clear();
+                        self.skip_until_newline = true;
+                        return found;
+                    }
+                    self.tail.extend_from_slice(sliver);
                     return found;
                 }
             }
@@ -539,9 +629,16 @@ impl UsageSnapshot {
         }
 
         // The incomplete trailing sliver becomes the new partial tail (a
-        // bounded copy, never the whole chunk).
+        // bounded copy, never the whole chunk; the single-line cap applies).
         if pos < chunk.len() {
-            self.tail.extend_from_slice(&chunk[pos..]);
+            let sliver = &chunk[pos..];
+            if self.tail.len().saturating_add(sliver.len()) > MAX_TAIL_BYTES {
+                // The line this sliver belongs to is (now) oversized: drop + skip to its `\n`.
+                self.tail.clear();
+                self.skip_until_newline = true;
+            } else {
+                self.tail.extend_from_slice(sliver);
+            }
         } else {
             self.tail.clear();
         }
@@ -627,25 +724,51 @@ impl UsageSnapshot {
     }
 }
 
-/// `true` when `buf` contains an anchored `data:` marker — at index 0 or
-/// immediately after a `\n`. Used to classify a response as SSE.
-fn has_anchored_data(buf: &[u8]) -> bool {
-    if buf.starts_with(b"data:") {
+/// Incrementally detect an anchored `data:` marker in `buf` (at index 0 or immediately after a
+/// `\n`), continuing a previous probe whose frontier is `*probe` (the length of `buf` at the last
+/// scan). A marker can only become visible where its bytes were previously incomplete — within the
+/// last few bytes of the old buffer or in the new ones — so each scan is O(new bytes + const)
+/// rather than O(whole tail): a fragmented hostile response cannot turn classification into O(n²).
+/// On return `*probe` is advanced to `buf.len()`.
+fn probe_anchored_data(buf: &[u8], probe: &mut usize) -> bool {
+    let len = buf.len();
+    // A marker at index 0 is anchored without a `\n`; it was only checkable once 5 bytes existed.
+    if *probe < 5 && len >= 5 && buf.starts_with(b"data:") {
+        *probe = len;
         return true;
     }
-    let mut pos = 0;
-    while pos < buf.len() {
-        match buf[pos] {
-            b'\n' => {
-                if buf.len() >= pos + 1 + 5 && &buf[pos + 1..pos + 6] == b"data:" {
-                    return true;
-                }
-                pos += 1;
-            }
-            _ => pos += 1,
-        }
+    // A `\n`-anchored marker at p needs `\n` at p-1 and bytes p..p+5 present. A window that was
+    // incomplete at the last scan had its `\n` within the final 6 bytes of the old buffer, so
+    // rescanning from `probe - 6` covers every possibly-new marker (and re-checks a few old ones).
+    let Some(last) = len.checked_sub(6) else {
+        *probe = len;
+        return false;
+    };
+    let from = probe.saturating_sub(6);
+    if from > last {
+        *probe = len;
+        return false;
     }
+    let mut i = from;
+    while i <= last {
+        if buf[i] == b'\n' && &buf[i + 1..i + 6] == b"data:" {
+            *probe = len;
+            return true;
+        }
+        i += 1;
+    }
+    *probe = len;
     false
+}
+
+/// `true` when the trailing non-whitespace byte of `buf` is `}` — the only point at which a JSON
+/// object *could* be complete (the gate that keeps the Unknown state from running an O(tail)
+/// full-DOM parse on fragments that cannot possibly parse yet).
+fn json_may_have_completed(buf: &[u8]) -> bool {
+    match buf.iter().rev().find(|b| !b.is_ascii_whitespace()) {
+        Some(b) => *b == b'}',
+        None => false,
+    }
 }
 
 fn trim_ascii(b: &[u8]) -> &[u8] {
@@ -1227,5 +1350,120 @@ mod tests {
         // recomputed = saturating_sum -> still u64::MAX (no wrap, no panic).
         assert_eq!(m.total_token, u64::MAX);
         assert!(m.completed);
+    }
+
+    // ----- MINOR-6 / F3: bounded tail, no unbounded single line, no O(n²) re-parse -----
+
+    #[test]
+    fn unclassified_tail_over_cap_stops_buffering_and_keeps_flush_semantics() {
+        // A response that is neither SSE nor a parseable JSON object must not be buffered /
+        // re-parsed without bound: once the unclassified tail passes MAX_TAIL_BYTES the snapshot
+        // stops (Mode::Oversized) — the rest of the response is ignored and flush still works,
+        // reporting `completed = false` (the server's byte-estimation fallback).
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        // Two 700 KiB junk chunks (no `data:`, no newline, no `}`-ending) push the tail past the
+        // 1 MiB cap while still Unknown.
+        let junk = vec![b'x'; 700 * 1024];
+        s.feed(&junk);
+        assert_eq!(s.mode, Mode::Unknown);
+        assert_eq!(s.tail.len(), 700 * 1024);
+        s.feed(&junk);
+        assert_eq!(s.mode, Mode::Oversized, "cap must stop the Unknown accumulation");
+        assert!(s.tail.is_empty(), "buffered tail must be dropped");
+
+        // After the cap the rest of the response is ignored (no more buffering / full re-parses)...
+        assert!(!s.feed(b"{\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}"));
+        assert!(s.tail.is_empty());
+        // ... and flush keeps its contract: nothing absorbed -> completed = false, zero tokens.
+        assert!(!s.complete());
+        let m = s.flush(&FlushFields {
+            model: "m".into(),
+            request_content_bytes: 0,
+            ..Default::default()
+        });
+        assert!(!m.completed);
+        assert_eq!((m.input_token, m.output_token, m.total_token), (0, 0, 0));
+    }
+
+    #[test]
+    fn oversized_unterminated_sse_line_is_dropped_and_stream_recovers() {
+        // SSE single-line guard: an unterminated `data:` line must not grow the persistent tail
+        // without bound. Once the pending line passes MAX_TAIL_BYTES it is dropped and the stream
+        // skips to its `\n`; following lines are still counted/absorbed normally.
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        // Classify as SSE with a real (small) data line — counted once.
+        assert!(!s.feed(b"data: {\"a\":1}\n"));
+        assert_eq!(s.output_chunks(), 1);
+        assert_eq!(s.mode, Mode::Sse);
+
+        // Keep feeding a never-terminated line: first 600 KiB fits under the cap...
+        let big = vec![b'y'; 600 * 1024];
+        assert!(!s.feed(&big));
+        assert_eq!(s.tail.len(), 600 * 1024);
+        // ... the second 600 KiB pushes the pending line past the cap: it is dropped + skipped.
+        assert!(!s.feed(&big));
+        assert!(s.tail.is_empty(), "oversized line must not stay buffered");
+        assert!(s.skip_until_newline, "remaining oversized line is skipped to its \\n");
+
+        // The giant line's terminator arrives; the line AFTER it is processed normally.
+        assert!(s.feed(b"\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n"));
+        assert!(s.complete());
+        assert_eq!(s.tokens(), (7, 3, 0));
+        // The oversized line was NOT counted; the first small line + the usage line were.
+        assert_eq!(s.output_chunks(), 2);
+        // The skip state was cleared and the tail is drained.
+        assert!(!s.skip_until_newline);
+        assert!(s.tail.is_empty());
+    }
+
+    #[test]
+    fn fragmented_json_with_interior_brace_is_still_classified_at_completion() {
+        // The Unknown JSON-parse gate must not skip a *legitimate* completion: a body that
+        // contains `}` inside a string fails an early parse attempt, but when the final `}`
+        // arrives it must still be classified and absorbed (bounded attempts, not "parse once").
+        let body = b"{\"content\":\"}\",\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}";
+        let prefix: &[u8] = b"{\"content\":\"}"; // 13 bytes, shared by `body`'s head
+        assert_eq!(&body[..prefix.len()], prefix);
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        // Feed an incomplete prefix that ends with `}` (parse attempt fails, attempt budget used)...
+        assert!(!s.feed(prefix), "incomplete prefix cannot absorb usage");
+        assert_eq!(s.json_parse_attempts, 1, "one failed attempt recorded");
+        // ... then the remainder completes the object on the final `}`.
+        let rest = &body[prefix.len()..];
+        assert!(s.feed(rest), "completed JSON object with usage must be absorbed");
+        assert_eq!(s.tokens(), (11, 4, 0));
+        assert_eq!(s.mode, Mode::Json);
+        assert!(s.complete());
+    }
+
+    #[test]
+    fn unknown_mode_parse_attempts_are_budgeted() {
+        // The attempt budget bounds repeated full-DOM parses of a hostile `}`-ending fragment
+        // stream: the snapshot gives up parsing after MAX_JSON_PARSE_ATTEMPTS failed attempts
+        // (each `}`-ending feed still parses fine later only if it completes the object).
+        let mut s = UsageSnapshot::new(UsageSchema::OpenAi);
+        // A fragment that ends with `}` on EVERY feed but never becomes a complete object: the
+        // classic O(n²) re-parse driver.
+        let frag = b"{\"a\":\"";
+        for i in 0..(MAX_JSON_PARSE_ATTEMPTS + 10) {
+            let mut chunk = Vec::new();
+            chunk.extend_from_slice(frag);
+            chunk.extend_from_slice(format!("x{i}").as_bytes());
+            chunk.push(b'}');
+            assert!(!s.feed(&chunk), "never-complete fragments must not absorb usage");
+        }
+        assert_eq!(
+            s.json_parse_attempts,
+            MAX_JSON_PARSE_ATTEMPTS,
+            "parse attempts must be budgeted, not unbounded"
+        );
+        // Still Unknown (never classified, never overflowed the cap), flush is well-defined.
+        assert_eq!(s.mode, Mode::Unknown);
+        assert!(!s.complete());
+        let m = s.flush(&FlushFields {
+            request_content_bytes: 0,
+            ..Default::default()
+        });
+        assert!(!m.completed);
     }
 }

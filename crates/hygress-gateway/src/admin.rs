@@ -79,7 +79,26 @@ impl AdminState {
         let Some(token) = &self.admin_token else {
             return false;
         };
-        Self::bearer_token(headers) == Some(token.as_str())
+        let Some(provided) = Self::bearer_token(headers) else {
+            return false;
+        };
+        // Compare in constant time (m5): a plain `Option<&str> ==` short-circuits on the first
+        // differing byte, leaking how many leading bytes matched through response timing.
+        Self::tokens_eq(provided.as_bytes(), token.as_bytes())
+    }
+
+    /// Constant-time equality over equal-length byte slices.
+    ///
+    /// Every byte of both inputs is read and folded into one accumulator, so a mismatch at any
+    /// position is not distinguishable by timing. The length check is the only early exit — a
+    /// bearer token's length is not secret, and comparing lengths first is the mainstream constant-
+    /// time pattern (this crate has no `subtle` dependency; the manual fold is the whole compare).
+    fn tokens_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        // XOR-fold every byte pair: any difference sets at least one bit of `acc`.
+        a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
     }
 
     /// Pure routing decision: maps `(method, path, headers)` to a response
@@ -364,6 +383,57 @@ mod tests {
         // No reloader wired → 501 once authenticated.
         let r2 = s.route("POST", "/reload", &ok);
         assert_eq!(r2.status, 501);
+    }
+
+    // ----- (m5) constant-time token comparison semantics -----
+
+    #[test]
+    fn constant_time_token_eq_exact_semantics() {
+        // Pins the compare helper: same length + same bytes → true; same length + any differing
+        // byte → false; different length → false (length is not secret for an admin bearer, so
+        // exiting early there is acceptable and matches mainstream constant-time compares).
+        let s = state(Some("secret")); // configured token: 6 bytes
+        let mut ok = h();
+        ok.insert("authorization", "Bearer secret");
+        assert!(s.authorized(&ok), "exact token must authorize");
+
+        // Equal length (6), every byte wrong / one byte wrong → false.
+        let mut all_wrong = h();
+        all_wrong.insert("authorization", "Bearer xxxxxx");
+        assert!(!s.authorized(&all_wrong), "equal-length wrong token must fail");
+        let mut one_wrong = h();
+        one_wrong.insert("authorization", "Bearer secerX");
+        assert!(!s.authorized(&one_wrong), "single-byte mismatch must fail");
+
+        // Different lengths → false.
+        let mut short = h();
+        short.insert("authorization", "Bearer secre");
+        assert!(!s.authorized(&short), "shorter token must fail");
+        let mut long = h();
+        long.insert("authorization", "Bearer secrets");
+        assert!(!s.authorized(&long), "longer token must fail");
+
+        // The helper itself (length-check + XOR fold) is unit-visible.
+        assert!(AdminState::tokens_eq(b"secret", b"secret"));
+        assert!(!AdminState::tokens_eq(b"secret", b"secrex"));
+        assert!(!AdminState::tokens_eq(b"secret", b"secre"));
+    }
+
+    #[test]
+    fn bearer_token_prefix_handling() {
+        // `Bearer` / `bearer` prefixes are both accepted and the gate still compares exactly
+        // (trailing whitespace is part of the value and must NOT match).
+        let s = state(Some("tk"));
+        let mut lower = h();
+        lower.insert("authorization", "bearer tk");
+        assert!(s.authorized(&lower), "lowercase bearer prefix accepted");
+
+        let mut trailing = h();
+        trailing.insert("authorization", "Bearer tk ");
+        assert!(
+            !s.authorized(&trailing),
+            "trailing whitespace must not match (exact token compare)"
+        );
     }
 
     #[test]

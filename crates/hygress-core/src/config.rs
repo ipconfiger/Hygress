@@ -76,10 +76,17 @@ impl ConfigData {
     ///
     /// Contract:
     /// - **per-object** issues (a route with an empty key / no destination /
-    ///   a bad endpoint / a bad weight sum / a mirror that is authed / an
-    ///   unknown fallback target / an auth-enabled route with an empty scope
-    ///   root; a registry missing a required field / an unknown proxy ref; a
-    ///   duplicate route key) DROP that single object and keep the rest;
+    ///   a bad endpoint / a bad weight sum / an out-of-range >100 destination
+    ///   weight / a mirror that is authed / an unknown fallback target / an
+    ///   auth-enabled route with an empty scope root; a registry missing a
+    ///   required field / an unknown proxy ref; a duplicate route key) DROP
+    ///   that single object and keep the rest; a **second-or-later Mirror**
+    ///   route is also dropped with an issue (only the first Mirror is ever
+    ///   reachable — see [`RouteTable`]);
+    /// - **cascading drop**: after the per-object pass, a route whose fallback
+    ///   target names a Fallback route that was **itself** dropped by the
+    ///   per-object pass is removed too (the redirect would dangle in the
+    ///   accepted snapshot — AM-4);
     /// - **structural** failures (a path predicate that is not a valid regex)
     ///   are surfaced when a [`RouteTable`] is built from the accepted set —
     ///   they reject the whole snapshot.
@@ -127,10 +134,35 @@ impl ConfigData {
                         d.service
                     )));
                 }
+                // MINOR-7: a destination percent is a 0..=100 weight. Anything above 100 is
+                // malformed (a typo like `150%` or a hostile `u32::MAX`) and must be reported per
+                // destination — not only through the "sum != 100" check — so the route is
+                // dropped with a clear issue instead of being silently normalized.
+                if let Some(p) = d.percent {
+                    if p > 100 {
+                        route_issues.push(ValidationError::new(format!(
+                            "{label}: destination '{}' has out-of-range weight {p} (must be 0..=100)",
+                            d.service
+                        )));
+                    }
+                }
             }
             let weighted = route.destinations.iter().any(|d| d.percent.is_some());
             if weighted {
-                let sum: u32 = route.destinations.iter().map(|d| d.weight()).sum();
+                // MINOR-7: accumulate with checked math — a malformed weight list (e.g. two
+                // `u32::MAX` percents) must not overflow-panic a debug build on a plain `u32`
+                // `sum()`. The accumulation runs even when a per-destination issue was already
+                // recorded (route is dropped either way), so it must be overflow-safe.
+                let mut sum: u64 = 0;
+                for d in &route.destinations {
+                    match sum.checked_add(u64::from(d.weight())) {
+                        Some(s) => sum = s,
+                        None => {
+                            sum = u64::MAX;
+                            break;
+                        }
+                    }
+                }
                 if sum != 100 {
                     route_issues.push(ValidationError::new(format!(
                         "{label}: destination weights sum to {sum}, expected 100"
@@ -159,6 +191,60 @@ impl ConfigData {
             } else {
                 issues.extend(route_issues);
             }
+        }
+
+        // ---- mirror routes: only the FIRST mirror is reachable (MINOR-13) ----
+        // `RouteTable::rebuild` installs only the first Mirror route as the catch-all
+        // (`mirror_index`, see its docs); every additional Mirror route in the snapshot is dead
+        // configuration — it can never be selected by the data plane. Report and drop the extra
+        // mirrors instead of silently accepting them (this runs AFTER the per-object pass, so a
+        // first mirror that was itself dropped for another issue does not block a later one).
+        {
+            let mut kept: Vec<RouteRule> = Vec::with_capacity(accepted_routes.len());
+            let mut mirror_seen = false;
+            for route in accepted_routes {
+                if route.kind == RouteKind::Mirror {
+                    if mirror_seen {
+                        issues.push(ValidationError::new(format!(
+                            "route '{}': only the first mirror route is used as the catch-all; additional mirror routes are unreachable and were dropped",
+                            route.key
+                        )));
+                        continue;
+                    }
+                    mirror_seen = true;
+                }
+                kept.push(route);
+            }
+            accepted_routes = kept;
+        }
+
+        // ---- fallback targets: re-check against the ACCEPTED set (AM-4) ----
+        // The first-pass target check above ran against the FULL `self.routes`, so a
+        // Main route whose referenced Fallback route is itself dropped by validation
+        // (a per-object issue in this pass) would survive with a dangling fallback.
+        // Re-check every accepted route that carries a fallback link against the
+        // accepted Fallback-route keys and drop the referencing route too (its
+        // redirect would otherwise target nothing in the live snapshot).
+        {
+            let accepted_fallback_keys: BTreeSet<String> = accepted_routes
+                .iter()
+                .filter(|r| r.kind == RouteKind::Fallback)
+                .map(|r| r.key.clone())
+                .collect();
+            let mut kept: Vec<RouteRule> = Vec::with_capacity(accepted_routes.len());
+            for route in accepted_routes {
+                let label = format!("route '{}'", route.key);
+                match &route.fallback {
+                    Some(fl) if !accepted_fallback_keys.contains(&fl.target_key) => {
+                        issues.push(ValidationError::new(format!(
+                            "{label}: fallback target '{}' not accepted (referenced Fallback route was dropped by validation)",
+                            fl.target_key
+                        )));
+                    }
+                    _ => kept.push(route),
+                }
+            }
+            accepted_routes = kept;
         }
 
         // ---- registries: per-object skip-and-report ----
@@ -1414,6 +1500,120 @@ mod tests {
     }
 
     #[test]
+    fn validation_percent_out_of_range_is_an_issue() {
+        // MINOR-7: a destination percent above 100 (a typo like `150%` — or worse) must be a
+        // per-object issue of its own, not merely surface through the "sum != 100" check.
+        let r = RouteRule {
+            destinations: vec![
+                Destination::with_percent(150, "a.static:80"),
+                Destination::with_percent(50, "b.static:80"),
+            ],
+            ..main_route("m1")
+        };
+        let data = ConfigData {
+            routes: vec![r],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        assert!(
+            sr.issues
+                .iter()
+                .any(|i| i.message.contains("out-of-range weight 150")),
+            "issues must name the out-of-range percent: {:?}",
+            sr.issues
+        );
+        // The route is dropped (skip-and-report), not silently normalized.
+        assert!(sr.accepted.routes.is_empty());
+
+        // A single 100% destination stays valid.
+        let ok = RouteRule {
+            destinations: vec![Destination::with_percent(100, "a.static:80")],
+            ..main_route("m1")
+        };
+        let data = ConfigData {
+            routes: vec![ok],
+            ..Default::default()
+        };
+        assert!(data.validate().is_empty());
+    }
+
+    #[test]
+    fn validation_huge_percents_reject_route_without_panic() {
+        // MINOR-7: two `u32::MAX` weights would overflow a plain debug-mode `u32` `sum()` and
+        // panic. The checked accumulation + per-destination bound must instead produce issues and
+        // drop the route. (Runs in a debug build — an overflow would abort the test.)
+        let r = RouteRule {
+            destinations: vec![
+                Destination::with_percent(u32::MAX, "a.static:80"),
+                Destination::with_percent(u32::MAX, "b.static:80"),
+            ],
+            ..main_route("m1")
+        };
+        let data = ConfigData {
+            routes: vec![r],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        assert!(sr.accepted.routes.is_empty(), "route must be dropped, not kept");
+        assert!(
+            sr.issues.iter().any(|i| i.message.contains("out-of-range weight")),
+            "out-of-range issue expected: {:?}",
+            sr.issues
+        );
+    }
+
+    #[test]
+    fn validation_only_first_mirror_route_is_accepted() {
+        // MINOR-13: `RouteTable` only ever installs the FIRST Mirror route as the catch-all
+        // (`mirror_index`); any additional Mirror route in the snapshot is unreachable dead
+        // configuration and must be reported + dropped — never silently accepted.
+        let mirror1 = RouteRule::new(
+            "gpustack-1",
+            RouteKind::Mirror,
+            vec![PathPred::new("/")],
+            vec![Destination::new("gpustack.dns:30080")],
+        )
+        .unwrap();
+        let mirror2 = RouteRule::new(
+            "gpustack-2",
+            RouteKind::Mirror,
+            vec![PathPred::new("/")],
+            vec![Destination::new("other.dns:30080")],
+        )
+        .unwrap();
+        let good = main_route("m1");
+        let data = ConfigData {
+            routes: vec![mirror1, mirror2, good],
+            ..Default::default()
+        };
+
+        let sr = data.sanitize();
+        // Only the FIRST mirror (plus the unrelated main route) survives; mirror2 is dropped
+        // with a dedicated issue.
+        assert_eq!(sr.accepted.routes.len(), 2);
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "gpustack-1"));
+        assert!(
+            sr.accepted.routes.iter().all(|r| r.key != "gpustack-2"),
+            "a second mirror must not be silently accepted"
+        );
+        assert!(
+            sr.issues
+                .iter()
+                .any(|i| i.message.contains("only the first mirror route is used")),
+            "issues: {:?}",
+            sr.issues
+        );
+
+        // Through the live holder the snapshot carries one mirror and the RouteTable indexes it.
+        let sc = SharedConfig::new(data).unwrap();
+        assert_eq!(sc.load().routes.len(), 2);
+        assert!(
+            sc.route_table().unwrap().mirror_index().is_some(),
+            "the accepted first mirror must be the catch-all"
+        );
+    }
+
+    #[test]
     fn validation_mirror_auth_and_duplicate_keys() {
         let mut mirror = RouteRule::new(
             "gpustack",
@@ -1455,6 +1655,66 @@ mod tests {
         let sr = data.sanitize();
         assert_eq!(sr.accepted.routes.len(), 1);
         assert_eq!(sr.accepted.routes[0].key, "m2");
+    }
+
+    #[test]
+    fn validation_dropped_fallback_target_drops_referencing_main() {
+        // AM-4: a Main route whose referenced Fallback route is itself dropped by
+        // validation (per-object issue) must NOT survive with a dangling fallback.
+        // The first-pass target check runs against the full route set; the second
+        // pass re-checks against the ACCEPTED set and drops the referencing route.
+        let broken_fb = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(), // per-object issue: no destinations
+            ..main_route("fb-target")
+        };
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb-target"));
+        let good = main_route("m2");
+        let data = ConfigData {
+            routes: vec![main, broken_fb, good],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        // The broken Fallback route is dropped, AND the Main that referenced it is
+        // dropped too (cascade); the unrelated good route survives.
+        assert_eq!(sr.accepted.routes.len(), 1);
+        assert_eq!(sr.accepted.routes[0].key, "m2");
+        assert!(sr.accepted.routes.iter().all(|r| r.key != "m1"));
+        assert!(sr
+            .issues
+            .iter()
+            .any(|i| i.message.contains("fallback target 'fb-target' not accepted")));
+        assert!(sr.issues.iter().any(|i| i.message.contains("has no destinations")));
+
+        // Store semantics: per-object skip count covers both drops, and the live
+        // snapshot carries only the good route.
+        let sc = SharedConfig::new(data).unwrap();
+        assert_eq!(sc.load().routes.len(), 1);
+        assert_eq!(sc.load().routes[0].key, "m2");
+    }
+
+    #[test]
+    fn validation_healthy_fallback_pair_both_accepted() {
+        // Control case (AM-4): a Fallback route with no per-object issues is
+        // accepted, so the Main route referencing it stays accepted too — no
+        // cascade, no fallback issue.
+        let fb = RouteRule::new(
+            "fb-target",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions|/embeddings)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap();
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb-target"));
+        let data = ConfigData {
+            routes: vec![main, fb],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        assert!(sr.issues.is_empty());
+        assert_eq!(sr.accepted.routes.len(), 2);
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "m1"));
+        assert!(sr.accepted.routes.iter().any(|r| r.key == "fb-target"));
     }
 
     #[test]

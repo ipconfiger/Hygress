@@ -24,10 +24,13 @@ etc/s6-overlay/s6-rc.d/supercronic/run    = edited: drop `readinessCheck "Higres
 - admin: `HYGRESS_ADMIN_ADDR` (127.0.0.1:8081); stats: `GATEWAY_PILOT_AGENT_METRICS_PORT` (15020) `/stats/prometheus`
 - NEVER binds 9876/15010/15012/8888/15051
 
-## access.log / logrotate
+## access.log / logrotate / hygress.log
 The original `gateway/run` created `${HIGRESS_LOG_DIR}/access.log` for the hourly logrotate
-(supercronic-driven). The launcher exports `HIGRESS_LOG_DIR` (default `/var/log/higress`) and
-appends hygress output there; keeps `higress-config` logrotate quiet.
+(supercronic-driven). The launcher keeps that contract for the logrotate tooling — it `touch`es
+`${HIGRESS_LOG_DIR}/access.log` (kept **empty**: no per-request writes; GPUStack logrotate rotates the
+empty file) — and appends the hygress process output to **`${GPUSTACK_DATA_DIR}/log/hygress.log`**
+(host-visible under the GPUStack data bind volume, for diagnosis). It does **not** write request logs
+into `access.log`.
 
 ## Rollback (DoD 6)
 `pack/Dockerfile.hygress` copies the surgery scripts; pristine upstream `gateway/pilot/controller/run`

@@ -288,6 +288,23 @@ pub fn build_outbound(
         prepared.body_model.as_deref(),
     );
 
+    // AM-2 (pin §2.8): force `stream_options.include_usage` on streaming
+    // OpenAI-completions bodies of model-route traffic, so the upstream emits
+    // the canonical final usage chunk (ai-proxy parity; Higress #4258/#2524).
+    // Single-point injection: both the registry destination and the
+    // provider-destined send paths consume `outbound.body`, so this covers
+    // every metered upstream. `None` keeps `out_body` untouched (R-5
+    // zero-allocation short path); a client-supplied `stream_options` is never
+    // overridden.
+    if let Some(nb) = crate::body::ensure_stream_include_usage(
+        &out_body,
+        Some(prepared.content_type.as_str()),
+        &prepared.upstream_path,
+        prepared.route.is_model_route,
+    ) {
+        out_body = nb;
+    }
+
     // ⑨ set-model-pre-route: the selected instance cluster name + the route
     //    name — **model-route traffic only** (NB6). The mirror `/` and any
     //    non-model passthrough never carry `X-GPUStack-Model-Instance` /
@@ -586,6 +603,41 @@ mod tests {
         let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
         assert_eq!(out.headers.get(hdr::MODEL_INSTANCE_OUT), None);
         assert_eq!(out.headers.get(hdr::ROUTE_NAME_OUT), None);
+    }
+
+    // ----- AM-2 (pin §2.8): streaming `include_usage` forced on -----
+
+    #[test]
+    fn model_route_stream_body_gets_include_usage_injected() {
+        // A metered model-route + OpenAI completions shape + top-level
+        // `stream:true` → the outbound body carries the forced option exactly
+        // once (both the registry and the provider send paths consume
+        // `outbound.body`, so this single injection point covers all).
+        let mut p = prepared(true, "higress-system/ai-route-route-1.internal");
+        p.body = bytes::Bytes::from(r#"{"model":"org1/llama-3-8b","stream":true}"#);
+        let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
+        let got = String::from_utf8(out.body.to_vec()).unwrap();
+        assert_eq!(
+            got,
+            r#"{"model":"org1/llama-3-8b","stream":true,"stream_options":{"include_usage":true}}"#
+        );
+        // Only one `stream_options` object in the whole outbound body.
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
+    }
+
+    #[test]
+    fn mirror_body_is_passthrough_never_include_usage_injected() {
+        // Non-model (mirror) traffic is forwarded byte-for-byte — usage is not
+        // metered there and the target may not understand `stream_options`.
+        let mut p = prepared(false, "gpustack");
+        let body = bytes::Bytes::from(r#"{"model":"x","stream":true}"#);
+        p.body = body.clone();
+        let out = build_outbound("POST", &p, &candidate(), &HeaderMap::new(), &[]);
+        assert_eq!(out.body, body);
+        assert_eq!(
+            String::from_utf8(out.body.to_vec()).unwrap(),
+            r#"{"model":"x","stream":true}"#
+        );
     }
 
     // ----- B2: the configured targetHeader receives the resolved model -----

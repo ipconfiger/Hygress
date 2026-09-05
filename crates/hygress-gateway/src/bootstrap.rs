@@ -517,20 +517,18 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             }
         });
 
-        // 4. Control plane: build the Controller, optionally seed the topology-B IngressClass,
-        //    and run the 1s poll loop as a task (stopped on shutdown_signal()).
+        // 4. Control plane: build the Controller (gating the topology-B IngressClass seed on
+        //    `config.topology_b` — the seed runs once inside `Controller::run`, AM-1) and run
+        //    the 1s poll loop as a task (stopped on shutdown_signal()).
         let controller = Controller::new(
             ds.shared.inner.clone(),
             resolve_kubeconfig(config),
             config.gateway_namespace.clone(),
             "higress".to_string(),
             config.poll_interval,
+            config.topology_b, // seed_ingress_class: single seed site is inside `Controller::run`
         )
         .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("control plane init: {e}")))?;
-        if config.topology_b {
-            info!("topology B enabled: seeding the higress IngressClass (best-effort)");
-            controller.seed_ingress_class();
-        }
         let ready = controller.ready();
         tokio::spawn(controller.run(shutdown_signal()));
 

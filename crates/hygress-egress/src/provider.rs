@@ -103,14 +103,26 @@ impl ProviderClient {
             }
         }
         // 2. Host override (URL authority + explicit Header, set below).
+        // MINOR-12: `set_host` fails (invalid host chars, e.g. a space or `_`) — never silently
+        // ignore the failure: log it and keep the `base` host so the request still goes out (the
+        // dialer would otherwise talk to the wrong origin with no trace).
         if let Some(host) = &opts.host_override {
-            let _ = url.set_host(Some(host));
+            if url.set_host(Some(host)).is_err() {
+                tracing::warn!(
+                    "provider: cannot set outbound URL host to {host:?} on base {base}; keeping the base host (request may reach the wrong origin)"
+                );
+            }
         }
         // 2b. Scheme override (e.g. dial an `https` upstream through a proxy); `None`
         //     keeps the `base` URL's scheme. `set_scheme` only touches the scheme, so it is
-        //     independent of the path / host / query set above.
+        //     independent of the path / host / query set above. As with the host, a failure
+        //     (an invalid scheme string) must not be silent.
         if let Some(scheme) = &opts.scheme {
-            let _ = url.set_scheme(scheme);
+            if url.set_scheme(scheme).is_err() {
+                tracing::warn!(
+                    "provider: cannot set outbound URL scheme to {scheme:?} on base {base}; keeping the base scheme"
+                );
+            }
         }
 
         // 3. Headers: forward-safe inbound copy, then key swap + Host override.
@@ -163,14 +175,27 @@ fn forward_inbound_headers(inbound: &CoreHeaderMap) -> HeaderMap {
 
 /// Build the outbound body, applying the per-destination model rewrite when a mapping + service
 /// are provided, and setting `Content-Type` when the caller did not.
+///
+/// A mapping lookup miss (the selected destination has no rule) is a **normal** no-op — the body is
+/// forwarded unchanged. But when the destination IS mapped and the rewrite still cannot be applied
+/// (non-object body, missing or non-string `model` field / no `name="model"` multipart part) the
+/// client-supplied model alias would reach the upstream unmapped — MINOR-12: log that instead of
+/// silently forwarding it.
 fn build_body(opts: &UpstreamOptions, headers: &mut HeaderMap) -> Vec<u8> {
     match &opts.body {
         None => Vec::new(),
         Some(Body::Json(value)) => {
             let mut value = value.clone();
-            if let Some(m) = &opts.model_mapping {
-                if let Some(svc) = &opts.destination_service {
-                    let _ = m.apply_json(svc, &mut value);
+            let mapped = opts
+                .model_mapping
+                .as_ref()
+                .zip(opts.destination_service.as_ref())
+                .filter(|(m, svc)| m.lookup(svc).is_some());
+            if let Some((m, svc)) = mapped {
+                if !m.apply_json(svc, &mut value) {
+                    tracing::warn!(
+                        "provider: model mapping for destination '{svc}' could not be applied to the JSON body (no rewritable top-level string `model`); forwarding the client-supplied value"
+                    );
                 }
             }
             if !headers.contains_key(header::CONTENT_TYPE) {
@@ -183,9 +208,16 @@ fn build_body(opts: &UpstreamOptions, headers: &mut HeaderMap) -> Vec<u8> {
         }
         Some(Body::Multipart { bytes, boundary }) => {
             let mut bytes = bytes.clone();
-            if let Some(m) = &opts.model_mapping {
-                if let Some(svc) = &opts.destination_service {
-                    let _ = m.apply_multipart(svc, &mut bytes, boundary);
+            let mapped = opts
+                .model_mapping
+                .as_ref()
+                .zip(opts.destination_service.as_ref())
+                .filter(|(m, svc)| m.lookup(svc).is_some());
+            if let Some((m, svc)) = mapped {
+                if !m.apply_multipart(svc, &mut bytes, boundary) {
+                    tracing::warn!(
+                        "provider: model mapping for destination '{svc}' could not be applied to the multipart body (no `name=\"model\"` part); forwarding the client-supplied value"
+                    );
                 }
             }
             if !headers.contains_key(header::CONTENT_TYPE) {
@@ -518,6 +550,50 @@ mod tests {
         let req = build("http://10.0.0.5:8081", &o);
         assert!(req.body.is_empty());
         assert_eq!(req.method, Method::POST);
+    }
+
+    // ----- MINOR-12: URL rewrite / mapping failures are logged, never silent -----
+
+    #[test]
+    fn invalid_host_override_keeps_base_host() {
+        // A host value the `url` crate rejects (whitespace is not a valid domain character) cannot
+        // be set on the URL authority. Previously `let _ = url.set_host(...)` swallowed that
+        // silently; the builder now logs it (MINOR-12) and falls back to the `base` host so the
+        // dialable URL stays valid.
+        let o = opt(UpstreamOptions {
+            host_override: Some("bad host.example".into()),
+            ..UpstreamOptions::default()
+        });
+        let req = build("http://10.0.0.5:8081", &o);
+        // The URL authority keeps the base host (the invalid override is not dialable)...
+        assert_eq!(req.url.host_str(), Some("10.0.0.5"));
+        assert_eq!(
+            req.url.to_string(),
+            "http://10.0.0.5:8081/v1/chat/completions"
+        );
+        // ... while the Host *header* still carries the override (an interior space IS a valid
+        // header value). The request would dial `10.0.0.5` while claiming `bad host.example` —
+        // the exact divergence MINOR-12 now logs instead of silently ignoring.
+        assert_eq!(
+            req.headers.get(header::HOST),
+            Some(&HeaderValue::from_static("bad host.example"))
+        );
+    }
+
+    #[test]
+    fn mapped_destination_with_unrewritable_model_forwards_unchanged() {
+        // The destination IS mapped, but the body has no rewritable top-level string `model`
+        // (here a number): the rewrite cannot apply. The builder logs it (MINOR-12) and forwards
+        // the body unchanged — never a silent partial rewrite.
+        let o = opt(UpstreamOptions {
+            model_mapping: Some(ModelMapping::single("model-1-10.static", "llama-3-8b-instruct")),
+            destination_service: Some("model-1-10.static".into()),
+            body: Some(Body::Json(json!({"model": 5, "messages": []}))),
+            ..UpstreamOptions::default()
+        });
+        let req = build("http://10.0.0.5:8081", &o);
+        let v: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(v["model"], json!(5), "non-string model is not rewritten");
     }
 
     #[test]

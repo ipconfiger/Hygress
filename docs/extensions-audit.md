@@ -39,13 +39,13 @@
 | A4 | **加权下游选择（SWRR）** | `pipeline/swrr_select.rs` + `core/swrr.rs` | 目标组共享状态 |
 | A5 | **回退（fallback）** | `pipeline/fallback.rs` | 有界重定向环（别名字段 `x-higress-fallback-from`） |
 | A6 | **镜像（mirror）** | `route_match` + `config.rs`(mirror_name) | 唯一 path 兜底 → GPUStack API；`:80/readyz` |
-| A7 | **认证（ext-auth）** | `pipeline/auth.rs` + `egress/forward_auth.rs` | `/token-auth`：7 头转发 + Authorization + 注入派生 token；路由名前缀作用域；FAIL_OPEN |
+| A7 | **认证（ext-auth）** | `pipeline/auth.rs` + `egress/forward_auth.rs` | `/token-auth`：7 头转发 + Authorization + 注入派生 token；路由名前缀作用域；传输失败默认 fail-closed（403 `ext_auth_unavailable`；`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切旧版 fail-open，R-12） |
 | A8 | **头转换（transformer）** | `pipeline/transformer.rs` | 入站 strip / set / pre-route |
 | A9 | **模型映射（model-mapper）** | `pipeline/model_mapper.rs` + `core/model_mapping.rs` | destination 级模型名映射（LoRA/改名） |
 | A10 | **AI 代理令牌交换（ai-proxy）** | `egress/provider.rs` + 管道 | provider-destined 请求令牌替换（D6） |
 | A11 | **usage 计量** | `egress/usage_sink.rs` + `core/usage.rs` | `ModelUsageMetrics` 17 字段 → `/v2/usage/gateway-metrics`，丢行闸门、非 2xx 计量 |
 | A12 | **TLS/SNI** | `core/config.rs`(TlsHost) + 数据面 | Secret gpustack-tls-* → TLS 终止 |
-| A13 | **admin / 可观测** | `bootstrap.rs` | 127.0.0.1:8081（healthz/metrics/reload token 保护）+ 15020 readyz 浅兼容 + tracing |
+| A13 | **admin / 可观测** | `bootstrap.rs` | 127.0.0.1:8081（healthz/metrics/reload token 保护）+ 15020 `/stats[/prometheus]` 浅兼容 + tracing（`:80/readyz` 由 mirror 路由透传，非 15020） |
 | A14 | **热重载** | `adapter/snapshot.rs` + `SharedConfig`(ARC-swap) | CRD 快照变更即点即用（零重建） |
 | A15 | **部署/回滚** | `pack/Dockerfile.hygress` + `pack/hygress-s6/` | s6 手术 + `.dist` 原件快照 |
 | A16 | **错误语义/短回路** | `error.rs`(GatewayError) + `pipe.rs` short_circuit | 统一 `{status, reason-slug}`；前置 fail-fast |
@@ -82,7 +82,8 @@
   配置走**配置文件**（规则表热重载）。
 - **B4b LLM 判定**（审核模型/护栏服务外呼）：`egress` 新增 `GuardrailClient`（并发上限、判词缓存、超时降级）；同步拦截或异步旁路；
   配置走**配置文件**（模型/服务/阈值/**失败策略**）。**关键定案：安全方向默认 `fail-closed`**（超时/出错→拒绝并告警），
-  与 ext-auth（A7）的 FAIL_OPEN 相反——两者性质不同，必须显式配置。
+  与 ext-auth 的 legacy fail-open（A7，`HYGRESS_EXT_AUTH_FAIL_MODE=open`）相对——R-12 后 ext-auth 传输失败默认亦为
+  fail-closed（403），但两者属不同领域、各自独立配置，护栏必须显式 closed。
 - **B4c 输出侧护栏**（响应合规/PII 脱敏）：**前置缺口**——见 D-2（无通用响应侧管道）。需在 Pingora upstream 回调上扩展响应体读取/拦截骨架（SSE 流式场景需逐块或缓存策略，需设计定案）。usage 计量（A11）已证明响应体可达（completion_tokens 取自响应），可在此能力上扩展。
 
 ---
@@ -113,7 +114,7 @@
 | **限流** | **Hygress 配置文件**（`limit:`） | Hygress 侧运维 |
 | **路由策略** | **Hygress 配置文件**（`policy:`） | Hygress 侧运维 |
 | **安全护栏** | **Hygress 配置文件**（`guardrail:`：规则/模型/阈值/失败策略） | Hygress 侧运维 |
-| admin/metrics/15020/readyz | 固定契约 + 环境变量 | 不可配置面最小化 |
+| admin/metrics/15020（/stats[/prometheus]）/ `:80/readyz`（mirror 透传） | 固定契约 + 环境变量 | 不可配置面最小化 |
 
 ---
 
@@ -128,8 +129,9 @@
   响应、`(None, true)` 收尾；usage 计量已从响应体取 completion_tokens（响应体可达），但**没有通用的
   响应体读取/改写/拦截钩子**（护栏 B4c 需要）。→ 需在 Pingora upstream 回调上补响应侧骨架，SSE 流式策略需设计定案。
 - **E-3 事实纠错**：无（本审核未发现对既有设计结论的事实性偏差；个别"已实现细节"以代码为准）。
-- **E-4 失败模式必须区分领域**：ext-auth 是"接入认证"（FAIL_OPEN 合理）；安全护栏是"安全/合规"（必须
-  fail-closed）；两者并存时护栏默认 closed、且配置显式化，避免"放行恶意请求"。
+- **E-4 失败模式必须区分领域**：ext-auth 是"接入认证"（鉴权服务不可用时**默认 fail-closed**（403
+  `ext_auth_unavailable`），`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切回 legacy fail-open —— R-12 修订）；
+  安全护栏是"安全/合规"（必须 fail-closed）；两者并存时护栏默认 closed、且配置显式化，避免"放行恶意请求"。
 
 ---
 

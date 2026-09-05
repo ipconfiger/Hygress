@@ -69,7 +69,6 @@ use tracing::{debug, warn};
 use crate::context::{
     hdr, GatewayState, GuardrailClientKey, InboundRequest, OutboundRequest, PreparedRequest,
 };
-use crate::error::GatewayError;
 use crate::pipeline;
 use crate::pipeline::PipelineCtx;
 use crate::policy_loader::{MergedEntry, MergedPolicy, bare_ingress_name};
@@ -249,6 +248,12 @@ impl ProxyHttp for HygressProxy {
         // spec: the route is not known before `route_match`), before the body
         // read. Empty client ip skips the dimension (D-9).
         if let Some(extra) = self.rate_limit_pre(&state, &head.client_ip) {
+            // AM-5: this terminal 429 writes downstream, so it counts in the
+            // request-level totals (kind = short_circuit; the ip/consumer
+            // breakdown stays on `rate_limit_denied`).
+            state
+                .metrics
+                .record_short_circuit(429, started.elapsed().as_secs_f64());
             return short_circuit_typed(
                 session,
                 429,
@@ -260,6 +265,11 @@ impl ProxyHttp for HygressProxy {
         }
 
         // ⑥ body phase (phase 2): read the full body up to the cap (413).
+        // AM-3: `Ok(Some/None)` is a **complete** (or absent/empty) body; an
+        // `Err` is either the oversized-body business 413 or a **read abort**
+        // (the downstream died mid-body → the buffered prefix is truncated).
+        // An abort short-circuits here — before `prepare` / auth / quota /
+        // usage / retry / fallback — and never dispatches upstream.
         let body = match Self::read_body(
             session,
             &head.method,
@@ -268,10 +278,24 @@ impl ProxyHttp for HygressProxy {
         )
         .await
         {
-            Ok(b) => b,
-            Err(e) => {
-                state.metrics.record_request(e.status(), e.reason());
-                return short_circuit(session, e.status(), e.reason()).await;
+            Ok(Some(b)) => b,
+            Ok(None) => Bytes::new(),
+            Err(failure) => {
+                if failure.is_abort() {
+                    // AM-3: truncated body — the request must not be treated as
+                    // whole. Close the connection (Pingora would anyway: the
+                    // body was never fully consumed) and answer 400 best-effort
+                    // (the write simply fails when the client is already gone).
+                    session.as_downstream_mut().set_keepalive(None);
+                    warn!(
+                        error = %failure,
+                        "downstream request body read aborted; short-circuiting without dispatch (AM-3)"
+                    );
+                }
+                state
+                    .metrics
+                    .record_short_circuit(failure.status(), started.elapsed().as_secs_f64());
+                return short_circuit(session, failure.status(), failure.reason()).await;
             }
         };
         let method = head.method;
@@ -311,7 +335,15 @@ impl ProxyHttp for HygressProxy {
                 pipeline::prepare_fallback(&current, &pctx)
             } {
                 Ok(p) => p,
-                Err(e) => return short_circuit(session, e.status(), e.reason()).await,
+                Err(e) => {
+                    // AM-5: a prepare failure terminal (no-route 404, registry
+                    // 503, ...) writes downstream — record it under the
+                    // short-circuit kind so the request-level totals cover it.
+                    state
+                        .metrics
+                        .record_short_circuit(e.status(), started.elapsed().as_secs_f64());
+                    return short_circuit(session, e.status(), e.reason()).await;
+                }
             };
 
             let kind = if prepared.route.is_model_route {
@@ -381,6 +413,10 @@ impl ProxyHttp for HygressProxy {
                     }
                     match outcome {
                         crate::pipeline::auth::AuthOutcome::Denied => {
+                            // AM-5: 401 writes downstream → request-level total.
+                            state
+                                .metrics
+                                .record_short_circuit(401, started.elapsed().as_secs_f64());
                             return short_circuit(session, 401, "auth_denied").await;
                         }
                         crate::pipeline::auth::AuthOutcome::Allowed { write_back } => {
@@ -396,7 +432,13 @@ impl ProxyHttp for HygressProxy {
                             if state.auth_fail_closed {
                                 // Default: reject, matching the GPUStack/Higress
                                 // `failure_mode_allow=false` behavior (403,
-                                // `status_on_error`).
+                                // `status_on_error`). AM-5: the 403 writes
+                                // downstream → request-level total (only the
+                                // denied branch; fail-open proceeds without
+                                // writing and is not a terminal short-circuit).
+                                state
+                                    .metrics
+                                    .record_short_circuit(403, started.elapsed().as_secs_f64());
                                 return short_circuit_typed(
                                     session,
                                     403,
@@ -422,6 +464,10 @@ impl ProxyHttp for HygressProxy {
                 let consumer = auth_writeback.get(hdr::MSE_CONSUMER).unwrap_or("").to_string();
                 let rate_policy = merged.as_ref().map(|e| &e.policy);
                 if let Some(extra) = self.rate_limit_post(&state, rate_policy, &consumer) {
+                    // AM-5: terminal 429 → request-level total.
+                    state
+                        .metrics
+                        .record_short_circuit(429, started.elapsed().as_secs_f64());
                     return short_circuit_typed(
                         session,
                         429,
@@ -451,6 +497,10 @@ impl ProxyHttp for HygressProxy {
                         match decision {
                             QuotaDecision::HardDeny => {
                                 state.metrics.record_quota_denied();
+                                // AM-5: terminal 429 → request-level total.
+                                state
+                                    .metrics
+                                    .record_short_circuit(429, started.elapsed().as_secs_f64());
                                 return short_circuit_typed(
                                     session,
                                     429,
@@ -506,6 +556,10 @@ impl ProxyHttp for HygressProxy {
                         state.metrics.record_guardrail_blocked("in");
                         self.report_incomplete_usage(&prepared, &prepared.selected_service)
                             .await;
+                        // AM-5: terminal 403 → request-level total.
+                        state
+                            .metrics
+                            .record_short_circuit(403, started.elapsed().as_secs_f64());
                         return short_circuit_typed(
                             session,
                             403,
@@ -743,6 +797,105 @@ struct InboundHead {
     headers: HeaderMap,
 }
 
+/// AM-3: why a downstream body read did not yield a **complete** request body.
+///
+/// The two failure classes are deliberately distinct — the AM-3 bug was that a
+/// downstream read `Err` (client closed / framing error → the buffered bytes
+/// are a truncated prefix) exited the old `while let Ok(Some(..))` loop and was
+/// returned as a complete body. Only [`BodyReadFailure::TooLarge`] is a
+/// *business* rejection of an oversized body (the read itself was fine up to
+/// the cap); [`BodyReadFailure::Read`] is an *abort* — the request must never
+/// dispatch upstream (AM-3), never reserve quota, never report usage.
+///
+/// Kept module-local: `GatewayError` (error.rs) is frozen and has no read-side
+/// variant — its closest matches (`DownstreamWrite`, `Egress`, `Other`) map to
+/// 502/500 with misleading reason slugs, which would corrupt the client error
+/// body and the metrics.
+enum BodyReadFailure {
+    /// The buffered body exceeded `max_body` — business 413 (the connection is
+    /// drained before the caller short-circuits, mirroring the old behavior).
+    TooLarge { len: usize, cap: usize },
+    /// The downstream read failed mid-body (`read_request_body` → `Err`):
+    /// client closed / protocol error. The buffered bytes are a truncated
+    /// prefix, not a body.
+    Read { detail: String },
+}
+
+impl BodyReadFailure {
+    /// The HTTP status this failed read short-circuits to: 413 for an
+    /// oversized body, 400 for a truncated (aborted) read.
+    fn status(&self) -> u16 {
+        match self {
+            BodyReadFailure::TooLarge { .. } => 413,
+            BodyReadFailure::Read { .. } => 400,
+        }
+    }
+
+    /// The stable client-facing reason slug (lowercase snake; unchanged per
+    /// class — it is what the short-circuit JSON body carries).
+    fn reason(&self) -> &'static str {
+        match self {
+            BodyReadFailure::TooLarge { .. } => "request_body_too_large",
+            BodyReadFailure::Read { .. } => "request_body_read_failed",
+        }
+    }
+
+    /// AM-3: `true` for a **truncated** read — the body is incomplete and the
+    /// request must be short-circuited **without** any pipeline / usage /
+    /// quota action; `false` for the oversized-body business 413 (whose read
+    /// itself was clean).
+    fn is_abort(&self) -> bool {
+        matches!(self, BodyReadFailure::Read { .. })
+    }
+}
+
+impl std::fmt::Display for BodyReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyReadFailure::TooLarge { len, cap } => {
+                write!(f, "request body too large: {len} bytes (cap {cap})")
+            }
+            BodyReadFailure::Read { detail } => write!(f, "request body read failed: {detail}"),
+        }
+    }
+}
+
+/// AM-3: the pure per-step decision for the downstream body read — extracted
+/// from [`HygressProxy::read_body`] so the abort-vs-end-vs-cap classification
+/// is unit-testable without a live `Session`.
+///
+/// A read step is classified on the **already-buffered** length plus the
+/// incoming chunk: `Ok(None)` is the only clean end of body; `Err` is always a
+/// read failure (never a normal end — this is the exact conflation AM-3
+/// fixes); an `Ok(Some(..))` that crosses `max_body` is the business `TooLarge`
+/// (never a read failure).
+#[derive(Debug, PartialEq, Eq)]
+enum BodyReadStep {
+    /// `Ok(None)`: no (more) body — stop reading.
+    BodyEnd,
+    /// `Ok(Some(..))` within the cap — keep reading.
+    Chunk,
+    /// The cap was crossed by this chunk — business 413.
+    CapExceeded,
+    /// `Err`: the downstream read failed — truncated body, abort.
+    ReadFailed,
+}
+
+fn body_read_step<E>(
+    buf_len: usize,
+    max_body: usize,
+    step: &Result<Option<Bytes>, E>,
+) -> BodyReadStep {
+    match step {
+        Ok(None) => BodyReadStep::BodyEnd,
+        Err(_) => BodyReadStep::ReadFailed,
+        Ok(Some(chunk)) if buf_len.saturating_add(chunk.len()) > max_body => {
+            BodyReadStep::CapExceeded
+        }
+        Ok(Some(_)) => BodyReadStep::Chunk,
+    }
+}
+
 impl HygressProxy {
     /// Inbound phase 1: read the request **headers** only (no body).
     ///
@@ -811,12 +964,22 @@ impl HygressProxy {
 
     /// Inbound phase 2: read the **full** body (POST/PUT/PATCH only) up to the
     /// cap (413 above it).
+    ///
+    /// AM-3: the result now distinguishes a **clean** body (`Ok(None)` = no
+    /// body / read cleanly to an empty end; `Ok(Some(..))` = a complete body)
+    /// from a **failed** read (`Err([`BodyReadFailure`])`). Pingora's
+    /// `read_request_body` returns `Ok(None)` only when there is no (more)
+    /// body; an `Err` means the downstream connection died / the framing broke
+    /// **mid-body**, so whatever was buffered is a truncated prefix — never a
+    /// complete request. Previously the `Err` was swallowed by the loop and
+    /// the truncated prefix was returned as `Ok`, letting a cut-short request
+    /// dispatch upstream as if whole (AM-3).
     async fn read_body(
         session: &mut Session,
         method: &str,
         max_body: usize,
         content_length: Option<u64>,
-    ) -> Result<Bytes, GatewayError> {
+    ) -> Result<Option<Bytes>, BodyReadFailure> {
         let has_body = matches!(method, "POST" | "PUT" | "PATCH");
         // B1: when the peer declared a valid Content-Length, pre-reserve that
         // exact size (capped at max_body) so the buffer grows geometrically
@@ -831,16 +994,42 @@ impl HygressProxy {
             _ => Vec::new(),
         };
         if has_body {
-            while let Ok(Some(chunk)) = session.as_downstream_mut().read_request_body().await {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > max_body {
-                    session.set_keepalive(None);
-                    let _ = session.as_downstream_mut().drain_request_body().await;
-                    return Err(GatewayError::BodyTooLarge(buf.len(), max_body));
+            loop {
+                let step = session.as_downstream_mut().read_request_body().await;
+                match body_read_step(buf.len(), max_body, &step) {
+                    BodyReadStep::BodyEnd => break,
+                    BodyReadStep::Chunk => {
+                        if let Ok(Some(chunk)) = &step {
+                            buf.extend_from_slice(chunk);
+                        }
+                    }
+                    BodyReadStep::CapExceeded => {
+                        session.set_keepalive(None);
+                        let _ = session.as_downstream_mut().drain_request_body().await;
+                        // Report the over-cap length (the buffered bytes plus
+                        // the chunk that crossed the cap), matching the
+                        // pre-AM-3 `TooLarge` payload.
+                        let len = match &step {
+                            Ok(Some(chunk)) => buf.len() + chunk.len(),
+                            _ => buf.len(),
+                        };
+                        return Err(BodyReadFailure::TooLarge { len, cap: max_body });
+                    }
+                    BodyReadStep::ReadFailed => {
+                        let detail = match step {
+                            Err(e) => e.to_string(),
+                            _ => unreachable!("ReadFailed implies an Err step"),
+                        };
+                        return Err(BodyReadFailure::Read { detail });
+                    }
                 }
             }
         }
-        Ok(Bytes::from(buf))
+        if buf.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Bytes::from(buf)))
+        }
     }
 }
 
@@ -2051,5 +2240,86 @@ mod tests {
                 "{status}: content-length must match the real body length"
             );
         }
+    }
+
+    // ----- AM-3: body-read step classification (pure, no Session) -----
+
+    #[test]
+    fn body_read_step_only_ok_none_ends_the_body() {
+        // `Ok(None)` (Pingora: "no (more) body to read") is the ONLY clean end
+        // of body — regardless of how much was already buffered it is never a
+        // failure.
+        assert_eq!(
+            body_read_step::<&str>(0, 100, &Ok(None)),
+            BodyReadStep::BodyEnd
+        );
+        assert_eq!(
+            body_read_step::<&str>(200, 100, &Ok(None)),
+            BodyReadStep::BodyEnd
+        );
+    }
+
+    #[test]
+    fn body_read_step_chunk_within_cap_continues() {
+        assert_eq!(
+            body_read_step::<&str>(90, 100, &Ok(Some(Bytes::from_static(b"12345")))),
+            BodyReadStep::Chunk
+        );
+        // Exactly at the cap is still within it (the over-cap check is `>`).
+        assert_eq!(
+            body_read_step::<&str>(100, 100, &Ok(Some(Bytes::new()))),
+            BodyReadStep::Chunk
+        );
+    }
+
+    #[test]
+    fn body_read_step_crossing_cap_is_too_large_not_a_failure() {
+        // A chunk crossing `max_body` is the business 413 — never a read
+        // failure.
+        assert_eq!(
+            body_read_step::<&str>(100, 100, &Ok(Some(Bytes::from_static(b"x")))),
+            BodyReadStep::CapExceeded
+        );
+        assert_eq!(
+            body_read_step::<&str>(0, 1, &Ok(Some(Bytes::from_static(b"ab")))),
+            BodyReadStep::CapExceeded
+        );
+    }
+
+    #[test]
+    fn body_read_step_err_is_an_abort_never_an_end_or_413() {
+        // AM-3 core regression: an `Err` read step is a READ FAILURE (abort)
+        // no matter how much was buffered. The old `while let Ok(Some(..))`
+        // swallowed this `Err`, exited the loop, and returned the truncated
+        // prefix as a complete body that then dispatched upstream.
+        assert_eq!(
+            body_read_step::<&str>(0, 100, &Err("peer closed mid-body")),
+            BodyReadStep::ReadFailed
+        );
+        assert_eq!(
+            body_read_step::<&str>(1000, 100, &Err("peer closed mid-body")),
+            BodyReadStep::ReadFailed
+        );
+    }
+
+    #[test]
+    fn body_read_failure_classes_are_not_conflated() {
+        // AM-3/AM-5: the oversized-body business rejection (413) and the
+        // truncated-read abort (400) must stay distinct — different statuses,
+        // client reason slugs, and abort semantics (only the abort must never
+        // dispatch / reserve quota / report usage).
+        let too_large = BodyReadFailure::TooLarge { len: 101, cap: 100 };
+        let aborted = BodyReadFailure::Read {
+            detail: "ConnectionClosed: peer prematurely closed".to_string(),
+        };
+        assert_eq!(too_large.status(), 413);
+        assert_eq!(too_large.reason(), "request_body_too_large");
+        assert!(!too_large.is_abort());
+        assert_eq!(aborted.status(), 400);
+        assert_eq!(aborted.reason(), "request_body_read_failed");
+        assert!(aborted.is_abort());
+        // The Display keeps the log/error message distinguishable.
+        assert!(too_large.to_string().contains("too large"));
+        assert!(aborted.to_string().contains("peer prematurely closed"));
     }
 }

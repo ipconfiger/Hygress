@@ -9,12 +9,15 @@
 //! - [`client`]    — kube 4.x `Api` wiring; kubeconfig (file or in-cluster) loading
 //! - [`snapshot`]  — full LIST (label selector `gpustack.ai/managed=true`) -> `ConfigData` objects
 //! - [`translate`] — **pure** CRD JSON -> `hygress_core` translation (unit-tested with real fixtures)
-//! - [`reconcile`] — api-resources discovery (60s/5s) + best-effort topology-B IngressClass seed
+//! - [`reconcile`] — api-resources discovery (60s/5s) + the gated topology-B IngressClass seed
+//!   (invoked only from [`Controller::run`] when `seed_ingress_class` is enabled)
 //!
 //! Invariants (design):
 //! - Pure consumer: no writes to the apiserver, no local persistence (CRDs are the truth), except
-//!   the single best-effort `higress` IngressClass seed for topology B (which GPUStack does not
-//!   create and `is_supported_higress` probes by name).
+//!   the single gated IngressClass seed: [`Controller::run`] seeds the `higress` IngressClass
+//!   (which GPUStack does not create and `is_supported_higress` probes by name) once, only when
+//!   the controller is built with `seed_ingress_class = true` (topology B / external). Topology A
+//!   (embedded apiserver) performs **zero** apiserver writes.
 //! - Bind-ready: the first successful snapshot store fires [`Controller::ready`]; the data plane
 //!   must await it before binding ports.
 //! - Last-known-good: a transient LIST/transport failure (or a structurally rejected snapshot)
@@ -37,6 +40,7 @@
 //!     "higress-system".into(),
 //!     "higress".into(),
 //!     Duration::from_secs(1),
+//!     false, // seed_ingress_class: topology B / external (seeds once inside `run`)
 //! )?;
 //!
 //! let ready = controller.ready();
@@ -90,6 +94,12 @@ pub struct Controller {
     gateway_namespace: String,
     ingress_class: String,
     poll_interval: std::time::Duration,
+    /// Whether [`Controller::run`] performs the single best-effort `higress`
+    /// IngressClass seed (AM-1). Enabled for topology B / external (the apiserver
+    /// there never hosts the IngressClass and `is_supported_higress` probes it by
+    /// name); disabled for topology A (embedded apiserver) so the control plane
+    /// stays a pure read-only consumer with zero apiserver writes.
+    seed_ingress_class: bool,
     mirror_name: String,
     ready: Arc<tokio::sync::Notify>,
     ready_notified: Arc<std::sync::atomic::AtomicBool>,
@@ -105,7 +115,9 @@ impl Controller {
     /// `shared` is the gateway's config holder (the adapter stores snapshots into it);
     /// `kubeconfig` is the embedded file kubeconfig path (`None` → in-cluster / `KUBECONFIG`);
     /// `ingress_class` is the IngressClass name to probe/seed (topology B); `poll_interval`
-    /// is the snapshot refresh cadence (1s).
+    /// is the snapshot refresh cadence (1s); `seed_ingress_class` gates the single
+    /// IngressClass seed inside [`Controller::run`] (AM-1) — set it for topology B /
+    /// external, leave it `false` for topology A (embedded apiserver, zero writes).
     ///
     /// Fails with [`Error::InvalidConfig`] on an empty namespace / ingress class, or a
     /// zero poll interval.
@@ -115,6 +127,7 @@ impl Controller {
         gateway_namespace: String,
         ingress_class: String,
         poll_interval: std::time::Duration,
+        seed_ingress_class: bool,
     ) -> Result<Self> {
         if gateway_namespace.trim().is_empty() {
             return Err(Error::InvalidConfig("gateway_namespace must be non-empty".into()));
@@ -137,6 +150,7 @@ impl Controller {
             gateway_namespace,
             ingress_class,
             poll_interval,
+            seed_ingress_class,
             mirror_name,
             ready: Arc::new(tokio::sync::Notify::new()),
             ready_notified: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -154,7 +168,9 @@ impl Controller {
     ///
     /// 1. Connect (file kubeconfig or in-cluster / `KUBECONFIG`).
     /// 2. Wait for api-resources discovery (60s / 5s budget).
-    /// 3. Best-effort, idempotent IngressClass seed (topology B).
+    /// 3. Best-effort, idempotent IngressClass seed — **only** when the controller was
+    ///    built with `seed_ingress_class = true` (topology B / external). Topology A
+    ///    (embedded apiserver) skips it entirely: zero apiserver writes (AM-1).
     /// 4. **First** full LIST → translate → store (bind-ready: the first successful store fires
     ///    [`Controller::ready`]) — identical to the old 1s-poll design's first iteration.
     /// 5. **Event-driven** (P4/1.1): one `kube::runtime::watcher` per managed kind. Each
@@ -175,9 +191,13 @@ impl Controller {
 
         reconcile::wait_for_apiserver_ready(&client).await?;
 
-        // Best-effort, idempotent seed (topology B); a failure here does not stop the loop.
-        if let Err(e) = reconcile::ensure_ingress_class(&client, &self.ingress_class).await {
-            tracing::warn!("IngressClass seed (best-effort) failed: {e}");
+        // Best-effort, idempotent seed (AM-1): gated on the construction flag so topology B
+        // (external) seeds once here while topology A (embedded apiserver) never writes —
+        // the 405/warn noise path is gone. A failure here does not stop the loop.
+        if self.seed_ingress_class {
+            if let Err(e) = reconcile::ensure_ingress_class(&client, &self.ingress_class).await {
+                tracing::warn!("IngressClass seed (best-effort) failed: {e}");
+            }
         }
 
         // ① First snapshot (bind-ready): the initial full LIST + store, unchanged from the old
@@ -306,36 +326,6 @@ impl Controller {
         })
     }
 
-    /// Best-effort, non-blocking IngressClass seed (topology B).
-    ///
-    /// GPUStack never creates the `higress` IngressClass, and `is_supported_higress` (external
-    /// mode) probes it **by name**, so it must exist for topology B to start. This method is a
-    /// convenience pre-warm: when a tokio runtime is present it spawns a detached task that
-    /// connects and seeds idempotently; otherwise it is a no-op. The canonical seed also runs
-    /// inside [`Controller::run`], so this is safe to call (or skip) — the operation is
-    /// idempotent (create-if-missing).
-    pub fn seed_ingress_class(&self) {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                tracing::warn!("seed_ingress_class: no tokio runtime; skipping (run() also seeds)");
-                return;
-            }
-        };
-        let kubeconfig = self.kubeconfig.clone();
-        let namespace = self.gateway_namespace.clone();
-        let name = self.ingress_class.clone();
-        handle.spawn(async move {
-            let Ok(c) = client::Client::connect(kubeconfig.as_deref(), namespace).await else {
-                tracing::warn!("seed_ingress_class: client connect failed; skipping");
-                return;
-            };
-            if let Err(e) = reconcile::ensure_ingress_class(&c, &name).await {
-                tracing::warn!("seed_ingress_class (best-effort) failed: {e}");
-            }
-        });
-    }
-
     /// Lock the last-fingerprint guard, recovering from a poisoned mutex instead of panicking.
     /// (Poisoning would require a panic while holding the lock — the only holder is the single
     /// poll loop, and the guarded `clone`/`assign` cannot panic, so this is purely defensive.)
@@ -431,15 +421,15 @@ mod tests {
         let sc = shared(ConfigData::default());
         // Empty namespace is rejected.
         assert!(
-            Controller::new(sc.clone(), None, String::new(), "higress".into(), std::time::Duration::from_secs(1)).is_err()
+            Controller::new(sc.clone(), None, String::new(), "higress".into(), std::time::Duration::from_secs(1), false).is_err()
         );
         // Empty ingress class is rejected.
         assert!(
-            Controller::new(sc.clone(), None, "higress-system".into(), String::new(), std::time::Duration::from_secs(1)).is_err()
+            Controller::new(sc.clone(), None, "higress-system".into(), String::new(), std::time::Duration::from_secs(1), false).is_err()
         );
         // Zero poll interval is rejected.
         assert!(
-            Controller::new(sc.clone(), None, "higress-system".into(), "higress".into(), std::time::Duration::from_secs(0)).is_err()
+            Controller::new(sc.clone(), None, "higress-system".into(), "higress".into(), std::time::Duration::from_secs(0), false).is_err()
         );
         // Valid params build.
         let c = Controller::new(
@@ -448,11 +438,44 @@ mod tests {
             "higress-system".into(),
             "higress".into(),
             std::time::Duration::from_secs(1),
+            false,
         )
         .unwrap();
         assert!(c.mirror_name == translate::MIRROR_NAME);
         // ready() hands out a usable Notify handle.
         let _ = c.ready();
+    }
+
+    #[test]
+    fn new_wires_seed_ingress_class_flag() {
+        // AM-1: the construction flag is the single gate for the IngressClass seed inside
+        // `Controller::run` (the standalone pre-warm `seed_ingress_class()` is gone — `run()`
+        // is always spawned by the bootstrap and is the only seeding path). Topology A
+        // (embedded apiserver) passes `false` → run() never calls `ensure_ingress_class` →
+        // zero apiserver writes; topology B passes `true`. The actual `run()` gating needs a
+        // live apiserver (no mocks in this crate), so this test pins the parameter wiring
+        // (unit layer) on top of the pure-function reconcile tests.
+        let sc = shared(ConfigData::default());
+        let off = Controller::new(
+            sc.clone(),
+            None,
+            "higress-system".into(),
+            "higress".into(),
+            std::time::Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+        assert!(!off.seed_ingress_class, "topology A: seed must be gated off");
+        let on = Controller::new(
+            sc,
+            None,
+            "higress-system".into(),
+            "higress".into(),
+            std::time::Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+        assert!(on.seed_ingress_class, "topology B: seed must be gated on");
     }
 
     #[test]

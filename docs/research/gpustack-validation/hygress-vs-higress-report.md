@@ -95,7 +95,7 @@ GPU/模型实例决定推理时长，网关增量（ms 级）不可从此分离�
 | 进程模型 | s6 托管 4 进程（apiserver/pilot/controller/envoy） | **单进程单二进制**（Pingora terminate-mode；pilot/controller 槽位 no-op + `notification-fd:3` 就绪字节） |
 | 数据面运行时 | Envoy + Wasm 运行时 + xDS | 纯 Rust（pingora 0.8），无 Wasm/无 xDS |
 | 控制面 | Istio/pilot 全量 xDS 推送 | kube WATCH 事件驱动（Phase 1.1 `cf4f6c5`）：6 类 CRD 各一 watcher，事件 → 去抖 → 全量快照重建（rv 指纹幂等短路 + 30s 安全网 tick）；**稳态零 LIST/零 JSON decode**，配置生效 ≤ 一个事件周期 |
-| 配置热更 | xDS | CRD WATCH（秒级内）+ `hygress.policy.yaml` 1s mtime 热重载 + admin `POST /reload` |
+| 配置热更 | xDS | CRD WATCH（秒级内）+ `hygress.policy.yaml` mtime 热重载（≤30s dutycycle，R-8）+ admin `POST /reload`（即时） |
 | 扩展模型 | Wasm 插件（Go/跨语言桥接） | 原生 Rust 管线（见 §4），`hygress.policy.yaml` 声明式延伸能力 |
 | 交付/回滚 | 官方镜像体系 | 镜像层 s6 手术（`.dist` 原脚本快照），**换回镜像即回滚**；端口契约不变（80/443 数据面、127.0.0.1:8081 admin、15020 stats；永绑禁端口 9876/15010/15012/8888/15051 零绑定） |
 
@@ -103,17 +103,17 @@ GPU/模型实例决定推理时长，网关增量（ms 级）不可从此分离�
 
 - **9 插件等价管道**（相位与 wire 契约逐字节对齐，`plugin-contract-pin.md`）：inbound strip → model-router（body→模型派生 + `x-higress-llm-model` 覆盖）→ transformer（头改写）→ ext-auth（forward-auth → GPUStack `/token-auth`，`ai-route-route-` 作用域）→ model-mapper（目标模型名映射，零拷贝 B1-B4）→ ai-proxy（provider 令牌交换）→ fallback 重定向 ×N 组 → 数据面转发 → usage sink → 头写回（`X-Mse-Consumer`/`Authorization`/cache）。
 - **模型路由/多实例**：RouteTable 按快照缓存（H2，请求路径单 Arc 读取）、SWRR O(1) 选择（M7）、fallback 链（D7）、provider 密钥换写（D6）。
-- **usage 落库**：`ModelUsageMetrics` 17 字段推送 `/v2/usage/gateway-metrics` → GPUStack DB `model_usage_details` 真实行（DoD5：34/7 行与响应 usage 逐位一致）；流式 SSE 逐块计量（B2）。
+- **usage 落库**：`ModelUsageMetrics` 17 字段推送 `/v2/usage/gateway-metrics` → GPUStack DB `model_usage_details` 真实行（DoD5：34/7 行与响应 usage 逐位一致——A/B 基线跑；修复批 B5 复跑 34/5，见 audit-fix-report §3.3）；流式 SSE 逐块计量（B2）。
 - **managed CRD 只读消费**：Ingress / EnvoyFilter / WasmPlugin / McpBridge（无 label 例外）/ Secret / ConfigMap —— WATCH 事件化 + 指纹幂等；CRD fixture 与基线**逐字节一致**（DoD2）。
 - **mirror 透传**：`:80/readyz` 等 mirror 路由原样转发（本报告全部 wrk 数据的路径）。
 - **:15020 浅兼容**：GPUStack pilot-agent 的 `/stats/prometheus`、`/stats` 探活面等价实现。
-- **延伸能力（真机验证）**：限流（IP/consumer 令牌桶，429+Retry-After）、token 配额（固定窗口 reserve/commit/release，429）、路由策略（override/pin/头增删/超时重试）、安全护栏（静态规则 + LLM fail-closed + 输出侧 per-chunk 断流，403）——`hygress.policy.yaml` 热更即点即用（真机 429/429/403 复现，§5.3）。
+- **延伸能力（真机验证）**：限流（IP/consumer 令牌桶，429+Retry-After）、token 配额（固定窗口 reserve/commit/release，429）、路由策略（override/pin/头增删/超时重试）、安全护栏（静态规则 + LLM fail-closed + 输出侧 per-chunk 断流，403）——`hygress.policy.yaml` 热更（mtime ≤30s dutycycle；admin `POST /reload` 即时）后生效（真机 429/429/403 复现，§5.3）。
 
 ## 5. 可运维性
 
 - **可观测**：Prometheus 文本指标（`:15020/stats/prometheus`，`hygress_*` 家族：requests/duration/tokens/ttft/retries/upstream_errors/fallback/auth/rate_limit/quota/policy/guardrail）；admin `127.0.0.1:8081`（`/healthz`、`/metrics`、token 门禁 `/reload`）；tracing 结构化日志。
 - **升级/回滚**：单二进制镜像层替换；s6 `.dist` 快照保底，`docker compose` 切回官方镜像即回滚（README §4.5）。
-- **热更**：CRD 变更 WATCH 事件驱动（≤1 事件周期）；策略文件 1s mtime 轮询 + admin 强制 reload；均无需重启进程。
+- **热更**：CRD 变更 WATCH 事件驱动（≤1 事件周期）；策略文件 mtime 轮询（≤30s dutycycle，R-8）+ admin 强制 reload（即时）；均无需重启进程。
 - **运行面自检**：启动 fail-fast（GPUSTACK_API_PORT 探测 + 首快照 bind-ready 门控）；admin/stats 独立监听器与数据面隔离。
 
 ## 6. 诚实局限（务必读）

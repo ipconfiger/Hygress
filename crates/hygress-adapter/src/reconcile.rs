@@ -1,14 +1,17 @@
-//! Reconcile loop support: startup api-resources discovery, the topology-B
-//! IngressClass seed, and (indirectly) the 1s poll diff (the LIST itself lives in
-//! [`crate::snapshot`] and the store in [`hygress_core::SharedConfig::store`]).
+//! Reconcile loop support: startup api-resources discovery, the gated
+//! topology-B IngressClass seed, and (indirectly) the 1s poll diff (the LIST
+//! itself lives in [`crate::snapshot`] and the store in
+//! [`hygress_core::SharedConfig::store`]).
 //!
 //! Design:
 //! - `wait_for_apiserver_ready` — `GET /api` (via `list_api_groups`) with a 60s / 5s retry
 //!   budget (design §5), so the first LIST is not issued against a half-up apiserver.
-//! - `ensure_ingress_class` — best-effort, idempotent seed of the `higress` IngressClass for
-//!   topology B (external cluster); topology A does not check it, and the seed has no side
-//!   effects when it already exists (design §5.2 / D3). GPUStack never creates this object, so
-//!   the seed is Hygress' responsibility.
+//! - `ensure_ingress_class` — best-effort, idempotent seed of the `higress` IngressClass.
+//!   It is invoked from a single site: [`crate::Controller::run`], and only when the
+//!   controller was constructed with `seed_ingress_class = true` (topology B / external
+//!   cluster; AM-1). Topology A (embedded apiserver) constructs with `false`, so the seed
+//!   never runs there — zero apiserver writes. GPUStack never creates this object, so the
+//!   seed is Hygress' responsibility (design §5.2 / D3).
 //!
 //! No mocks: the discovery + seed paths are exercised only against a real cluster (out of scope
 //! for the unit layer). The IngressClass object construction is a pure function and is unit
@@ -81,7 +84,8 @@ pub(crate) fn build_ingress_class(name: &str, controller: &str) -> IngressClass 
 /// Idempotently ensure the named IngressClass exists (topology-B seed).
 ///
 /// Best-effort by caller: this returns `Err` on a transport / 409, which the caller logs and
-/// tolerates (the embedded topology A never depends on it).
+/// tolerates. AM-1: the only caller is [`crate::Controller::run`], which invokes it solely
+/// when `seed_ingress_class = true` (topology B / external); topology A never reaches it.
 pub(crate) async fn ensure_ingress_class(client: &Client, name: &str) -> Result<()> {
     let api = client.ingress_class();
     match api.get_opt(name).await? {

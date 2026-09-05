@@ -89,7 +89,7 @@ Pingora 终止模式；`ready()` 门控（首快照前不绑 :80）+ 有界就�
 | `hygress-core` | RouteTable/Registry/Destination/模型路由映射/认证作用域/ConfigData——纯领域、无 IO | 146 |
 | `hygress-adapter` | kube 只读 CRD 消费 → ConfigData；快照 + 热重载；命名空间/标签选择器 | 45 |
 | `hygress-egress` | `/token-auth` forward-auth、`/v2/usage/gateway-metrics` sink、provider 客户端、令牌派生 | 39+8+4 |
-| `hygress-gateway` | Pingora 终止模式、admin/metrics/15020(readyz)/TLS-SNI、9 插件等价管道、bootstrap/main | 115+11 |
+| `hygress-gateway` | Pingora 终止模式、admin/metrics/15020（/stats[/prometheus]）/TLS-SNI、9 插件等价管道、bootstrap/main | 115+11 |
 
 **质量约定**：一切走真实 IO（无 mock）；覆盖错误路径（fail-fast 语义、FAIL_OPEN、非 2xx 用量）；
 e2e 集成测试用真实 Pingora + 真实本地上游/认证/用量服务。最终 **368 测试 / clippy 0 / 零 mock-stub**。
@@ -142,9 +142,10 @@ fix-18 曾误判"远端不可达"（试错主机）并留下 s6 boot 阻滞的**
 > 与配置声明不一致等）——单元/集成测试无法覆盖，验证计划的"真实环境证据链"设想得到兑现。
 
 ### 7.3 最终 DoD（全部 PASS）
-- **DoD 1** e2e：`POST :80/v1/chat/completions` → 200 / "HELLO_HYGRESS_WORKS" / usage 34/7 / 0.47s；
+- **DoD 1** e2e：`POST :80/v1/chat/completions` → 200 / "HELLO_HYGRESS_WORKS" / usage 34/7 / 0.47s
+  （该跑次为 A/B 基线跑；修复批 B5 复跑（2026-09-05）实测 usage 34/5，见 audit-fix-report §3.3）；
 - **DoD 2** CRD 换入后 16/16 与基线一致（规范化后逐字节），无新增/缺失，只读证实；
-- **DoD 5-DB** usage `model_usage_details` 2→3，新行 34/7 与响应逐位一致；
+- **DoD 5-DB** usage `model_usage_details` 2→3，新行 34/7（同 §7.3 A/B 基线跑）与响应逐位一致；
 - **DoD 6** 端口纪律（无 9876/15010/15012/8888/15051）、单 hygress 进程（无 envoy/pilot/controller）、
   supercronic 正常、`.dist` 回滚件齐、`/readyz`=200、server 稳定（R=0）。
 
@@ -199,6 +200,9 @@ cargo build --release -p hygress-gateway --features integrations
 ## 10. 升级开发：网关延伸能力（2026-09-04）
 
 > 文档：`docs/extensions-audit.md`（审核分类）、`docs/extensions-design.md`（设计终版 + §10 实现/审核/真机记录）。
+> 注：本节记录期为 2026-09-04（审计修复批 B1-B5 之前）——彼时 policy mtime 轮询周期为 1s、admin
+> `/reload` 尚未接线（501）、ext-auth 传输失败默认 fail-open；三者均已按后续审计修复变更（R-8：
+> ≤30s dutycycle；R-12：默认 fail-closed/403 + env 开关），本节相应表述为当时记录。
 
 ### 10.1 缘起与范围
 用户提出四类网关延伸需求：**token 配额 · 限流 · 路由策略 · 安全护栏**。先做深度审核

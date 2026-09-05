@@ -77,6 +77,14 @@ All resource names/phases/priorities/versions are from [py:__init__] (`ext_auth_
 `http://<plugin_server>/<prefix>/<name>/<version>/plugin.wasm` [py:plugins.py:18-21,41-49].
 All plugins: `failStrategy="FAIL_OPEN"`, `defaultConfigDisable=False`, `matchRules=[]` at init.
 
+> **Version note (live-fixture delta).** The table pins versions from the extracted wheel's
+> `manifest.json` / [py:__init__]. The repo's real-machine fixture (`gpustack-validation/
+> fixtures-hygress/dump.log`) recorded `gpustack-token-usage/1.1.1/plugin.wasm` at runtime, vs **1.1.0**
+> pinned here (also `model-mapper` 1.0.1 vs 1.0.0, `ai-proxy` 2.0.0-patched vs 2.0.0). The patch-level
+> deltas are **not consumed by Hygress** (behavior is natively implemented from the pinned wire
+> contract; the CRD `url` field is not fetched) — no behavioral impact. On a GPUStack upgrade,
+> re-run §7.
+
 > Note on the numeric ordering: the numbers are the *Wasm filter position* in Envoy. The Rust
 > terminate-mode data plane does **not** copy the numbers — it implements the *net-semantic* pipeline
 > in §4.2. The numbers matter only for CRD compatibility (what a fixture would contain).
@@ -130,8 +138,17 @@ auth). Mirror ingress `gpustack` and any non-`ai-route-route-` route are **never
 **Behavior.** GET `/token-auth` on the GPUStack server registry. Forwards the 7 `allowed_headers`,
 injects `X-GPUStack-Auth-Token=<derived>`. Writes the 4 `allowed_upstream_headers` back onto the
 request: `X-Mse-Consumer`, `Authorization` (= `Bearer <registration_token>`), `cookie`,
-`x-gpustack-auth-cache` (5-min JWT) [py:routes/token.py:140-148]. `FAIL_OPEN`: transport error →
-pass-through (no verdict).
+`x-gpustack-auth-cache` (5-min JWT) [py:routes/token.py:140-148].
+
+**Failure semantics (R-12, two layers — do not conflate).** `failStrategy="FAIL_OPEN"` on the CRD
+governs only **Wasm-VM fatal errors** (it never flips at runtime). **Business-level** auth failures
+(transport error / 5xx / timeout on `/token-auth`) are governed by the plugin's
+`failure_mode_allow`/`status_on_error`: GPUStack defaults `failure_mode_allow=false` ⇒ **fail-closed
+(403)**. Hygress mirrors this: the egress contract still returns `Ok(None)` ("no verdict — auth
+service unavailable"), and the gateway maps it to **403 `ext_auth_unavailable` by default**
+(`config.ext_auth_fail_closed`, matching `failure_mode_allow=false`); setting
+`HYGRESS_EXT_AUTH_FAIL_MODE=open` restores the legacy fail-open (transport error → pass-through,
+no verdict). A 3xx/4xx auth response is a real rejection (`authenticated=false`), never a fail-open.
 
 **Forward-auth wire (server response → what Hygress must reproduce),** [py:routes/token.py:137-148]:
 - `X-Mse-Consumer`: `access_key.gpustack-<user.id>` (both parts dot-joined) when an API key is
@@ -504,7 +521,7 @@ Same-phase rule: **higher priority runs earlier**. Net cross-phase invariant use
 |---|---|---|---|---|
 | 1 | set-model-pre-route | AUTHN | 90 | writes instance + route-name headers |
 | 2 | ai-proxy | UNSPECIFIED | 100 | provider proxy |
-| 3 | ext-auth | AUTHN | 360 | forward-auth, FAIL_OPEN, route-name scoped |
+| 3 | ext-auth | AUTHN | 360 | forward-auth, failStrategy `FAIL_OPEN` (business failure default fail-closed, §2.1), route-name scoped |
 | 4 | token-usage | UNSPECIFIED | 400 | usage push (server only) |
 | 5 | model-mapper | AUTHN | 800 | per-service model rewrite (server+worker) |
 | 6 | header-transformer | AUTHN | 810 | (server only) |
@@ -524,7 +541,8 @@ Same-phase rule: **higher priority runs earlier**. Net cross-phase invariant use
 ②  model resolve           : generic-proxy-router (path-alias / body / autoRouting) -> overwrites x-higress-llm-model
 ③  transformer-in          : rename x-gpustack-model→x-higress-llm-model (RETAIN_FIRST); backup :path→x-gpustack-original-path
 ④  route match             : x-higress-llm-model (exact) + path predicate -> RouteRule
-⑤  ext-auth                : ONLY if route name starts with (ns/)ai-route-route- ; GET /token-auth ; write-back ; FAIL_OPEN ; 30s
+⑤  ext-auth                : ONLY if route name starts with (ns/)ai-route-route- ; GET /token-auth ; write-back ;
+                             default fail-closed on transport error/5xx (403 ext_auth_unavailable; HYGRESS_EXT_AUTH_FAIL_MODE=open → legacy fail-open) ; 30s
 ⑥  full-body read (cap→413)
 ⑦  registry resolve        : static|dns|proxy|tunnel -> target group
 ⑧  SWRR select             : pick concrete instance  (this is what the Wasm set-header would read from the weighted cluster)
@@ -617,11 +635,19 @@ Same-phase rule: **higher priority runs earlier**. Net cross-phase invariant use
 ### 5.3 Ext-auth request/response header contract
 
 **Outbound (to `GET /token-auth`)** — Hygress must forward/inject:
-- Forward (from request, allowlist): `X-Real-IP`, `X-Forwarded-For`, `x-higress-llm-model`,
-  `x-api-key`, `cookie`, `x-gpustack-auth-cache` (the previous hop's cache JWT).
+- Forward (from request, allowlist of **7**, matching `forward_auth.rs::ALLOWLIST`):
+  `authorization`, `X-Real-IP`, `X-Forwarded-For`, `x-higress-llm-model`, `x-api-key`, `cookie`,
+  `x-gpustack-auth-cache` (the previous hop's cache JWT).
+- `authorization` is forwarded iff present inbound — **fixed Higress wasm ext-auth behavior**
+  (`extensions/ext-auth/main.go` `ExtractFromHeader(authorization)` + `Set`), **not** gated by the
+  GPUStack `allowed_headers` config (which omits it) — see `forward_auth.rs:211-224` and the
+  real-machine record (`gpustack-validation/REPORT.md` §13.1 fix #6). This is what lets AUTHED models
+  authenticate via the client's `Bearer` apiKey.
 - Inject: `X-GPUStack-Auth-Token` = derived token.
 - Path/method: `GET /token-auth`. Scope: only when route name starts with
-  `(ns/)ai-route-route-`; `FAIL_OPEN`; timeout 30 s.
+  `(ns/)ai-route-route-`. Failure semantics: default **fail-closed** (transport error/5xx → 403
+  `ext_auth_unavailable`, matching GPUStack/Higress `failure_mode_allow=false`; `failStrategy` only
+  covers Wasm-VM fatal errors); `HYGRESS_EXT_AUTH_FAIL_MODE=open` → legacy fail-open. Timeout 30 s.
 
 **Write-back (auth response → request)** — Hygress must set from the response:
 - `X-Mse-Consumer` = `access_key.gpustack-<user.id>` or literal `none` (no-key/public policy).
@@ -631,7 +657,9 @@ Same-phase rule: **higher priority runs earlier**. Net cross-phase invariant use
 
 *Assert:* on a valid key, the request forwarded upstream carries `X-Mse-Consumer=sk-…<ak>.gpustack-<uid>`
 and `Authorization: Bearer …`; on the public (no-key) policy, `X-Mse-Consumer=none`; on auth-service
-unreachable, the request proceeds (FAIL_OPEN) without an auth verdict.
+unreachable (transport error / 5xx), the gateway **defaults to fail-closed: 403 `ext_auth_unavailable`**
+(R-12; matches GPUStack `failure_mode_allow=false`) — and only under `HYGRESS_EXT_AUTH_FAIL_MODE=open`
+does the request proceed (legacy fail-open) without an auth verdict.
 
 ---
 
@@ -654,3 +682,32 @@ unreachable, the request proceeds (FAIL_OPEN) without an auth verdict.
 Everything else previously flagged (`operation`, `realIPHeader` ownership, generic-proxy body-vs-header
 trigger, cluster names, `X-GPUStack-Route-Name` consumer = token-usage) is **resolved with evidence**
 above.
+
+---
+
+## 7. GPUStack upgrade — re-run checklist (R-10 / C1)
+
+> Purpose: a GPUStack version upgrade can silently drift the pinned contract above. Hygress parses
+> CRDs with loose serde + per-parse `warn_unknown_keys` (never reject — see §6 / control-plane
+> equivalence §B-C1), so a drift is *ignored*, not *loud*. After any GPUStack upgrade, re-verify:
+
+1. **Plugin versions / new defaultConfig keys.** Compare the deployed `WasmPlugin` `url` versions and
+   `defaultConfig` shape against §1/§2. New `defaultConfig` keys (or a changed plugin version) must be
+   reconciled against the C1 unknown-key warnings emitted at `translate.rs`
+   (`wasmplugin_model_router` :587 / `wasmplugin_model_mapping` :513 / `wasmplugin_ai_proxy` :647 /
+   `configmap_to_timing` :938, `warn_unknown_keys` :105) — a warning now, a silent ignore later.
+2. **New managed `WasmPlugin` resource names.** Add to `KNOWN_WASM_PLUGINS`
+   (`translate.rs:91`) or confirm the distribution-warning path (:1056) fires for managed objects
+   outside the set.
+3. **ext-auth semantics drift.** Re-verify `failure_mode_allow` / `status_on_error` / `failStrategy`
+   defaults (see §2.1 failure-semantics note) — any upstream flip away from `failure_mode_allow=false`
+   changes the business-level fail-closed default equivalence (R-12).
+4. **Usage wire fields.** Diff the token-usage plugin's emitted `ModelUsageMetrics` fields against
+   §2.8/§5.1 (the 17-field table: 11 required + 6 omitempty). Any field added/removed/renamed must be
+   re-pinned and the e2e DoD #5 assertion re-run.
+5. **CRD annotation keys.** Diff ingress/EnvoyFilter annotations (`.internal` routing, fallback,
+   `x-gpustack-fallback-*`, timeout ConfigMap keys) against §3.2 and the full key set parsed in
+   `translate.rs` — unknown annotations are ignored (never rejected), so a renamed key is a silent
+   behavior change until re-pinned.
+
+Record each re-run in this document (version → delta → decision).

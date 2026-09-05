@@ -9,8 +9,10 @@
 //!   returns `Ok(())` immediately — it never blocks and never spins. When the buffer is full (or the
 //!   flusher is gone) the metric is dropped with a log line.
 //! - One background flusher (spawned per [`GpustackSink::new`]) drains the channel and POSTs each
-//!   payload. On transport / HTTP failure it retries a bounded number of times with a small backoff
-//!   and then **drops the metric with a log** — it never retries forever.
+//!   payload. On a **transient** failure (transport error, `429`, 5xx) it retries a bounded number
+//!   of times with a small backoff and then **drops the metric with a log** — it never retries
+//!   forever. A deterministic 4xx (e.g. a 401 from a bad token, 400/404) is **not** retried at all
+//!   (MINOR-4): the metric is dropped after the first attempt.
 //!
 //! No mock in impl: the flusher performs a real `reqwest` `POST`. Test doubles (a real local HTTP
 //! server) are confined to `tests/`.
@@ -122,6 +124,11 @@ impl GpustackSink {
     }
 
     /// POST one serialized payload with bounded retry, then drop-with-log on final failure.
+    ///
+    /// Retry policy (MINOR-4): only **transient** failures are retried — transport errors
+    /// (connect refused / DNS / timeout), `429 Too Many Requests` and 5xx. Deterministic 4xx
+    /// client errors (401 bad token, 400, 404, …) are **not** retried: retrying cannot turn them
+    /// into a success, so the metric is dropped after the first attempt.
     async fn post_with_retry(http: &reqwest::Client, endpoint: &str, token: &str, payload: &[u8]) {
         for attempt in 1..=MAX_ATTEMPTS {
             // Backoff before every retry (not the first try).
@@ -131,6 +138,12 @@ impl GpustackSink {
             match Self::post_once(http, endpoint, token, payload).await {
                 Ok(()) => return,
                 Err(e) => {
+                    if !Self::retryable(&e) {
+                        tracing::warn!(
+                            "usage push to {endpoint} failed with non-retryable {e} on attempt {attempt}; dropping metric"
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         "usage push to {endpoint} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}"
                     );
@@ -142,10 +155,20 @@ impl GpustackSink {
         );
     }
 
+    /// Whether a failed POST is worth retrying. Transport errors (connect/refused/DNS/timeout) and
+    /// the transient HTTP statuses `429` + 5xx are; every other status (all 4xx — e.g. a 401 from a
+    /// wrong/missing token, 400, 404) is deterministic and must fail fast (MINOR-4).
+    fn retryable(e: &PostError) -> bool {
+        match e {
+            PostError::Transport(_) => true,
+            PostError::Status(s) => *s == http::StatusCode::TOO_MANY_REQUESTS || s.is_server_error(),
+        }
+    }
+
     /// A single real `POST {endpoint}` with the auth token and a JSON body.
     ///
-    /// Returns `Ok(())` on a 2xx response; `Err` on a transport error or a non-2xx status (which the
-    /// caller turns into a retry).
+    /// Returns `Ok(())` on a 2xx response; `Err` on a transport error or a non-2xx status (which
+    /// the caller classifies via [`Self::retryable`]).
     async fn post_once(
         http: &reqwest::Client,
         endpoint: &str,
@@ -173,7 +196,7 @@ impl GpustackSink {
             let _ = resp.bytes().await;
             Ok(())
         } else {
-            // Surface the status as an error so the caller retries.
+            // Surface the status as an error so the caller can classify it (retry 429/5xx only).
             Err(PostError::Status(status))
         }
     }
@@ -291,5 +314,204 @@ mod tests {
         }
         // And `operation` is a real core value we might be tempted to leak — prove absence.
         let _ = Operation::ChatCompletion.as_str();
+    }
+
+    // ----- MINOR-4: retry policy (real local HTTP server; no mocks) -----
+    //
+    // `post_with_retry` must only retry TRANSIENT failures: transport errors, `429` and 5xx.
+    // Deterministic 4xx client errors (401 bad token, 400/404, ...) must fail fast after the
+    // first attempt — retrying them cannot succeed and only adds useless load/backoff.
+
+    /// Minimal real HTTP/1.1 server: answers every request with one fixed status and counts the
+    /// requests it receives (a test double, allowed in `#[cfg(test)]` per the crate lib docs).
+    struct StubStatusServer {
+        addr: std::net::SocketAddr,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl StubStatusServer {
+        async fn spawn(status: u16) -> Self {
+            use tokio::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+            let (accept_count, accept_stop) = (count.clone(), stop.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = accept_stop.notified() => break,
+                        res = listener.accept() => {
+                            let (sock, _) = match res { Ok(x) => x, Err(_) => continue };
+                            let (c, s) = (accept_count.clone(), accept_stop.clone());
+                            tokio::spawn(async move { serve_one(sock, status, c, s).await });
+                        }
+                    }
+                }
+            });
+            Self { addr, count, stop }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn wait_until(&self, n: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while self.count() < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {n} request(s), got {}",
+                    self.count()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        fn shutdown(&self) {
+            self.stop.notify_waiters();
+        }
+    }
+
+    impl Drop for StubStatusServer {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    async fn serve_one(
+        mut sock: tokio::net::TcpStream,
+        status: u16,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Read the request head, then the body (Content-Length), then respond — one request per
+        // connection (`Connection: close`). Reading the full body keeps the client's write from
+        // being RST-dropped mid-flight.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 2048];
+        loop {
+            match sock.read(&mut tmp).await {
+                Ok(0) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => return,
+            }
+            if find_bytes(&buf, b"\r\n\r\n").is_some() {
+                break;
+            }
+            if buf.len() > 1 << 20 {
+                return;
+            }
+        }
+        let head_end = find_bytes(&buf, b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&buf[..head_end]);
+        let content_length = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim().eq_ignore_ascii_case("content-length"))
+                    .then(|| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while buf.len() < head_end + content_length {
+            match sock.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let reason = match status {
+            401 => "Unauthorized",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            503 => "Service Unavailable",
+            _ => "Status",
+        };
+        let resp = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+        let _ = stop;
+    }
+
+    fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        let last = hay.len() - needle.len();
+        (0..=last).find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+
+    /// Endpoint of a stub server with the real sink URL path.
+    fn endpoint(server: &StubStatusServer) -> String {
+        format!("{}/v2/usage/gateway-metrics", server.base_url())
+    }
+
+    #[tokio::test]
+    async fn http_401_is_not_retried_drops_after_one_attempt() {
+        // A 401 (bad/missing token) is deterministic: retrying cannot turn it into a success,
+        // so the metric must be dropped after exactly ONE attempt (no backoff, no retries).
+        let server = StubStatusServer::spawn(401).await;
+        GpustackSink::post_with_retry(&reqwest::Client::new(), &endpoint(&server), "tok", b"{}")
+            .await;
+        server.wait_until(1).await;
+        // Covers the 50ms + 100ms backoffs attempts 2/3 would have taken.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server.count(),
+            1,
+            "a 401 must not be retried (deterministic client error)"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_404_is_not_retried_drops_after_one_attempt() {
+        // Same rule for any other 4xx: a wrong endpoint (404) will never start succeeding.
+        let server = StubStatusServer::spawn(404).await;
+        GpustackSink::post_with_retry(&reqwest::Client::new(), &endpoint(&server), "tok", b"{}")
+            .await;
+        server.wait_until(1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.count(), 1, "a 404 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn http_503_is_retried_up_to_max_attempts_then_dropped() {
+        // A transient server error IS retried: all 3 bounded attempts are made, then the metric is
+        // dropped (never spins).
+        let server = StubStatusServer::spawn(503).await;
+        GpustackSink::post_with_retry(&reqwest::Client::new(), &endpoint(&server), "tok", b"{}")
+            .await;
+        server.wait_until(3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server.count(),
+            3,
+            "a 503 is transient: retried the full MAX_ATTEMPTS (3) then dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_429_is_retried_then_dropped_after_max_attempts() {
+        // 429 (rate-limited) is transient: it must be retried (all 3 attempts) like a 5xx.
+        let server = StubStatusServer::spawn(429).await;
+        GpustackSink::post_with_retry(&reqwest::Client::new(), &endpoint(&server), "tok", b"{}")
+            .await;
+        server.wait_until(3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server.count(),
+            3,
+            "a 429 must be retried (transient rate limit), up to MAX_ATTEMPTS"
+        );
     }
 }

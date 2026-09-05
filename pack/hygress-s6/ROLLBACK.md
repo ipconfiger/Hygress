@@ -8,5 +8,11 @@ in this repo because they are GPUStack image content, not Hygress content).
 Rollback procedure:
 1. Restore `s6-rc.d.dist/{pilot,controller,gateway}/run` over the surgery scripts.
 2. Restore the original `supercronic/run` (re-add the `readinessCheck "Higress Pilot" 15010`).
+   **Note: `.dist` contains only the `{gateway,pilot,controller}` run scripts** (the image build
+   snapshots those three, see `pack/Dockerfile.hygress`); the **pristine `supercronic/run` is not
+   snapshotted**. To roll it back, fetch the original from the upstream GPUStack image of the same
+   tag you built from (`docker cp` from `gpustack/gpustack:<tag>`:
+   `/etc/s6-overlay/s6-rc.d/supercronic/run`), or equivalently re-add the readiness gate line to the
+   current surgery script by hand.
 3. Keep Hygress installed but unused (or remove the image layer).
 Rebuild the image. This returns the embedded Higress trio exactly as upstream ships it.

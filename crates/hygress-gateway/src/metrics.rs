@@ -72,6 +72,20 @@ fn counter_family(name: &str, help: &str, value: u64) -> proto::MetricFamily {
     f
 }
 
+/// The `kind` label dictionary shared by `hygress_requests_total` and
+/// `hygress_request_duration_seconds` (AM-5):
+/// - `model_route` — a request whose terminal came from a complete upstream
+///   dispatch over a model route (2xx stream end, forwarded final non-2xx,
+///   total transport failure, guardrail-cut stream);
+/// - `mirror` — the same, for a mirror / passthrough route;
+/// - [`KIND_SHORT_CIRCUIT`] — a terminal 4xx/5xx the gateway itself generated
+///   **before** a complete upstream dispatch (rate-limit 429, auth 401 /
+///   fail-closed 403, quota 429, guardrail 403, no-route 404, registry 503,
+///   body 413 / read-abort 400). Previously these short-circuit paths only
+///   bumped their dedicated counters and were absent from the request-level
+///   totals.
+pub(crate) const KIND_SHORT_CIRCUIT: &str = "short_circuit";
+
 /// Central metrics handle. All recording methods are cheap (lazy label vec);
 /// clone the handle (`Arc<Metrics>`) per request.
 #[derive(Clone)]
@@ -107,14 +121,17 @@ impl Metrics {
     pub fn new() -> Self {
         let registry = Registry::new();
         let requests_total = IntCounterVec::new(
-            prometheus::Opts::new("hygress_requests_total", "Requests by status and kind."),
+            prometheus::Opts::new(
+                "hygress_requests_total",
+                "Requests by status and kind. Kind: model_route/mirror (complete upstream dispatch) or short_circuit (gateway-generated terminal 4xx/5xx before a complete upstream dispatch).",
+            ),
             &["status", "kind"],
         )
         .expect("requests_total");
         let request_duration = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "hygress_request_duration_seconds",
-                "End-to-end request latency.",
+                "End-to-end request latency. Kind: model_route/mirror/short_circuit (see hygress_requests_total).",
             )
             .buckets(vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
@@ -256,6 +273,21 @@ impl Metrics {
             .inc();
     }
 
+    /// AM-5: account a **gateway-generated terminal short-circuit** — a 4xx/5xx
+    /// the gateway writes before a complete upstream dispatch (rate-limit 429,
+    /// auth 401 / fail-closed 403, quota 429, guardrail 403, no-route 404,
+    /// registry 503, body 413 / read-abort 400) — under the fixed
+    /// [`KIND_SHORT_CIRCUIT`] kind. The `requests_total` count and the
+    /// `request_duration` latency are recorded together so **every** written
+    /// downstream terminal keeps the request-level totals complete (the
+    /// dedicated counters — `auth_decisions` / `rate_limit_denied` /
+    /// `quota_denied` / `guardrail_blocked` — are kept for the classification
+    /// dimension; they are not request-level totals).
+    pub fn record_short_circuit(&self, status: u16, secs: f64) {
+        self.record_request(status, KIND_SHORT_CIRCUIT);
+        self.record_request_duration(KIND_SHORT_CIRCUIT, secs);
+    }
+
     pub fn record_request_duration(&self, kind: &str, secs: f64) {
         self.inner
             .request_duration
@@ -388,6 +420,39 @@ mod tests {
         assert!(out.contains("hygress_requests_total"));
         assert!(out.contains("hygress_tokens_total"));
         assert!(out.contains("hygress_fallback_total"));
+    }
+
+    /// AM-5: `record_short_circuit` must land the request-level count AND the
+    /// duration under the fixed `short_circuit` kind, for every short-circuit
+    /// status — the accounting the pipe's short-circuit exits converge on.
+    #[test]
+    fn record_short_circuit_uses_the_fixed_kind() {
+        let m = Metrics::new();
+        m.record_short_circuit(429, 0.125);
+        m.record_short_circuit(403, 0.5);
+        m.record_short_circuit(413, 0.0625);
+        let out = m.encode();
+        // Counts: one `hygress_requests_total` per (status, kind) pair, under
+        // kind="short_circuit" (never under a reason-slug kind).
+        for status in ["429", "403", "413"] {
+            let present = out.lines().any(|l| {
+                l.starts_with("hygress_requests_total{")
+                    && l.contains(&format!("status=\"{status}\""))
+                    && l.contains("kind=\"short_circuit\"")
+                    && l.ends_with(" 1")
+            });
+            assert!(
+                present,
+                "requests_total for status {status} kind short_circuit missing:\n{out}"
+            );
+        }
+        // The duration histogram carries the same fixed kind label.
+        assert!(
+            out.lines()
+                .any(|l| l
+                    .starts_with("hygress_request_duration_seconds_bucket{kind=\"short_circuit\"")),
+            "no short_circuit duration buckets in:\n{out}"
+        );
     }
 
     #[test]

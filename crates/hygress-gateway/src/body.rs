@@ -204,6 +204,78 @@ pub fn model_field_equals(
     }
 }
 
+/// AM-2 (pin §2.8) streaming-metering gate: force `stream_options.include_usage`
+/// on OpenAI completions-style **streaming** outbound bodies of model-route
+/// traffic so the upstream emits the canonical final usage chunk (the Higress
+/// ai-proxy baseline injects the same option — upstream PR #4258 provides the
+/// `disableStreamUsageStats` opt-out and #2524 restricts the injection to the
+/// OpenAI chat/completions family).
+///
+/// Returns `Some(new_body)` only when EVERY gate passes:
+/// 1. `is_model_route` — mirror / non-model passthrough bodies are never
+///    rewritten: they are not metered, and their upstream may be an engine
+///    that does not understand `stream_options` (an older vLLM 400s on the
+///    unknown parameter — the reason #4258 exists).
+/// 2. JSON `content_type` with a non-empty body.
+/// 3. the outbound path is an OpenAI completions shape — ends with
+///    `/chat/completions` or `/completions` (covers `/v1` and `/v1-openai`
+///    prefixes; excludes embeddings/images/audio/… so no "Unknown parameter"
+///    400 is risked on endpoints that never stream usage).
+/// 4. the top-level `stream` field is the literal `true` (missing / `false` /
+///    a string / nested are all left untouched — only a top-level boolean true
+///    selects the streaming meter path).
+/// 5. the top-level object has **no** `stream_options` key. A client that sent
+///    one keeps its own explicit preference (respecting the #4147-style
+///    clients that deliberately ask for a usage-less stream). Residual
+///    divergence vs. the wasm baseline is limited to exactly those explicit
+///    clients; the mainstream OpenAI-SDK shape — `stream_options` absent — is
+///    what this fixes.
+///
+/// `None` = no rewrite (the caller keeps its `Bytes` reference — the R-5
+/// zero-allocation short path). All decisions precede the single splice, which
+/// scans the **top-level object only** (H4 — no `serde_json::Value` DOM, same
+/// validate-and-advance semantics as the model-key scan) and inserts the new
+/// member immediately before the object's closing `}`, preserving every other
+/// byte (whitespace included).
+pub fn ensure_stream_include_usage(
+    body: &Bytes,
+    content_type: Option<&str>,
+    upstream_path: &str,
+    is_model_route: bool,
+) -> Option<Bytes> {
+    // (1) Metered traffic only — mirror / non-model passthrough never injects.
+    if !is_model_route {
+        return None;
+    }
+    // (2) JSON with a non-empty body.
+    if body.is_empty() || !is_json(content_type) {
+        return None;
+    }
+    // (3) OpenAI completions shape only (see #2524's chat/completions scoping).
+    if !(upstream_path.ends_with("/chat/completions") || upstream_path.ends_with("/completions")) {
+        return None;
+    }
+    // (4)+(5) One bounded top-level scan: `stream == literal true`, no
+    // `stream_options` key, and the closing-`}` splice point. A body that is
+    // not a well-formed JSON object scans `Err(())` → no injection.
+    let (stream_true, has_stream_options, closing_brace) =
+        scan_top_level_stream(body.as_ref()).ok()?;
+    if !stream_true || has_stream_options {
+        return None;
+    }
+    // Splice before the closing `}`. The object is non-empty here (a top-level
+    // `stream` member exists), so the leading comma is always correct; all
+    // whitespace around `}` is preserved byte-for-byte.
+    let mut out = Vec::with_capacity(body.len() + STREAM_OPTIONS_INJECTION.len());
+    out.extend_from_slice(&body[..closing_brace]);
+    out.extend_from_slice(STREAM_OPTIONS_INJECTION);
+    out.extend_from_slice(&body[closing_brace..]);
+    Some(Bytes::from(out))
+}
+
+/// The member spliced before the top-level object's closing `}` (AM-2).
+const STREAM_OPTIONS_INJECTION: &[u8] = b",\"stream_options\":{\"include_usage\":true}";
+
 /// `true` when a multipart part header block carries `name="model"`.
 fn contains_field(header: &[u8], field: &str) -> bool {
     let needle = format!("name=\"{field}\"");
@@ -317,6 +389,71 @@ fn scan_top_level_value(body: &[u8], key: &str) -> Result<Option<TopLevelValue>,
                             decoded: None,
                         })
                     };
+                }
+                pos = skip_json_value(body, pos, 0).ok_or(())?;
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+/// Scan the **top-level object** of `body` for the AM-2 streaming-metering
+/// gate, returning `(stream_true, has_stream_options, closing_brace)`:
+/// - `stream_true` — the top-level `stream` field's value is the **literal**
+///   `true` (a string, a nested object, a number, or `false` are all `false`;
+///   duplicate keys follow serde last-wins like [`scan_top_level_value`]);
+/// - `has_stream_options` — a top-level `stream_options` field exists with any
+///   value (presence alone is an explicit client control);
+/// - `closing_brace` — the byte offset of the object's closing `}` — the
+///   splice point: the comma-key member is inserted right before it so every
+///   other byte (whitespace included) is preserved.
+///
+/// `Err(())` when the body is not a well-formed JSON object (same strict
+/// validate-and-advance semantics as [`scan_top_level_value`]: bad escapes,
+/// malformed numbers, trailing content, etc. all reject) — such bodies are
+/// never injected into. Recursion is bounded by [`MAX_JSON_DEPTH`] via
+/// [`skip_json_value`].
+fn scan_top_level_stream(body: &[u8]) -> Result<(bool, bool, usize), ()> {
+    let mut pos = skip_ws(body, 0);
+    if body.get(pos) != Some(&b'{') {
+        return Err(());
+    }
+    pos += 1;
+    let mut stream_true = false;
+    let mut has_stream_options = false;
+    loop {
+        pos = skip_ws(body, pos);
+        match body.get(pos) {
+            Some(b'}') => {
+                // Trailing content must be whitespace-only (like serde); any
+                // other trailing byte makes the document malformed.
+                if skip_ws(body, pos + 1) != body.len() {
+                    return Err(());
+                }
+                return Ok((stream_true, has_stream_options, pos));
+            }
+            Some(b',') => {
+                let after = skip_ws(body, pos + 1);
+                if body.get(after) == Some(&b'}') {
+                    return Err(()); // trailing comma (serde rejects)
+                }
+                pos = after;
+            }
+            Some(b'"') => {
+                let (k, after_key) = parse_json_string(body, pos).ok_or(())?;
+                pos = skip_ws(body, after_key);
+                if body.get(pos) != Some(&b':') {
+                    return Err(());
+                }
+                pos = skip_ws(body, pos + 1);
+                if k == "stream" {
+                    // Only a top-level literal `true` gates; the value token is
+                    // still fully validated below (validate-and-advance).
+                    stream_true = body.get(pos..pos + 4) == Some(b"true");
+                } else if k == "stream_options" {
+                    // Presence alone counts (any value, incl. `null`/`false`):
+                    // the client explicitly controls usage reporting.
+                    has_stream_options = true;
                 }
                 pos = skip_json_value(body, pos, 0).ok_or(())?;
             }
@@ -1041,6 +1178,227 @@ mod tests {
         }
         body.push_str("\"}],\"stream\":true}");
         body
+    }
+
+    // -------------------------------------------------------------------
+    // AM-2: `stream_options.include_usage` forced-on injection gate
+    // -------------------------------------------------------------------
+
+    /// A canonical streaming OpenAI chat body the client sends WITHOUT
+    /// `stream_options` (the mainstream OpenAI-SDK default shape).
+    const STREAM_BODY: &str =
+        r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+    /// Convenience: run the gate with the canonical metered setup (JSON
+    /// content-type, `/v1/chat/completions`, model route).
+    fn inject(body: &str) -> Option<Bytes> {
+        ensure_stream_include_usage(
+            &Bytes::copy_from_slice(body.as_bytes()),
+            Some(MODEL),
+            "/v1/chat/completions",
+            true,
+        )
+    }
+
+    /// The exact splice the injection appends before the closing `}`.
+    const INJECT: &str = r#","stream_options":{"include_usage":true}"#;
+
+    #[test]
+    fn inject_include_usage_for_stream_chat_byte_exact() {
+        let out = inject(STREAM_BODY).expect("a stream:true chat body must be injected");
+        let got = String::from_utf8(out.to_vec()).unwrap();
+        // Byte-exact: the original body with the member spliced before the
+        // top-level closing `}` (trailing `}` closes the object, and the
+        // `}` inside `messages` did not confuse the locator).
+        let expected = r#"{"model":"org1/llama-3-8b","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#;
+        assert_eq!(got, expected);
+        // Exactly one injection.
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
+        // The result is well-formed and carries the forced option.
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream"], json!(true));
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+        assert_eq!(v["messages"][0]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn inject_preserves_whitespace_byte_for_byte() {
+        // Trailing whitespace AFTER the object close stays at the end.
+        let body = "{\"stream\":true}\n  \t";
+        let out = inject(body).expect("must inject");
+        let got = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(got, format!("{{\"stream\":true{INJECT}}}\n  \t"));
+
+        // Whitespace BETWEEN the last member and the `}` is also kept (the
+        // comma lands right before `}`, valid JSON either way).
+        let pretty = "{\n  \"model\": \"m\",\n  \"stream\": true\n}\n";
+        let out = inject(pretty).expect("must inject");
+        let got = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(
+            got,
+            "{\n  \"model\": \"m\",\n  \"stream\": true\n,\"stream_options\":{\"include_usage\":true}}\n"
+        );
+    }
+
+    #[test]
+    fn already_explicit_stream_options_is_not_overridden() {
+        // The client explicitly controls usage reporting (any value, incl.
+        // `false` / `null`) — the gateway never overrides or duplicates it.
+        for body in [
+            r#"{"stream":true,"stream_options":{"include_usage":true}}"#,
+            r#"{"stream":true,"stream_options":{"include_usage":false}}"#,
+            r#"{"stream_options":{},"stream":true}"#,
+            r#"{"stream":true,"stream_options":null}"#,
+        ] {
+            assert_eq!(inject(body), None, "must not touch {body}");
+        }
+    }
+
+    #[test]
+    fn no_injection_unless_stream_is_top_level_literal_true() {
+        // Missing / false / string / nested / numeric / empty-object bodies are
+        // all untouched; a duplicate `stream` key follows serde last-wins.
+        for body in [
+            r#"{"model":"m"}"#,
+            r#"{"stream":false}"#,
+            r#"{"stream":"true"}"#,
+            r#"{"stream":true,"stream":false}"#,
+            r#"{"stream":{"inner":true}}"#,
+            r#"{"stream":[true]}"#,
+            r#"{"stream":1}"#,
+            "{}",
+        ] {
+            assert_eq!(inject(body), None, "must not inject into {body}");
+        }
+    }
+
+    #[test]
+    fn path_gate_limits_injection_to_completions_endpoints() {
+        // /v1-openai prefix and bare /completions inject too ...
+        for path in [
+            "/v1/chat/completions",
+            "/v1-openai/chat/completions",
+            "/v1/completions",
+            "/completions",
+        ] {
+            let out = ensure_stream_include_usage(
+                &Bytes::from(r#"{"stream":true}"#),
+                Some(MODEL),
+                path,
+                true,
+            );
+            assert!(out.is_some(), "must inject on {path}");
+            assert_eq!(
+                out.unwrap(),
+                Bytes::from(format!("{{\"stream\":true{INJECT}}}")),
+                "injection bytes on {path}"
+            );
+        }
+        // ... while every other streaming endpoint (embeddings / images /
+        // audio / anything that is not a completions shape) never injects.
+        for path in [
+            "/v1/embeddings",
+            "/v1/images/generations",
+            "/v1/audio/speech",
+            "/v1/responses",
+            "/other/chat/completionsX",
+            "/v1/chat/completions/extra",
+            "/",
+            "",
+        ] {
+            assert_eq!(
+                ensure_stream_include_usage(
+                    &Bytes::from(r#"{"stream":true}"#),
+                    Some(MODEL),
+                    path,
+                    true
+                ),
+                None,
+                "must not inject on {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_json_content_type_empty_body_and_non_model_route_are_none() {
+        let stream_body = Bytes::from(r#"{"stream":true}"#);
+        // Non-JSON content types (multipart / SSE / none).
+        assert_eq!(
+            ensure_stream_include_usage(&stream_body, Some(MP), "/v1/chat/completions", true),
+            None
+        );
+        assert_eq!(
+            ensure_stream_include_usage(
+                &stream_body,
+                Some("text/event-stream"),
+                "/v1/chat/completions",
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            ensure_stream_include_usage(&stream_body, None, "/v1/chat/completions", true),
+            None
+        );
+        // Empty body.
+        assert_eq!(
+            ensure_stream_include_usage(&Bytes::new(), Some(MODEL), "/v1/chat/completions", true),
+            None
+        );
+        // Mirror / non-model passthrough: even a perfect stream body is untouched.
+        assert_eq!(
+            ensure_stream_include_usage(&stream_body, Some(MODEL), "/v1/chat/completions", false),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_object_bodies_never_inject() {
+        for body in [
+            "{broken",
+            r#"{"stream":true"#,          // unterminated object
+            r#"{"stream":true} garbage"#, // trailing content
+            r#"{"stream":true,}"#,        // trailing comma
+            r#"{"stream":"\q"}"#,         // bad escape in a skipped string
+            r#"{"bad":01,"stream":true}"#, // bad number
+            r#"{"stream" true}"#,         // missing colon
+            r#"{"stream":true}{"a":1}"#,  // trailing object
+            r#"[{"stream":true}]"#,       // top-level array (not an object)
+            "null",
+            "42",
+        ] {
+            assert_eq!(inject(body), None, "must never inject into {body}");
+        }
+    }
+
+    #[test]
+    fn braces_and_escaped_quotes_inside_strings_do_not_fool_the_locator() {
+        // The messages content contains a brace-object, a stray `}`, and
+        // escaped quotes — the scanner must only honor the TOP-LEVEL closing
+        // `}` and splice there, byte-faithfully.
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"say {\"a\":1} then } he said \"hi\""}],"stream":true}"#;
+        let out = inject(body).expect("must inject");
+        let got = String::from_utf8(out.to_vec()).unwrap();
+        // body[..] minus its final `}` + the injection + the `}` it closed.
+        let expected = format!("{}{INJECT}}}", &body[..body.len() - 1]);
+        assert_eq!(got, expected);
+        assert_eq!(got.matches("\"stream_options\"").count(), 1, "body: {got}");
+        // Round-trips with the content (incl. its braces/quotes) intact.
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+        assert_eq!(v["messages"][0]["content"], json!(r#"say {"a":1} then } he said "hi""#));
+    }
+
+    #[test]
+    fn escaped_stream_key_still_counts_as_the_stream_field() {
+        // Keys are decoded like serde (escapes included): `"\u0073tream"` IS
+        // the `stream` key — parity with the model-key scanner.
+        let body = r#"{"\u0073tream":true}"#;
+        let out = inject(body).expect("escaped key must still gate");
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            format!(r#"{{"\u0073tream":true{INJECT}}}"#)
+        );
     }
 }
 

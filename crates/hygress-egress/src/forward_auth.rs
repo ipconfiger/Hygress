@@ -223,9 +223,24 @@ const ALLOWLIST: [&str; 7] = [
     AUTH_CACHE_HEADER,
 ];
 
-/// Decode a header value to a `String` (lossy fallback when it is not valid UTF-8).
+/// Decode a header value to a `String`.
+///
+/// HTTP header values may carry arbitrary (non-UTF-8) bytes. The write-back fields
+/// (`Authorization` / `cookie` / `X-Mse-Consumer` / `AUTH_CACHE_HEADER`) are model strings that
+/// the gateway re-emits as header values (see the write-back path), so a non-UTF-8 value cannot
+/// be written back and must be dropped. MINOR-14: the drop is **logged**, not silent — in
+/// practice this path is inert because GPUStack auth values are always ASCII, but a silent empty
+/// write-back would be very hard to diagnose (a request would suddenly lose its credential).
 fn to_header_string(v: &HeaderValue) -> Option<String> {
-    Some(v.to_str().ok()?.to_string())
+    match v.to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(_) => {
+            tracing::warn!(
+                "forward-auth response carries a non-UTF-8 header value; dropping the write-back value (write-back headers must be valid UTF-8 to be re-emitted)"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +264,18 @@ mod tests {
     fn header_string_roundtrip() {
         let v = HeaderValue::from_static("dummy=dummy");
         assert_eq!(to_header_string(&v), Some("dummy=dummy".to_string()));
+    }
+
+    #[test]
+    fn non_utf8_header_value_is_dropped_not_misdecoded() {
+        // MINOR-14: a write-back header with non-UTF-8 bytes cannot be re-emitted as a model
+        // string — the parser returns None (the drop is logged, never silent), and it must NOT
+        // produce replacement-character garbage that would corrupt the credential.
+        let v = HeaderValue::from_bytes(b"Bearer \xff\xfetoken").unwrap();
+        assert_eq!(to_header_string(&v), None, "non-UTF-8 write-back must be dropped");
+        // A normal ASCII write-back still decodes cleanly.
+        let ok = HeaderValue::from_static("Bearer ascii-token");
+        assert_eq!(to_header_string(&ok), Some("Bearer ascii-token".to_string()));
     }
 }
 

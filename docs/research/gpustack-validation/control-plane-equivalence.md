@@ -43,16 +43,16 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | ② 模型解析（path alias / body / autoRouting） | generic-proxy-router Wasm | model-router 原生（body 零拷贝 B1-B4） | EQUIVALENT-WITHIN-SCOPE（autoRouting 字段未消费，见 §B-C1） |
 | ③ transformer-in（rename/backup :path） | transformer 规则 3-9 | 原生 | EQUIVALENT |
 | ④ 路由匹配（`x-higress-llm-model` exact + path regex） | Envoy RDS | RouteTable（H2 快照缓存 + SWRR） | EQUIVALENT |
-| ⑤ ext-auth forward-auth（/token-auth、FAIL_OPEN、30s、7 头转发 + 4 头写回） | ext-auth Wasm | egress forward_auth（token 派生 HMAC 契约一致，e2e 验证） | EQUIVALENT |
+| ⑤ ext-auth forward-auth（/token-auth、30s、7 头转发 + 4 头写回；传输失败默认 fail-closed 403 `ext_auth_unavailable`，`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切 legacy fail-open — R-12） | ext-auth Wasm（`failure_mode_allow=false`） | egress forward_auth（token 派生 HMAC 契约一致，e2e 验证） | EQUIVALENT |
 | ⑦⑧⑨ registry resolve + SWRR + instance/route 头 | Envoy cluster + set-header Wasm | 原生 SWRR + `X-GPUStack-Model-Instance`/`Route-Name`（`get_instance_id_from_header` 正则一致） | EQUIVALENT（LB 算法 SWRR vs envoy 加权 RR：长期分布等价，短时平滑度不同——🟢） |
 | ⑩ model-mapper（LoRA/改名） | model-mapper Wasm | 零拷贝 body model 改写（B1-B4） | EQUIVALENT |
 | ⑪ failover（proxy-next-upstream ×tries + path 重写 + key swap） | Envoy retry + fallback EnvoyFilter | 候选循环 + `x-gpustack-fallback-from`（D7） | EQUIVALENT |
-| ⑫⑬ usage 落库（17 字段 → `model_usage_details`） | token-usage Wasm → POST /v2/usage | usage sink（B2 SSE 计量；DoD5 34/7 行逐位一致） | EQUIVALENT |
+| ⑫⑬ usage 落库（17 字段 → `model_usage_details`） | token-usage Wasm → POST /v2/usage | usage sink（B2 SSE 计量；DoD5 34/7 行逐位一致 —— A/B 基线跑，B5 复跑 34/5） | EQUIVALENT |
 | mirror `/readyz` 透传 | envoy route | mirror route（基准路径） | EQUIVALENT |
 | TLS 终止 | SDS + Cert Server | gpustack-tls-* Secret → 单默认证书 SNI | 🟠 GAP-C3 |
 | rate-limit（第 9 插件） | GPUStack 未创建（wheel 内闲置） | hygress 自有令牌桶（扩展，policy.yaml 驱动） | **hygress 超集**（GPUStack 未用的槽位反而有原生实现） |
 
-**判定**：GPUStack 数据面契约（pin §4.2 管线 ①-⑮ + §5 wire 断言）**全链路原生覆盖**，DoD1-6 真机验证（CRD 逐字节、usage 34/7 行逐位、端口纪律、回滚）。超出 GPUStack 使用面的 Wasm 能力（§B-C1）是唯一系统性边界。
+**判定**：GPUStack 数据面契约（pin §4.2 管线 ①-⑮ + §5 wire 断言）**全链路原生覆盖**，DoD1-6 真机验证（CRD 逐字节、usage 34/7 行逐位（A/B 基线跑；B5 复跑 34/5）、端口纪律、回滚）。超出 GPUStack 使用面的 Wasm 能力（§B-C1）是唯一系统性边界。
 
 ### A3. 动态控制/生命周期面
 
@@ -71,7 +71,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | 配置下发状态可见性 | `istioctl proxy-status` / `proxy-config`（NACK/版本可见） | 日志（warn on reject/skip）+ **无**当前生效快照的 introspection 端点 | 🟡 GAP-C4：建议 admin 增 `/config` dump（ArcSwap 快照直接序列化）+ `config_reject_total`/`config_skip_total` 计数器——低成本补齐 |
 | 指标 | envoy stats + prometheus（丰富） | `:15020/stats/prometheus` 浅兼容 + `hygress_*` 家族（requests/duration/tokens/ttft/retries/upstream_errors/fallback/auth/rate_limit/quota/policy/guardrail） | EQUIVALENT-WITHIN-SCOPE（GPUStack 消费的指标面已覆盖；envoy 细粒度 cluster-level stats 无对等——🟢） |
 | 健康/就绪 | — | `/healthz`（admin）+ `:80/readyz`（镜像路径）+ 绑定门控 | ✅ |
-| 热更 | xDS 推送 | CRD WATCH + policy.yaml mtime 1s + admin `/reload`（token 门禁） | ✅（Phase 1.1 后零周期打点） |
+| 热更 | xDS 推送 | CRD WATCH + policy.yaml mtime（R-8 后 ≤30s dutycycle）+ admin `/reload`（token 门禁） | ✅（Phase 1.1 后零周期打点） |
 | 日志 | envoy/pilot 分散 | 单进程 Rust tracing 集中 | ✅ |
 
 ### A5. 端口/契约面
@@ -81,7 +81,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 | 数据面 :80/:443 | envoy | pingora（TLS SNI 单默认证书，🟠 C3） | ✅（DoD3） |
 | `:80/readyz` 镜像 | envoy → GPUStack | mirror route → GPUStack（真机 200 双侧） | ✅ |
 | admin/stats 端口纪律 | pilot 15010/15012/15051、console 8080 | **永绑定**禁用端口 9876/15010/15012/8888/15051；admin 127.0.0.1:8081、stats 15020 | ✅（DoD6 `ss -ltn` 验证零泄漏） |
-| usage 落库 | token-usage Wasm → `/v2/usage/gateway-metrics` | egress sink（17 字段逐位一致，`model_usage_details` 34/7 行 DoD5） | ✅ |
+| usage 落库 | token-usage Wasm → `/v2/usage/gateway-metrics` | egress sink（17 字段逐位一致，`model_usage_details` 34/7 行 DoD5 —— A/B 基线跑，B5 复跑 34/5） | ✅ |
 | CRD 只读 | — | 6 类 LIST/WATCH + label selector，**不写任何 CRD**（IngressClass 种子除外，topology-B 显式开启） | ✅ |
 
 ## B. 诚实差距清单（按严重度）

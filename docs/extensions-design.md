@@ -1,8 +1,9 @@
-# Hygress 升级开发设计 v2（已按 @oracle 首轮交叉审核修订，待复审）
+# Hygress 升级开发设计 v2（终版 —— 二轮复审无阻塞 + M0-M4 已实现，见 §9/§10）
 
 > 依据：`docs/extensions-audit.md`（深度审核）+ `docs/design.md`（v1.5）+ 实际代码结构。
 > 范围：Token quota · 限流 · 路由策略 · 安全护栏（四类延伸能力）+ 两个前置缺口（配置骨架 / 响应侧管道）。
-> 状态：**v2** —— 已消解首轮审核 5 项阻塞（BLOCK-1~5）并裁决 D-1~D-15；**待二轮复审确认无阻塞**。
+> 状态：**终版（v2）** —— 已消解首轮审核 5 项阻塞（BLOCK-1~5）并裁决 D-1~D-15；二轮复审无阻塞（§9）；
+> M0-M4 已实现并真机 e2e（§10）。
 > 原则延续：TDD + 零 mock/stub；纯逻辑进 `hygress-core`、外呼进 `hygress-egress`、阶段进 `hygress-gateway`；
 > 热重载走独立 `SharedPolicy`(ARC-swap)；每能力沿用 Gate 门禁；GPUStack 控制面只读（契约边界不变）。
 
@@ -22,7 +23,10 @@
 ### 2.1 配置骨架（消除 E-1）
 - **载体**：独立 `SharedPolicy` —— `ArcSwap<PolicyConfig>`（core 纯类型 + serde derive；持有器仿 `SharedConfigHandle` 放 `GatewayState.policy`）。**限流/配额等引擎可变态（DashMap）挂 `GatewayState`/`PolicyHandle`，绝不进 `ConfigData`**（后者被 adapter 每秒整体换入，状态即丢；`SharedConfig::store` 无相等性短路，现状保留不动，不做"Data 不变则不动"）。
 - **路径**：`HYGRESS_POLICY_PATH`（env 覆盖，默认 `/etc/hygress/policy.yaml`）。文件名统一 `policy.yaml`，弃 `HYGRESS_CONFIG` 命名。
-- **加载/热重载**：启动加载；mtime 1s 轮询（tokio 任务，与 adapter 1s poll 节奏一致，零新依赖）+ admin `POST /reload`。**注意：admin `/reload` 现状未接线（`admin_state` 的 reloader=None，返回 501）——接线是 M0 真实工作量**：闭包捕获 `Arc<PolicyHandle>` → 读文件→解析→swap（失败保留旧值+warn）。token 门禁已存在（fail-closed 401）。
+- **加载/热重载**：启动加载；**mtime 轮询**（实现期先按 1s 与 adapter poll 同节奏；审计 R-8 后并入
+  quota/限流 evict dutycycle，周期 **30s**，`bootstrap.rs`）+ admin `POST /reload` **即时**（token
+  门禁 fail-closed 401）。接线即 M0 真实工作量：闭包捕获 `Arc<PolicyHandle>` → 读文件→解析→swap
+  （失败保留旧值+warn）——**M0 已完成**（设计期 `/reload` 返回 501，见 §10.1/§10.2）。
 - **语义**：缺文件 = 空策略（默认全放行）+ warn 一次；坏文件 = 保留上次有效 + warn（对齐 last-known-good）。配置分层：`global` 默认 → `routes` 覆盖。
 - **部署**：`pack/hygress-s6/.../gateway/run` 导出 `HYGRESS_POLICY_PATH`；镜像建 `/etc/hygress/`（或置于 `HYGRESS_DATA_DIR` bind mount 下——**挂载来源为部署决策，需人工确认**，代码无约束）。
 - **依赖**：`serde_yaml` 加入 hygress-gateway（core 零 IO 无 yaml；adapter 已有，workspace 版本沿用）。
@@ -71,7 +75,7 @@ routes:                                # 路由键 = ingress_name（ns 剥离后
 ### 4.1 限流（P1）
 - core：`RatLimiter`（令牌桶，`AtomicU64` 桶 + DashMap 键表，单实例）。**键语义（裁决 D-9/D-10）**：
   - **IP 键** = 现有 `client_ip` 提取结果（`X-Real-IP` → **XFF 首值** → 空串；与 `pipe.rs:473-479` 实现一致，三处文档口径本次统一）。**为空则跳过**（绝不共享 "" 桶）；头可伪造 → 文档标注 best-effort；peer-addr 键列为 M1 可选增强（需把 Pingora 下游地址接入 `InboundRequest`）。
-  - **consumer 键** = `X-Mse-Consumer`；`none`/缺省（含 ext-auth FAIL_OPEN）时 **consumer 维度跳过**，仅 IP 维度生效。
+  - **consumer 键** = `X-Mse-Consumer`；`none`/缺省（含 ext-auth 鉴权缺失 / legacy fail-open 模式）时 **consumer 维度跳过**，仅 IP 维度生效。
 - 阶段：**两处**，均在 pipe 异步段（不拆 `prepare_inner`，见 §5）：`rate_limit_pre`（入站**头读取后、body 读取前**，早拒不排空 body）；`rate_limit_post`（ext-auth 后、候选循环前，每请求一次）。
 - 响应：**扩展 `short_circuit`** 支持类型化错误与附加头（D-15）：`{"error":{"message":...,"type":"rate_limit_error"}}` + `Retry-After`。
 
@@ -87,6 +91,10 @@ routes:                                # 路由键 = ingress_name（ns 剥离后
   | **下游写失败中断（`pipe.rs:319-328` 现状直接 return，连 usage 都不报）** | release + 补 `completed=false` usage（护栏中断同此） |
   | 护栏拦截（4.4） | release + `completed=false` |
   | TTL 兜底 GC | 防进程内泄漏 |
+  > 注（completed=false 行记账口径，D-11）：护栏/网关前置拒绝补报的 `completed=false` usage 行，由
+  > GPUStack 侧按字节/chunk 估算落账（`_estimate_partial_usage`：input≈bytes/4、output≈chunks×1）——
+  > 与 wasm token-usage **仅在上游请求触达被跟踪集群后上报**不同；前置拒绝（未触达上游）仍补一行属
+  > Hygress 自有层的取舍（D-11），真机已验证该行形态（REPORT §14 completed=false 行）。
 - 阶段：`quota(reserve)` 在 ext-auth 后、候选循环前（每请求一次）；`commit/release` 随响应终端路径。hard 超限 429；soft 超限告警 + 可选降级头。
 - **持久化（D-5 裁决）**：**内存先行**（重启丢窗口 → 短暂 over-allow，可接受；与护栏 fail-closed 性质不同）；WAL/文件移出 v1（design §8 策略 2 零本地持久化原则）。
 
@@ -146,7 +154,7 @@ inbound 头读取 ── rate_limit_pre(IP, B2) ── body 读取（复用 read
 | 护栏(LLM) | 已启用且外呼超时/出错 | **reject（fail-closed）** | on_error: reject\|allow |
 | 护栏(未配置 `llm.service: null`) | — | **直通（非 closed）** | 配置即启用 |
 | 配置（缺失/坏文件） | — | 上次有效 / 默认放行 + warn | — |
-| ext-auth（既有，不改） | 传输失败 | allow（FAIL_OPEN） | — |
+| ext-auth（既有，R-12 修订） | 传输失败/5xx | **默认 fail-closed：403 `ext_auth_unavailable`**（对齐 GPUStack/Higress `failure_mode_allow=false`；`failStrategy` 仅约束 Wasm VM 致命错误） | `HYGRESS_EXT_AUTH_FAIL_MODE=open` 切回 legacy fail-open |
 
 ## 8. 定案记录（D-1~D-15，首轮 @oracle 裁决已采纳）
 
@@ -158,7 +166,7 @@ inbound 头读取 ── rate_limit_pre(IP, B2) ── body 读取（复用 read
 | D-4 | 配置并入 | 独立 `SharedPolicy`(ArcSwap)；删除"数据不变则不动"（CRD store 现状保留） |
 | D-5 | quota 持久化 | 内存先行（over-allow 可接受）；WAL 移 v1 |
 | D-6 | 限流 window | 从限流 schema 删除（文档化字段不入）；quota window 保留（真语义） |
-| D-7 | 路径/触发 | `HYGRESS_POLICY_PATH`（默认 /etc/hygress/policy.yaml）+ mtime 1s + /reload 接线（现 501，M0 必做） |
+| D-7 | 路径/触发 | `HYGRESS_POLICY_PATH`（默认 /etc/hygress/policy.yaml）+ mtime 轮询（实现期 1s；R-8 后并入 30s dutycycle）+ `/reload`（M0 接线完成，原设计期 501） |
 | D-8 | 阶段插入点 | 全部在 pipe 异步段与响应接缝；不拆 prepare_inner |
 | D-9 | 限流 IP 键 | 现有 client_ip（X-Real-IP→XFF 首值），空则跳过；头可伪造 best-effort；peer-addr 可选增强 |
 | D-10 | consumer 键 | `X-Mse-Consumer`，'none'/缺省跳过 consumer 维（fail-open）；mirror 仅 IP 维 |
@@ -181,6 +189,11 @@ inbound 头读取 ── rate_limit_pre(IP, B2) ── body 读取（复用 read
 ---
 
 ## 10. 实现完成与自审记录（2026-09-04）
+
+> 注：本节为 2026-09-04 的**实现/审核记录**（早于审计修复批 B1-B5）。彼时 policy mtime 轮询周期为
+> 1s、ext-auth 传输失败默认 fail-open；均已随审计修复变更（R-8：policy 轮询并入 ≤30s dutycycle；
+> R-12：ext-auth 默认 fail-closed/403 + `HYGRESS_EXT_AUTH_FAIL_MODE=open` 开关），本节内相应表述保留
+> 为当时状态，现行机制以 §2.1/§7（已修订）与 README env 表为准。
 
 ### 10.1 实现（三个并行 lane + 复核，全部 TDD、零 mock/stub）
 | lane | 内容 | 结果 |

@@ -1,8 +1,8 @@
 # Hygress — 基于 Pingora 的 GPUStack 内嵌 Higress 原位替换 AI Gateway 设计方案
 
-- 版本：v1.2（根据 oracle 第二轮审核 APPROVED-WITH-MINOR-FIXES 8.5/10 修订）
-- 日期：2026-09-02
-- 状态：草案（第 3 轮，终审目标 APPROVED）
+- 版本：v1.5（终稿——v1.3 依 Gate-1 代码门禁修订、v1.5 依真机 A/B 验证完成更新，见修订记录）
+- 日期：2026-09-02（v1.5 更新于真机验证后，2026-09-03）
+- 状态：**终稿**（oracle 第二轮审核 APPROVED-WITH-MINOR-FIXES 8.5/10 → Gate-1/Gate-2 → 真机 DoD 1/2/5-DB/6 全 PASS）
 - 关联源码：
   - 借鉴/复用对象：`/home/alex/Projects/dogress2`（Pingora AI 网关，代码名 Hydra）
   - 替换目标：GPUStack 内嵌 Higress（`/home/alex/Projects/GPUStack/gpustack`，分析基线 v2.2.x / Higress 2.1.9）
@@ -44,7 +44,8 @@ WasmPlugin / EnvoyFilter / Secret / ConfigMap），由 Higress 控制器消费�
 6. 可回滚：s6 镜像层保留三进程脚本（no-op 而非删除），便于对比回归。
 
 > **DoD 状态（v1.5，真机验证完成）**：DoD 1/2/3/4 MET ✅；DoD 5-DB MET ✅
-> （`model_usage_details` 新增行 34/7 与 e2e 响应逐位一致）；DoD 6 MET ✅（端口纪律/进程/回滚/supercronic）。
+> （`model_usage_details` 新增行 34/7 —— A/B 基线跑，与 e2e 响应逐位一致；修复批 B5 复跑实测 34/5，
+> 见 audit-fix-report §3.3）；DoD 6 MET ✅（端口纪律/进程/回滚/supercronic）。
 > 证据：`docs/research/gpustack-validation/`（REPORT §13、hygress.log、CRD dump diff、usage_rows）。
 > 注：真机为 v2.2.3 实测兜底；若未来 GPUStack 给 McpBridge 补上 managed 标签或改 ext-auth 转发语义，
 > 需按 §13 变更点回归。
@@ -199,7 +200,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 - **无 registry/discovery**——McpBridge 的 static/dns/proxy/tunnel 四类注册项与动态实例伸缩
   （1s 刷新）不存在。
 - **`HttpAuthChecker` 是 POST + 判定**——缺 forward-auth（GET 语义、header 透传/写回、token 注入、
-  `FAIL_OPEN`）。
+  鉴权服务不可用时的 closed/open 失败模式，R-12）。
 - **无 header transformer / fallback / `X-GPUStack-Model-Instance` / `X-GPUStack-Route-Name`**。
 - **无 GPUStack usage sink / `/token-auth` 适配 / 15020 风格指标别名**。
 - **路径匹配仅 `is_v1_route` 判定**——无不限 host/path 路由表。
@@ -346,7 +347,10 @@ priority 数字号：
 ④ 路由匹配                header x-higress-llm-model + path 谓词 → RouteRule
 ⑤ ext-auth (等价)         仅当命中 RouteRule 的 origin ingress 名（含可选 ns 前缀）以 ai-route-route- 开头
                           → forward-auth GET /token-auth（透传/注入头, 写回 X-Mse-Consumer/Authorization/
-                          cookie/AUTH_CACHE_HEADER, FAIL_OPEN, 30s 超时）;
+                          cookie/AUTH_CACHE_HEADER, 30s 超时）;
+                          传输失败/5xx 默认 **fail-closed**（403 `ext_auth_unavailable`，对齐
+                          GPUStack/Higress `failure_mode_allow=false`）；`HYGRESS_EXT_AUTH_FAIL_MODE=open`
+                          切回 legacy fail-open（R-12）
                           mirror(gpustack) 及非 GPUStack 路由不鉴权
 ⑥ 全文读取 (cap→413)      (Hydra 已验证; multipart 单独处理)
 ⑦ registry 解析           (static|dns|proxy|tunnel → 目标组) → SWRR 加权选后端
@@ -371,8 +375,10 @@ priority 数字号：
   必须保证出向带去重后的正确 `x-higress-llm-model`。
 - **fallback 空目标特例**：GPUStack 在主路由 destinations 为空时会把 fallback 的 destinations **拷进主
   Ingress**（代码 FIXME 行为）——Hygress 由直接消费 CRD 天然获得，**禁止「简化」掉**。
-- **fail-open 边界**：ext-auth FAIL_OPEN + WORKER-proxy 目标 ⇒ 请求到达 worker proxy 时可能未携带改写
-  后的 `Authorization` ⇒ 401 ⇒ 落入 fallback 链——作为可接受的等效行为在测试中固定。
+- **fail-open/closed 边界（R-12）**：默认 fail-closed —— `/token-auth` 传输失败/5xx ⇒ 403
+  `ext_auth_unavailable`（不再放行到上游）。仅 `HYGRESS_EXT_AUTH_FAIL_MODE=open`（legacy）下保留旧边界：
+  ext-auth fail-open + WORKER-proxy 目标 ⇒ 请求到达 worker proxy 时可能未携带改写后的 `Authorization` ⇒
+  401 ⇒ 落入 fallback 链——作为可接受的等效行为在测试中固定（fail-closed 分支见 R-12 集成/单元覆盖）。
 
 ### 6.2 路由规则数据模型（新增，核心）
 
@@ -449,8 +455,8 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 | `gpustack-set-model-pre-route` | 路由钩子 | 选实例 → 出向写 `X-GPUStack-Model-Instance`（格式=`get_instance_id_from_header` 正则可解析）+ `X-GPUStack-Route-Name` | 2-3 d |
 | `gpustack-model-mapper` | `model_mapper.rs` | **逐目的地**模型名映射（`model_mapping` keyed by service 名）；**随路由事件热更新**（非 init-only）；LoRA 别名（`l<sha256[:8]>` 注册表）与改名 provider 必须命中 | 3-5 d |
 | `gpustack-header-transformer` | `transformer.rs` | **有序规则引擎**：入向 remove `X-GPUStack-Auth-Token`/`X-GPUStack-Model-Instance`；rename `x-gpustack-model`→`x-higress-llm-model`；rename `x-gpustack-fallback-path`→`:path`(fallback)；dedupe(RETAIN_FIRST/LAST)；`:path`→`x-gpustack-original-path` 备份；出向保留实例/route-name 头 | 3-5 d |
-| `gpustack-llm-ext-auth` | `forward_auth.rs` | **GET** `/token-auth`；透传 `X-Real-IP/X-Forwarded-For/x-higress-llm-model/x-api-key/cookie/x-gpustack-auth-cache`；注入 `X-GPUStack-Auth-Token`；**写回 `X-Mse-Consumer`/`Authorization`/cookie/`AUTH_CACHE_HEADER`**；30s 超时、`FAIL_OPEN`；复用 Hydra auth 缓存(5min)；**作用域=路由名前缀 `ai-route-route-`** | 3-5 d |
-| `gpustack-ai-proxy` | `ai_proxy.rs` | v1 OpenAI 兼容子集 provider（`providers[]/(apiTokens/failover/retryOnFailure)` + `matchRules[]`）+ key 替换/失败转移（复用 provider_client）；**非 OpenAI 类型优雅透传**；claude 透传 | 1-2 wk |
+| `gpustack-llm-ext-auth` | `forward_auth.rs` | **GET** `/token-auth`；透传 7 头（`authorization`/`X-Real-IP`/`X-Forwarded-For`/`x-higress-llm-model`/`x-api-key`/`cookie`/`x-gpustack-auth-cache`，与 `ALLOWLIST` 一致）；注入 `X-GPUStack-Auth-Token`；**写回 `X-Mse-Consumer`/`Authorization`/cookie/`AUTH_CACHE_HEADER`**；30s 超时；传输失败默认 **fail-closed**（403 `ext_auth_unavailable`，R-12），`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切旧版 fail-open；复用 Hydra auth 缓存(5min)；**作用域=路由名前缀 `ai-route-route-`** | 3-5 d |
+| `gpustack-ai-proxy` | `ai_proxy.rs` | v1 OpenAI 兼容子集 provider（`providers[]/(apiTokens/failover/retryOnFailure)` + `matchRules[]`）+ **key 交换**（每 provider 取首个 `apiToken` 写入出站 Authorization）+ **目的地级重试**（`proxy-next-upstream` 候选重派）；provider 内多 token failover/健康探测**不在 v1 范围**；**非 OpenAI 类型优雅透传**；claude 透传 | 1-2 wk |
 | `gpustack-token-usage` | `gpustack_sink.rs` | `POST /v2/usage/gateway-metrics`，`X-GPUStack-Auth-Token`=HMAC(jwt_secret_key,"gateway-metrics-push")；**wire=恰 17 字段**（必送 11 + omitempty 6：user_id/model_id/model_route_id/provider_id/access_key/organization_id；`operation`/`cluster_id`/`provider_name/provider_type` **不上送**，见 §2.1.3）；归属来自 X-Mse-Consumer + X-GPUStack-Route-Name；`completed=true` 优先；仅 model-route 流量上报 | 3-5 d |
 | `gpustack-ai-statistics` | `ai_statistics.rs` | 浅兼容统计型（content-type 门控 `GATEWAY_AI_STATISTICS_PLUGIN_CONTENT_TYPES`）；MVP 记录 + 暴露 metric | 浅 |
 
@@ -489,7 +495,10 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
   名（含可选 `gateway_namespace` 前缀）以 `ai-route-route-` 开头才鉴权；mirror `/` 与 GPUStack 自身流量
   永不鉴权。**以 path 前缀判定会导致 FAIL_OPEN 下的安全洞**，禁止。
 - `GET` 语义 + header 透传/写回（见 §7 ext-auth）+ 5 分钟缓存（复用 Hydra `AuthCache`/Redis 失效流）、
-  `FAIL_OPEN`（GPUStack 契约 `failStrategy: FAIL_OPEN`）+ 30s 超时。
+  30s 超时。**两层失败语义须区分（R-12）**：CRD 侧 `failStrategy: FAIL_OPEN` 只约束 Wasm VM 致命错误
+  （GPUStack 对全部插件如此设置）；**业务级**鉴权失败默认 **fail-closed**（403 `ext_auth_unavailable`，
+  对齐 GPUStack/Higress `failure_mode_allow=false`），`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切回 legacy
+  fail-open。
 - **`jwt_secret_key` 获取（设计内定案，禁止在实现期才定）**，解析优先级：
   1. env `GPUSTACK_JWT_SECRET_KEY`（with-contenv 可见，分布部署必配）；
   2. 文件 `{data_dir}/jwt_secret_key`（`prepare_jwt_secret_key` 仅在**自动生成**时写入；若操作者经
@@ -561,7 +570,7 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 |---|---|---|
 | 控制面 CRD 读兼容 + 响应形状 | 全量（策略 2 天然满足） | GPUStack `tests/gateway/*` 单测化为 **CRD fixture 生成器**：录制 `ensure_*` 产物 → Rust 端断言解析/翻译一致（渲染「零失败」为「fixture 基线一致」） |
 | 数据面路由 | `x-higress-llm-model`/path/`pct%` 权重/`/model/proxy` 别名/mirror `/` | e2e 推理直连 + 回放录制 |
-| 鉴权 | `/token-auth`（写回 X-Mse-Consumer/Authorization/cookie，FAIL_OPEN，路由名作用域） | e2e：key/无 key/坏 key/FAIL_OPEN 链路 |
+| 鉴权 | `/token-auth`（写回 X-Mse-Consumer/Authorization/cookie；传输失败默认 403 `ext_auth_unavailable`（fail-closed），`HYGRESS_EXT_AUTH_FAIL_MODE=open` 切旧版 fail-open；路由名作用域） | e2e：key/无 key/坏 key/鉴权服务不可用（closed↔open）链路 |
 | 用量 | `/v2/usage/gateway-metrics`（完整字段、completed=true） | **e2e 断言 usage 行落地：model_route_id 非空 + access_key 归属正确**（不止 200） |
 | model 改写 | 逐目的地 modelMapping（LoRA/改名 provider） | e2e：LoRA 别名路由、provider 改名路由命中正确上游 model |
 | fallback | 4xx/5xx max10、fallback-from 守卫、original-path 备份恢复 | e2e：主动 503 → fallback 生效且 loop 接线正确 |

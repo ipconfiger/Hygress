@@ -157,3 +157,14 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
 | 真机冒烟 ✅ | 镜像 4b8b5401：readyz 200@28s、3×chat 200（走新 drain 路径）、usage_push_dropped=0、无 token /reload→401、server 稳定 | b97-verdict.txt |
 
 诚实边界：逐候选一次 make_mut 深拷保留（候选 map 须与存活 base 分叉——语义必需，为最大残余成本）；provider dial 的 drain 未做（frozen egress 契约取 &outbound + 头读取）；shared-map 无变更候选多 2 个瞬时对（:path/content-type 克隆即弃）——独占常态无影响；read_headers 入站物化未动（非纯阶段）；AM-2 per-candidate 复核依赖 profile 随 PreparedRequest（M14 注记，独立后续）。
+
+### B9.8 — AM-6b overlay 头（提交 3da7dd2；镜像 800ec8a8；远端 b98*.log + b98-verdict.txt）+ 诚实未知收尾
+| 项 | 落地 | 实测（release alloc_guard） |
+|---|---|---|
+| OutboundHeaders overlay | core transform.rs：共享 base + overrides/removed delta；读/meterialize 与 clone-then-mutate 内容一致（golden 等价测试 6）；`HeaderOps` 泛型化 Transformer::apply（outbound keep 共用同一引擎）；build_outbound 只记 delta（O(1) Arc） | build_outbound 1候选 **3865→1071B**（−72%）、+写回 **4019→1417B**（−65%）、3候选 **11595→3213B**（−72%） |
+| dial/materialize 时机 | direct dial 经 overlay into_pairs 单次（base 只在实 dial 候选克隆一次）；provider 分支 dial 前 materialize（全量拷贝仅 provider 实际拨号时付一次，provider 罕见） | overlay drain 1012B/25；provider materialize 1696B/50；独占 drain 仍 672B/1 |
+| 门禁 | 640 tests / clippy 双模式 0 / alloc_guard 双 profile（预算按 AM6b 实测收紧 ×2 左右） | — |
+| 真机冒烟 ✅ | 镜像 800ec8a8：readyz 200@20s、3×chat 200 HYGRESS_B98_OK、usage_push_dropped=0、无 token /reload→401、server 稳定 | b98-verdict.txt |
+| **诚实未知收尾（P1/P2，b98-unknowns-verdict.txt）** | P1 建路由→Hygress 生效：**实测 17s**（≤文档 30s tick 界）——UI/API 建后立即推理可短暂 404 属预期，已量化；P2 默认安装（无 --ssl）:443 = connection refused，监听仅 80/30080/8081/15020——与文档化差异一致 | — |
+
+诚实边界：wire 上 header 名级顺序变为确定性 base→delta（原 HashMap 随机序；HTTP 头序非契约，语义=多重集+同名内序保留）；provider 每次拨号付一次 materialize 深拷（可接受）；HeaderMap::into_pairs 现仅测试/独占 drain 使用（保留 pub）；prepare 的 3018B/91 不变（结构必需）。

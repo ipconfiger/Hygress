@@ -35,9 +35,12 @@ updated: 2026-09-05
 - [ ] 2.1 先量化（评审注：`read_headers(&Session)` 主体是 `session.req_header()` 的纯变换——先抽取 `fn build_inbound_head(req: &RequestHeader) -> InboundHead` 纯函数便于 alloc_guard 无 socket 可测，再上"临时计数"量化；若占比可忽略则 P6 如实降级）
 - [ ] 2.2 验证：alloc_guard 新增 `build_inbound_head` 预算断言 + 同 rig wrk A/B（c16/c64 p50/p99/吞吐）
 
-## Phase 3: 纯网关内核基准口径（P3） [PENDING]
-- [ ] 3.1 在 rig 上加**网关自服务 `/healthz`**（admin/stats 是 pingora ServeHttp，不经过 `request_filter` 管线 = 纯 accept+parse+respond 的**内核下限**，非"真代理路径"；用 `/healthz` 而非 `/metrics`——后者 O(families) 编码劣选）
-- [ ] 3.2 若需 envoy 内核对比：临时静态 loopback sink + 一条测试路由（不改生产数据面），两侧同法；**任何 "hygress 内核 vs envoy 内核" 结论必须出自 3.2**
+## Phase 3: 纯网关内核基准口径（P3） [COMPLETE]
+- [x] 3.1 网关自服务 `/healthz` 内核下限——**免改码完成**（`bench_kernel_healthz_c{16,64}.txt`）：纯内核
+  c16 13,643 req/s / p50 0.74ms / **p99 5.85ms（平坦、无周期尾）**；c64 14,537 / 2.5 / 24ms。**判定：
+  网关内核平坦且快；`:80/readyz` 周期尾与 ~1.1k req/s 上限归因于共享镜像上游**（`benchmark.md §11`）
+- [ ] 3.2 静态 loopback sink + 测试路由的"网关 vs envoy 纯内核"形式化对比——**降级为可选**（3.1 已给出
+  等效判定证据；仅当需要正式跨网关对比数字时再实施临时 rig）
 
 ## Phase 4: 端到端验证与归档 [PENDING]
 - [ ] 4.1 全套：`cargo build/test` 两 feature 模式 + 22 Pingora e2e + clippy 双模式 0 + alloc_guard

@@ -18,6 +18,10 @@ arc-swap = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 base64 = { workspace = true }
+# `futures` is an existing workspace dependency (already used by hygress-egress /
+# hygress-gateway, and transitively required by `kube`); it is needed here to drive the
+# `kube::runtime::watcher` stream (`.next()` via `StreamExt`). Not a new external crate.
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

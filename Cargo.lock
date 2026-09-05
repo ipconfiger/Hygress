@@ -1239,6 +1239,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "base64",
+ "futures",
  "hygress-core",
  "k8s-openapi",
  "kube",

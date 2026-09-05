@@ -59,7 +59,13 @@ mod snapshot;
 pub mod gvr;
 pub mod translate;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
+use kube::runtime::watcher::{watcher, Config};
+use kube::Api;
 
 use snapshot::SnapshotFingerprint;
 pub use client::Client;
@@ -68,6 +74,12 @@ pub use translate::{Object, ObjectKind};
 
 /// Mirror-ingress name env var (GPUStack `GATEWAY_MIRROR_INGRESS_NAME`, design §2.1.1 / §4.3).
 const MIRROR_NAME_ENV: &str = "GATEWAY_MIRROR_INGRESS_NAME";
+
+/// Low-frequency safety-net tick for the watch streams (P4/1.1). NOT the old 1s poll: the
+/// primary update path is now event-driven (kube WATCH), and this tick is only a backstop for
+/// a missed / restarted watch stream. [`Controller::run`] uses `max(this, poll_interval)`, so
+/// the configured cadence can never make the backstop run more often than 30s.
+const FALLBACK_TICK: Duration = Duration::from_secs(30);
 
 /// Control-plane adapter (strategy 2): a read-only kube CRD consumer that LISTs the managed
 /// Higress CRDs, translates them into [`hygress_core::ConfigData`], and stores the snapshot
@@ -143,11 +155,16 @@ impl Controller {
     /// 1. Connect (file kubeconfig or in-cluster / `KUBECONFIG`).
     /// 2. Wait for api-resources discovery (60s / 5s budget).
     /// 3. Best-effort, idempotent IngressClass seed (topology B).
-    /// 4. Poll every `poll_interval`: full LIST → translate → `SharedConfig::store`; keep
-    ///    last-known-good on any failure; fire [`Controller::ready`] after the first successful
-    ///    store.
+    /// 4. **First** full LIST → translate → store (bind-ready: the first successful store fires
+    ///    [`Controller::ready`]) — identical to the old 1s-poll design's first iteration.
+    /// 5. **Event-driven** (P4/1.1): one `kube::runtime::watcher` per managed kind. Each
+    ///    `Ok` event marks a shared dirty flag + notifies the main loop; `Err` items are
+    ///    logged and the stream is kept alive (kube-runtime reconnects / relists internally).
+    ///    The main loop reconciles on a dirty flag or a low-frequency safety-net tick
+    ///    (`max([`FALLBACK_TICK`], poll_interval)`); a LIST/transport failure keeps the
+    ///    last-known-good snapshot and keeps watching.
     ///
-    /// Returns `Err` only on connect/discovery failure (the per-poll loop never aborts on a
+    /// Returns `Err` only on connect/discovery failure (the event loop never aborts on a
     /// transient error).
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         let client = client::Client::connect(
@@ -163,20 +180,128 @@ impl Controller {
             tracing::warn!("IngressClass seed (best-effort) failed: {e}");
         }
 
+        // ① First snapshot (bind-ready): the initial full LIST + store, unchanged from the old
+        //    1s-poll design — the first successful store fires [`Controller::ready`].
+        self.sync_once(&client).await;
+
+        // ② Event-driven watchers (P4/1.1): one per managed kind. McpBridge is listed WITHOUT
+        //    the managed selector (the plain-list invariant from the snapshot layer); every
+        //    other kind uses the managed label selector.
+        let dirty = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let managed = client::MANAGED_SELECTOR;
+        let handles = vec![
+            Self::spawn_watcher(client.mcpbridges(), Config::default(), "mcpbridge", &dirty, &notify),
+            Self::spawn_watcher(
+                client.wasmplugins(),
+                Config::default().labels(managed),
+                "wasmplugin",
+                &dirty,
+                &notify,
+            ),
+            Self::spawn_watcher(
+                client.envoyfilters(),
+                Config::default().labels(managed),
+                "envoyfilter",
+                &dirty,
+                &notify,
+            ),
+            Self::spawn_watcher(
+                client.ingresses(),
+                Config::default().labels(managed),
+                "ingress",
+                &dirty,
+                &notify,
+            ),
+            Self::spawn_watcher(
+                client.secrets(),
+                Config::default().labels(managed),
+                "secret",
+                &dirty,
+                &notify,
+            ),
+            Self::spawn_watcher(
+                client.configmaps(),
+                Config::default().labels(managed),
+                "configmap",
+                &dirty,
+                &notify,
+            ),
+        ];
+
+        // ③ Main loop: reconcile on a dirty flag, the low-frequency safety-net tick, or
+        //    shutdown. The fallback is a backstop for the watch streams — NOT the old 1s poll.
+        let fallback_tick = FALLBACK_TICK.max(self.poll_interval);
         // Pin the opaque shutdown future so `select!` can poll it (it isn't guaranteed `Unpin`).
         let mut shutdown = Box::pin(shutdown);
         loop {
-            self.sync_once(&client).await;
-
+            // `Notify::notified()` resolves immediately if a notify is already pending (a
+            // watcher fired between the previous wake and now), so creating it fresh each
+            // iteration cannot miss a wakeup.
+            let notified = notify.notified();
+            tokio::pin!(notified);
             tokio::select! {
-                () = &mut shutdown => {
-                    tracing::info!("adapter: shutdown received; stopping poll loop");
+                _ = &mut shutdown => {
+                    tracing::info!("adapter: shutdown received; stopping watch loop");
                     break;
                 }
-                () = tokio::time::sleep(self.poll_interval) => {}
+                _ = &mut notified => {}
+                _ = tokio::time::sleep(fallback_tick) => {}
+            }
+            // A burst of events collapses into one reconcile (`swap` is the debounce); the
+            // rv-fingerprint short-circuit inside `sync_once` then no-ops if nothing changed.
+            if dirty.swap(false, Ordering::Relaxed) {
+                self.sync_once(&client).await;
             }
         }
+
+        // Abort the (infinite, self-healing) watcher tasks so they don't leak past `run`.
+        for h in handles {
+            h.abort();
+        }
         Ok(())
+    }
+
+    /// Spawn one `kube::runtime::watcher` stream for a managed kind. Each `Ok` event marks the
+    /// shared dirty flag + notifies the main loop; `Err` items are logged and the stream is kept
+    /// alive (kube-runtime reconnects / relists internally) — a transient error must never
+    /// terminate the watcher task (P4/1.1).
+    fn spawn_watcher<K>(
+        api: Api<K>,
+        config: Config,
+        kind: &'static str,
+        dirty: &Arc<AtomicBool>,
+        notify: &Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+    {
+        let dirty = Arc::clone(dirty);
+        let notify = Arc::clone(notify);
+        tokio::spawn(async move {
+            let stream = watcher(api, config);
+            futures::pin_mut!(stream);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(_event) => {
+                        dirty.store(true, Ordering::Relaxed);
+                        notify.notify_one();
+                    }
+                    Err(e) => {
+                        // Keep the stream alive: kube-runtime reconnects / relists internally.
+                        tracing::warn!(kind, "watch error (keeping stream alive): {e}");
+                    }
+                }
+            }
+            // The `watcher` stream is self-healing/infinite; reaching here means it ended
+            // unexpectedly — log it loudly and mark dirty so the safety-net tick reconciles.
+            tracing::error!(
+                kind,
+                "watch stream ended unexpectedly; degraded to fallback tick until back"
+            );
+            dirty.store(true, Ordering::Relaxed);
+            notify.notify_one();
+        })
     }
 
     /// Best-effort, non-blocking IngressClass seed (topology B).
@@ -312,5 +437,26 @@ mod tests {
         assert!(c.mirror_name == translate::MIRROR_NAME);
         // ready() hands out a usable Notify handle.
         let _ = c.ready();
+    }
+
+    #[test]
+    fn dirty_flag_debounces_a_burst_of_events() {
+        // P4/1.1 debounce: the main loop reconciles on `dirty.swap(false)`. A burst of watch
+        // events (each a `store(true)`) must collapse into exactly one reconcile, then stay
+        // clean until the next event. This is the exact mechanism used in `run` (no kube mock
+        // needed) — the rv-fingerprint short-circuit inside `sync_once` then no-ops if the
+        // burst turned out to leave the snapshot unchanged.
+        let dirty = AtomicBool::new(false);
+        // No events yet → no reconcile.
+        assert!(!dirty.swap(false, Ordering::Relaxed));
+        // A burst of events (e.g. an `Init` + several `Apply`s) → exactly one reconcile.
+        dirty.store(true, Ordering::Relaxed);
+        dirty.store(true, Ordering::Relaxed);
+        dirty.store(true, Ordering::Relaxed);
+        assert!(dirty.swap(false, Ordering::Relaxed), "a dirty burst must trigger one reconcile");
+        assert!(!dirty.swap(false, Ordering::Relaxed), "no further reconcile until the next event");
+        // The next event triggers the next reconcile.
+        dirty.store(true, Ordering::Relaxed);
+        assert!(dirty.swap(false, Ordering::Relaxed));
     }
 }

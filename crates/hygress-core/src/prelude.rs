@@ -31,7 +31,9 @@ pub use crate::route::{
     AuthScope, FallbackLink, PathPred, PathRewriter, RouteKind, RouteRule, RuleSource,
 };
 pub use crate::swrr::{order as swrr_order, SwrrCandidate, SwrrState};
-pub use crate::transform::{HeaderMap, RetainMode, TransformOp, TransformRule, Transformer};
+pub use crate::transform::{
+    HeaderMap, OutboundHeaders, RetainMode, TransformOp, TransformRule, Transformer,
+};
 pub use crate::usage::{
     parse_usage, FlushFields, ModelUsageMetrics, Operation, Usage, UsageSchema, UsageSnapshot,
 };

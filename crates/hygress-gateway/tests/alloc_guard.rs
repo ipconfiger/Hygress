@@ -23,9 +23,13 @@
 //! AM-6 (header materialization, `am6_*` tests): the pure header stages —
 //! `prepare` end-to-end, `build_outbound` (per-candidate deep copy), and the
 //! dial pair materialization (`HeaderMap::into_pairs`, drain vs shared clone).
-//! The ceilings below are intentionally GENEROUS (the coordinator tightens them
-//! after the first real run); each test prints `AM6 measured ...` with the
-//! bytes + allocation count for that pass.
+//! AM-6b replaced the per-candidate clone-then-mutate `HeaderMap` with the lazy
+//! `OutboundHeaders` overlay (`build_outbound` records a delta only; the base
+//! entries are materialized once at the dial drain or the provider-branch
+//! `materialize`). The ceilings below are intentionally GENEROUS (the
+//! coordinator tightens them after the first real run); each test prints
+//! `AM6 measured ...` / `AM6b measured ...` with the bytes + allocation count
+//! for that pass.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -427,8 +431,8 @@ fn am6_prepare_model_route_end_to_end() {
     assert!(p.route.is_model_route);
     assert_eq!(p.base_headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
     assert!(
-        bytes < 8 * KIB as u64,
-        "AM6 prepare allocated {bytes} bytes (measured 3018 @ 9784f04; ceiling < 8 KiB)"
+        bytes < 6 * KIB as u64,
+        "AM6 prepare allocated {bytes} bytes (measured 3018/91; ceiling < 6 KiB)"
     );
 }
 
@@ -457,7 +461,7 @@ fn am6_build_outbound_single_candidate() {
         ));
     });
     eprintln!(
-        "AM6 measured build_outbound 1 candidate (registry, no token swap): {bytes} bytes / {allocs} allocs"
+        "AM6b measured build_outbound 1 candidate (registry, no token swap): {bytes} bytes / {allocs} allocs"
     );
     let out = out.expect("outbound built");
     assert_eq!(
@@ -467,8 +471,8 @@ fn am6_build_outbound_single_candidate() {
     assert_eq!(out.headers.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
     assert_eq!(out.headers.get("content-length"), None, "hop-by-hop stripped");
     assert!(
-        bytes < 8 * KIB as u64,
-        "AM6 build_outbound (1 candidate) allocated {bytes} bytes (measured 3865; ceiling < 8 KiB)"
+        bytes < 2 * KIB as u64,
+        "AM6b build_outbound (1 candidate) allocated {bytes} bytes (AM6b measured 1071/27; ceiling < 2 KiB)"
     );
 }
 
@@ -498,7 +502,7 @@ fn am6_build_outbound_with_ext_auth_writeback() {
         out = Some(pipeline::build_outbound("POST", &p, &c, &wb, &[]));
     });
     eprintln!(
-        "AM6 measured build_outbound 1 candidate + ext-auth write-back: {bytes} bytes / {allocs} allocs"
+        "AM6b measured build_outbound 1 candidate + ext-auth write-back: {bytes} bytes / {allocs} allocs"
     );
     let out = out.expect("outbound built");
     // The write-back REPLACED the client key (exactly one Authorization).
@@ -509,8 +513,8 @@ fn am6_build_outbound_with_ext_auth_writeback() {
     assert_eq!(out.headers.count(hdr::AUTHORIZATION), 1);
     assert_eq!(out.headers.get(hdr::MSE_CONSUMER), Some("ak.gpustack-7"));
     assert!(
-        bytes < 8 * KIB as u64,
-        "AM6 build_outbound + write-back allocated {bytes} bytes (measured 4019; ceiling < 8 KiB)"
+        bytes < 4 * KIB as u64,
+        "AM6b build_outbound + write-back allocated {bytes} bytes (AM6b measured 1417/39; ceiling < 4 KiB)"
     );
 }
 
@@ -542,16 +546,16 @@ fn am6_build_outbound_three_candidates_in_a_row() {
     });
     assert_eq!(built, 3);
     eprintln!(
-        "AM6 measured build_outbound 3 candidates in a row: {bytes} bytes / {allocs} allocs"
+        "AM6b measured build_outbound 3 candidates in a row: {bytes} bytes / {allocs} allocs"
     );
     assert!(
-        bytes < 24 * KIB as u64,
-        "AM6 build_outbound (3 candidates) allocated {bytes} bytes (measured 11595; ceiling < 24 KiB)"
+        bytes < 4 * KIB as u64,
+        "AM6b build_outbound (3 candidates) allocated {bytes} bytes (AM6b measured 3213/81; ceiling < 4 KiB)"
     );
 }
 
 #[test]
-fn am6_dial_pairs_exclusive_and_shared() {
+fn am6_dial_overlay_drain_and_materialize() {
     let _g = TEST_LOCK.lock().unwrap();
     let inbound = realistic_model_route_inbound();
     let (data, table, shared, router) = model_route_env();
@@ -563,8 +567,11 @@ fn am6_dial_pairs_exclusive_and_shared() {
     };
     let p = pipeline::prepare(&inbound, &ctx).expect("fixture routes");
 
-    // Exclusive map (the per-candidate post-make_mut norm): into_pairs MOVES
-    // every header String — the AM-6 direct-dial cost.
+    // AM-6b direct-dial drain: `outbound.headers` is a LAZY OVERLAY over the
+    // (shared) `prepared.base_headers`. `into_pairs` emits the base entries
+    // (cloned exactly once HERE — the AM-6 per-candidate deep copy moved out of
+    // `build_outbound` to this one drain of the actually-dialed candidate) and
+    // moves the candidate's delta strings.
     let out = pipeline::build_outbound(
         "POST",
         &p,
@@ -577,7 +584,7 @@ fn am6_dial_pairs_exclusive_and_shared() {
         pairs = out.headers.into_pairs();
     });
     eprintln!(
-        "AM6 measured dial pairs drain (exclusive map): {bytes} bytes / {allocs} allocs"
+        "AM6b measured dial pairs (overlay over shared base): {bytes} bytes / {allocs} allocs"
     );
     assert!(
         pairs
@@ -586,20 +593,28 @@ fn am6_dial_pairs_exclusive_and_shared() {
     );
     assert!(
         pairs.iter().any(|(n, _)| n == ":path"),
-        "the pseudo header stays in the map; the dial fold drops it"
+        "the pseudo header stays in the overlay; the dial fold drops it"
     );
     assert!(
         pairs.iter().any(|(n, _)| n == "content-type"),
-        "content-type stays in the map; DIAL_SKIP drops it at the fold"
+        "content-type stays in the overlay; DIAL_SKIP drops it at the fold"
+    );
+    assert!(
+        !pairs.iter().any(|(n, _)| n == "content-length"),
+        "content-length was hop-by-hop stripped in build_outbound"
+    );
+    assert!(
+        !pairs.iter().any(|(n, _)| n == "host"),
+        "host was hop-by-hop stripped in build_outbound (re-set from outbound.host)"
     );
     assert!(
         bytes < 2 * KIB as u64,
-        "AM6 dial drain allocated {bytes} bytes (measured 672 / 1 alloc; ceiling < 2 KiB)"
+        "AM6b overlay dial drain allocated {bytes} bytes (AM6b measured 1012/25; ceiling < 2 KiB)"
     );
 
-    // Shared map (a clone keeps the Arc alive — the no-mutation candidate, whose
-    // map IS `prepared.base_headers`): into_pairs deep-clones, byte-identical
-    // to the historical clone-then-dial cost.
+    // AM-6b provider branch: the frozen ProviderClient needs a FULL
+    // CoreHeaderMap — the overlay is materialized once (ONE base deep copy,
+    // paid only when a provider candidate is actually dialed).
     let out2 = pipeline::build_outbound(
         "POST",
         &p,
@@ -607,25 +622,43 @@ fn am6_dial_pairs_exclusive_and_shared() {
         &HeaderMap::new(),
         &[],
     );
-    let OutboundRequest {
-        headers: shared_headers,
-        ..
-    } = out2;
-    let _keep = shared_headers.clone(); // strong count 2 while measuring
-    let mut shared_pairs: Vec<(String, String)> = Vec::new();
-    let (bytes_s, allocs_s) = measure_counted(|| {
-        shared_pairs = shared_headers.into_pairs();
+    let mut map: Option<hygress_core::prelude::HeaderMap> = None;
+    let (bytes_m, allocs_m) = measure_counted(|| {
+        map = Some(out2.headers.materialize());
     });
     eprintln!(
-        "AM6 measured dial pairs clone (shared map): {bytes_s} bytes / {allocs_s} allocs"
+        "AM6b measured provider-branch materialize: {bytes_m} bytes / {allocs_m} allocs"
+    );
+    let map = map.expect("materialized map");
+    assert_eq!(
+        map.get(hdr::MODEL_INSTANCE_OUT),
+        Some("model-1-10.static")
+    );
+    assert_eq!(map.get("content-length"), None, "hop-by-hop stripped");
+    assert_eq!(map.get("host"), None, "hop-by-hop stripped");
+    assert_eq!(map.get(hdr::LLM_MODEL), Some("org1/llama-3-8b"));
+    assert!(
+        bytes_m < 4 * KIB as u64,
+        "AM6b materialize allocated {bytes_m} bytes (AM6b measured 1696/50; ceiling < 4 KiB)"
+    );
+
+    // AM-6 budget kept: the materialized map is EXCLUSIVELY owned, so its drain
+    // (`HeaderMap::into_pairs`) still MOVES every String (the old 672 B / 1
+    // alloc exclusive-drain norm — unchanged semantics for full-map dials).
+    let mut pairs_m: Vec<(String, String)> = Vec::new();
+    let (bytes_x, allocs_x) = measure_counted(|| {
+        pairs_m = map.into_pairs();
+    });
+    eprintln!(
+        "AM6b measured dial pairs (exclusive materialized map drain): {bytes_x} bytes / {allocs_x} allocs"
     );
     assert!(
-        shared_pairs
+        pairs_m
             .iter()
             .any(|(n, v)| n == "x-gpustack-model-instance" && v == "model-1-10.static")
     );
     assert!(
-        bytes_s < 4 * KIB as u64,
-        "AM6 dial clone allocated {bytes_s} bytes (measured 1090; ceiling < 4 KiB)"
+        bytes_x < 2 * KIB as u64,
+        "AM6b exclusive-map drain allocated {bytes_x} bytes (AM-6 measured 672 / 1 alloc; ceiling < 2 KiB)"
     );
 }

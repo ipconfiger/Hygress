@@ -30,7 +30,8 @@
 //! - [`fallback`]          ⑭  `x-higress-fallback-from` match, original-path restore, max-10 guard
 
 use hygress_core::prelude::{
-    provider_bearer, ConfigData, HeaderMap, ProviderToken, RouteMatch, RouteTable,
+    provider_bearer, ConfigData, HeaderMap, OutboundHeaders, ProviderToken, RouteMatch, RouteTable,
+    Transformer,
 };
 
 use crate::context::{
@@ -343,7 +344,14 @@ pub fn build_outbound(
     // replaces any pre-existing value so the client's key can never leak
     // upstream (B4: appending would leave the client `Authorization` visible
     // to the worker).
-    let mut headers = prepared.base_headers.clone();
+    // AM-6b: the candidate's headers are a LAZY OVERLAY over the shared base
+    // (`OutboundHeaders::new` is an O(1) Arc bump — the ~14-entry base payload
+    // is NEVER deep-copied per candidate). The deltas below are recorded in
+    // order and materialized exactly once, at the dial (`into_pairs`) or at the
+    // provider egress boundary (`materialize`). Reads (`get` / `contains`) and
+    // the materialized result are byte-identical to the AM-6 clone-then-mutate
+    // `HeaderMap` for the same operation sequence.
+    let mut headers = OutboundHeaders::new(prepared.base_headers.clone());
     // AM-6: iterate `names()` directly (no `Vec<&str>` collect — `auth_writeback`
     // is only ever borrowed immutably here, so there is no borrow conflict to
     // work around).
@@ -421,16 +429,18 @@ pub fn build_outbound(
     }
 
     // Transformer-outbound: dedupe (keep) the instance / route-name headers the
-    //    egress must not strip.
-    transformer::apply_outbound(&mut headers);
+    //    egress must not strip. AM-6b: runs the CORE rule engine directly over
+    //    the overlay (the core `Transformer::apply` is generic over
+    //    `HeaderOps`); the gateway `transformer::apply_outbound` wrapper —
+    //    `Transformer::outbound().apply(&mut HeaderMap)` — is exactly this for
+    //    a materialized map, so the semantics are identical by construction.
+    Transformer::outbound().apply(&mut headers);
 
     // Strip hop-by-hop / connection-management headers before forwarding.
-    // AM-6: presence-check before each `remove`. `HeaderMap::remove` calls
-    // `make_mut` unconditionally — even for an ABSENT name — so a candidate
-    // whose map carries no hop-by-hop header (and had no other mutation) would
-    // otherwise deep-copy `base_headers` for nothing. With the guard, such a
-    // candidate keeps sharing `base_headers` (O(1)); when a header IS present
-    // the outcome is byte-identical to the unguarded remove.
+    // AM-6b: the overlay records a removal ONLY when the name is present (base
+    // or overlay), so the presence guard keeps an absent-name remove from
+    // allocating a suppression record for nothing; when a header IS present the
+    // outcome is byte-identical to the AM-6 unguarded remove.
     for h in HOP_BY_HOP {
         if headers.contains(h) {
             headers.remove(h);

@@ -619,10 +619,11 @@ impl ProxyHttp for HygressProxy {
                     &auth_writeback,
                     &data.provider_tokens,
                 );
-                // AM-6: `outbound` is moved into `send_outbound` — after the
+                // AM-6b: `outbound` is moved into `send_outbound` — after the
                 // dial nothing reads `outbound` (every match arm below uses
                 // `prepared` / `candidate` / `resp` only), so the direct dial
-                // can consume `outbound.headers` and drain-move its Strings.
+                // can consume the header overlay and drain it (base entries
+                // cloned once at THIS dial, delta strings moved).
                 match self.send_outbound(&prepared, outbound, candidate).await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
@@ -1444,12 +1445,13 @@ impl HygressProxy {
     /// assembled and dialed via the frozen `ProviderClient` (the live D6/§7
     /// ai-proxy key-swap); any other candidate is dialed directly.
     ///
-    /// AM-6: `outbound` arrives **by value** so the direct dial can consume its
-    /// header map (`HeaderMap::into_pairs` — drain-move when the per-candidate
-    /// `make_mut` left the map exclusively owned, deep-clone when it is still
-    /// shared with `prepared.base_headers`). The provider path keeps borrowing
-    /// (`send_provider_outbound` re-reads `outbound.headers` for the key-swap
-    /// extraction + the frozen `inbound_headers` clone).
+    /// AM-6b: `outbound` arrives **by value** so the direct dial can consume its
+    /// header overlay (`OutboundHeaders::into_pairs` — the shared base entries
+    /// are cloned exactly once at this dial, the candidate's delta strings are
+    /// moved; no per-candidate base deep copy happened in `build_outbound`).
+    /// The provider path keeps borrowing (`send_provider_outbound` re-reads
+    /// `outbound.headers` for the key-swap extraction and materializes the full
+    /// map for the frozen `inbound_headers` field).
     async fn send_outbound(
         &self,
         prepared: &PreparedRequest,
@@ -1493,11 +1495,12 @@ impl HygressProxy {
         if let Some(ms) = prepared.override_timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
         }
-        // ORA3-M12 + AM-6: ONE header pass into the builder (the old two
-        // intermediate `Vec`s are gone). [`HeaderMap::into_pairs`] emits owned
-        // `(name, value)` pairs — moved out of the exclusively-owned
-        // per-candidate map (no per-header clone), deep-cloned when the map is
-        // still shared with `base_headers` (identical to the pre-AM-6 dial).
+        // ORA3-M12 + AM-6b: ONE header pass into the builder (the old two
+        // intermediate `Vec`s are gone). [`OutboundHeaders::into_pairs`] emits
+        // owned `(name, value)` pairs over the lazy overlay: the shared base
+        // entries are cloned once here (this dial is where the AM-6
+        // per-candidate deep copy was paid — now only for the candidate
+        // actually dialed) and the candidate's own delta strings are moved.
         // The map values are core `HeaderMap` strings (always UTF-8 — the
         // decode policy in `utf8_header_value` does not apply here);
         // `content-type` is skipped (`DIAL_SKIP` — it is set once, explicitly,
@@ -1586,7 +1589,11 @@ impl HygressProxy {
             destination_service: None,
             // `outbound.headers` already carries the (key-swapped) Authorization +
             // set-instance/route-name + forward-auth write-back; forward them.
-            inbound_headers: outbound.headers.clone(),
+            // AM-6b: the frozen ProviderClient contract needs a FULL
+            // `CoreHeaderMap`, so the lazy overlay is materialized here — the
+            // ONE base deep copy of the overlay path, paid only when a provider
+            // candidate is actually dialed (provider is rare vs registry).
+            inbound_headers: outbound.headers.materialize(),
             // Raw body forwarded separately below (a `None` body = no re-encode).
             body: None,
             query: if prepared.query.is_empty() {
@@ -2333,7 +2340,8 @@ mod tests {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             host: "provider-1.example.com".into(),
-            headers,
+            // AM-6b: OutboundRequest.headers is the lazy overlay over a base map.
+            headers: hygress_core::transform::OutboundHeaders::new(headers),
             body: bytes::Bytes::new(),
             content_type: "application/json".into(),
         }

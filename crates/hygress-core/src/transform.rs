@@ -11,6 +11,9 @@
 //!
 //! [`HeaderMap`] is the header abstraction: keys are stored
 //! lowercased (case-insensitive lookups), values are multi-valued.
+//! [`OutboundHeaders`] (AM-6b) is the lazy per-candidate outbound variant: a
+//! shared base [`HeaderMap`] plus an in-order mutation delta, so candidates
+//! that only add/override/remove a few headers never deep-copy the base.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -116,16 +119,19 @@ impl HeaderMap {
     }
 
     /// AM-6: consume the map into owned `(name, value)` pairs — one pair per
-    /// value, in map iteration order — the dial materialization.
+    /// value, in map iteration order.
     ///
-    /// When this map is the **only** reference (the per-candidate norm:
-    /// `build_outbound`'s O(1) clone plus one `make_mut` leave the [`Arc`]
-    /// exclusive), every `String` is **moved** out — no per-header clone, no
-    /// per-name re-allocation. When clones still share the map (a candidate
-    /// whose mutation set was empty, so the map *is* `prepared.base_headers`),
-    /// the pairs are deep-cloned and the shared map is left untouched —
-    /// byte-identical to the historical clone-then-dial path. Callers must not
-    /// use the map after this call (it is consumed).
+    /// AM-6b: the per-candidate outbound dial no longer drains a per-candidate
+    /// `HeaderMap` (it drains the [`OutboundHeaders`] overlay via
+    /// [`OutboundHeaders::into_pairs`]); this method serves the maps a full
+    /// materialization produced — e.g. [`OutboundHeaders::materialize`] in the
+    /// provider branch — plus standalone `HeaderMap`s. When this map is the
+    /// **only** reference (the `materialize` norm: an O(1) `base` clone plus
+    /// one `make_mut` leave the [`Arc`] exclusive), every `String` is
+    /// **moved** out — no per-header clone, no per-name re-allocation. When
+    /// clones still share the map, the pairs are deep-cloned and the shared map
+    /// is left untouched — byte-identical to the historical clone-then-dial
+    /// path. Callers must not use the map after this call (it is consumed).
     pub fn into_pairs(self) -> Vec<(String, String)> {
         // Total value count (the fold emits one pair per value) so the result
         // Vec never re-grows.
@@ -187,6 +193,322 @@ impl<'a> FromIterator<(&'a str, &'a str)> for HeaderMap {
             m.append(k, v);
         }
         m
+    }
+}
+
+/// The mutation surface the ordered rule engine ([`Transformer::apply`]) needs
+/// — implemented by [`HeaderMap`] (a materialized map) and [`OutboundHeaders`]
+/// (the lazy overlay) so the engine has exactly ONE implementation and the two
+/// can never drift. Hidden: not part of the supported public surface.
+#[doc(hidden)]
+pub trait HeaderOps {
+    /// All current values of `name` (empty when absent).
+    fn header_get_all(&self, name: &str) -> &[String];
+    /// Replace all values of `name` with `value`.
+    fn header_insert(&mut self, name: &str, value: String);
+    /// Append a value (multi-value semantics).
+    fn header_append(&mut self, name: &str, value: String);
+    /// Remove all values of `name`.
+    fn header_remove(&mut self, name: &str);
+}
+
+impl HeaderOps for HeaderMap {
+    fn header_get_all(&self, name: &str) -> &[String] {
+        self.get_all(name)
+    }
+    fn header_insert(&mut self, name: &str, value: String) {
+        self.insert(name, value);
+    }
+    fn header_append(&mut self, name: &str, value: String) {
+        self.append(name, value);
+    }
+    fn header_remove(&mut self, name: &str) {
+        self.remove(name);
+    }
+}
+
+/// AM-6b: a **lazy overlay** over a shared base [`HeaderMap`] (typically
+/// `PreparedRequest.base_headers`), replacing the AM-6 clone-then-mutate
+/// per-candidate copy with an in-order delta: a candidate that only
+/// adds / overrides / removes a handful of headers (the norm: auth write-back,
+/// pre-route instance/route-name headers, hop-by-hop strip, provider key swap)
+/// **never** deep-copies the base entries — the base stays shared and the
+/// deltas are materialized exactly once, at the dial
+/// ([`OutboundHeaders::into_pairs`]) or at the egress-contract boundary
+/// ([`OutboundHeaders::materialize`]).
+///
+/// Semantics are content-identical to running the same operation sequence on a
+/// cloned [`HeaderMap`]: keys are lowercased on write, `insert` replaces,
+/// `append` extends (a first `append` over a base name inherits the base
+/// values), `remove` deletes, and every read (`get` / `get_all` / `count` /
+/// `contains` / `names`) sees the same effective set the materialized map
+/// would. The materialized result of an overlay therefore equals exactly what
+/// today's clone-then-mutate `HeaderMap` yields for the same op sequence.
+///
+/// Layout:
+/// * `overrides` — a name whose final value list the overlay fully owns (first
+///   touched by an `insert` / `append`). A name appears at most once and its
+///   list is never empty.
+/// * `removed` — names deleted from the **base** (removing an overlay-only
+///   name simply leaves `overrides`, recording nothing). `removed` and
+///   `overrides` never overlap.
+#[derive(Clone, Debug, Default)]
+pub struct OutboundHeaders {
+    base: HeaderMap,
+    overrides: Vec<(String, Vec<String>)>,
+    removed: Vec<String>,
+}
+
+impl OutboundHeaders {
+    /// An empty delta over `base`. O(1): `HeaderMap` is an [`Arc`]-backed
+    /// copy-on-write map, so this shares (never copies) the base payload.
+    pub fn new(base: HeaderMap) -> Self {
+        Self {
+            base,
+            overrides: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    /// Replace all values of `name` with `value` — shadows any base entry with
+    /// the same (lowercased) name.
+    pub fn insert(&mut self, name: &str, value: impl Into<String>) {
+        let key = HeaderMap::lookup(name);
+        // A re-add after a remove cancels the removal.
+        if let Some(pos) = self.removed.iter().position(|n| n == key.as_ref()) {
+            self.removed.remove(pos);
+        }
+        if let Some((_, values)) = self
+            .overrides
+            .iter_mut()
+            .find(|(n, _)| n == key.as_ref())
+        {
+            values.clear();
+            values.push(value.into());
+        } else {
+            self.overrides.push((HeaderMap::key(name), vec![value.into()]));
+        }
+    }
+
+    /// Append a value (multi-value semantics). The FIRST `append` over a base
+    /// name inherits the base's current values (a bounded copy of that one
+    /// name's list only — the base entries themselves are never copied);
+    /// `append` over an overlay-owned name extends the overlay list.
+    pub fn append(&mut self, name: &str, value: impl Into<String>) {
+        let key = HeaderMap::lookup(name);
+        if let Some(pos) = self.removed.iter().position(|n| n == key.as_ref()) {
+            self.removed.remove(pos);
+        }
+        if let Some((_, values)) = self
+            .overrides
+            .iter_mut()
+            .find(|(n, _)| n == key.as_ref())
+        {
+            values.push(value.into());
+        } else {
+            let mut values = self.base.get_all(key.as_ref()).to_vec();
+            values.push(value.into());
+            self.overrides.push((HeaderMap::key(name), values));
+        }
+    }
+
+    /// Remove all values of `name` — deletes an overlay entry and suppresses a
+    /// base entry of the same name.
+    pub fn remove(&mut self, name: &str) {
+        let key = HeaderMap::lookup(name);
+        if let Some(pos) = self.overrides.iter().position(|(n, _)| n == key.as_ref()) {
+            self.overrides.remove(pos);
+        }
+        if self.base.contains(key.as_ref()) && !self.removed.iter().any(|n| n == key.as_ref()) {
+            // Only base-present names need a suppression record (an overlay-only
+            // removal already left `overrides` above).
+            self.removed.push(key.into_owned());
+        }
+    }
+
+    /// First value of `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let key = HeaderMap::lookup(name);
+        if let Some((_, values)) = self.overrides.iter().find(|(n, _)| n == key.as_ref()) {
+            return values.first().map(String::as_str);
+        }
+        if self.removed.iter().any(|n| n == key.as_ref()) {
+            return None;
+        }
+        self.base.get(key.as_ref())
+    }
+
+    /// All values of `name` (empty slice when absent).
+    pub fn get_all(&self, name: &str) -> &[String] {
+        let key = HeaderMap::lookup(name);
+        if let Some((_, values)) = self.overrides.iter().find(|(n, _)| n == key.as_ref()) {
+            return values.as_slice();
+        }
+        if self.removed.iter().any(|n| n == key.as_ref()) {
+            return &[];
+        }
+        self.base.get_all(key.as_ref())
+    }
+
+    /// Number of values of `name`.
+    pub fn count(&self, name: &str) -> usize {
+        self.get_all(name).len()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        let key = HeaderMap::lookup(name);
+        if self.overrides.iter().any(|(n, _)| n == key.as_ref()) {
+            return true;
+        }
+        !self.removed.iter().any(|n| n == key.as_ref()) && self.base.contains(key.as_ref())
+    }
+
+    /// All header names present (lowercase form): the base names minus removed /
+    /// shadowed, then the overlay-only names in first-touch order.
+    pub fn names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.base
+            .names()
+            .filter(move |name| {
+                !self.removed.iter().any(|n| n == *name)
+                    && !self.overrides.iter().any(|(n, _)| n == *name)
+            })
+            .chain(
+                self.overrides
+                    .iter()
+                    .filter(move |(n, _)| !self.base.contains(n))
+                    .map(|(n, _)| n.as_str()),
+            )
+    }
+
+    /// AM-6b: the dial materialization — consume the overlay into owned
+    /// `(name, value)` pairs, one pair per value. The base entries are cloned
+    /// once (the base stays shared with `prepared.base_headers` for the whole
+    /// failover loop); the overlay's own strings are **moved**. Order: base
+    /// map order (a shadowed base name is emitted at its base position with the
+    /// overlay's list), then overlay-only names in first-touch order. The pair
+    /// SET and the per-name value order are identical to
+    /// [`HeaderMap::into_pairs`] on the clone-then-mutate result; the
+    /// name-level order is deterministic here (the reference map's order was
+    /// HashMap-hash-dependent and therefore not a stable contract).
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        let OutboundHeaders {
+            base,
+            mut overrides,
+            removed,
+        } = self;
+        // One pass over the base for the exact pair count (the result Vec never
+        // re-grows).
+        let mut pair_count: usize = 0;
+        for (name, base_values) in base.map.iter() {
+            if removed.iter().any(|r| r == name) {
+                continue;
+            }
+            pair_count += match overrides.iter().find(|(n, _)| n == name) {
+                Some((_, values)) => values.len(),
+                None => base_values.len(),
+            };
+        }
+        pair_count += overrides
+            .iter()
+            .filter(|(n, _)| !base.map.contains_key(n))
+            .map(|(_, values)| values.len())
+            .sum::<usize>();
+
+        let mut pairs = Vec::with_capacity(pair_count);
+        for (name, base_values) in base.map.iter() {
+            if removed.iter().any(|r| r == name) {
+                continue;
+            }
+            // A shadowed base name: emit the overlay's list (drain-moved) at the
+            // base key's position; the trailing loop then skips it.
+            if let Some(idx) = overrides.iter().position(|(n, _)| n == name) {
+                let (_, values) = overrides.remove(idx);
+                push_name_value_pairs(&mut pairs, name.clone(), values);
+                continue;
+            }
+            for value in base_values {
+                pairs.push((name.clone(), value.clone()));
+            }
+        }
+        // The survivors are overlay-only names, in first-touch order.
+        for (name, values) in overrides {
+            push_name_value_pairs(&mut pairs, name, values);
+        }
+        pairs
+    }
+
+    /// Materialize the overlay into a full [`HeaderMap`] — the egress-contract
+    /// boundary (the frozen `ProviderClient` needs a real `CoreHeaderMap`).
+    /// This is the ONE base deep copy of the overlay path, paid only when a
+    /// provider candidate is actually dialed: `base.clone()` is an O(1) Arc
+    /// bump and the first mutation below triggers exactly one `make_mut`.
+    /// Content-identical to the AM-6 clone-then-mutate build.
+    pub fn materialize(&self) -> HeaderMap {
+        let mut m = self.base.clone();
+        if !self.removed.is_empty() {
+            for name in &self.removed {
+                if m.contains(name) {
+                    m.remove(name);
+                }
+            }
+        }
+        for (name, values) in &self.overrides {
+            if let Some((first, rest)) = values.split_first() {
+                m.insert(name, first.clone());
+                for v in rest {
+                    m.append(name, v.clone());
+                }
+            }
+        }
+        m
+    }
+}
+
+impl From<HeaderMap> for OutboundHeaders {
+    fn from(base: HeaderMap) -> Self {
+        Self::new(base)
+    }
+}
+
+impl HeaderOps for OutboundHeaders {
+    fn header_get_all(&self, name: &str) -> &[String] {
+        self.get_all(name)
+    }
+    fn header_insert(&mut self, name: &str, value: String) {
+        self.insert(name, value);
+    }
+    fn header_append(&mut self, name: &str, value: String) {
+        self.append(name, value);
+    }
+    fn header_remove(&mut self, name: &str) {
+        self.remove(name);
+    }
+}
+
+/// Semantic equality: two overlays are equal when their materialized maps are.
+impl PartialEq for OutboundHeaders {
+    fn eq(&self, other: &Self) -> bool {
+        self.materialize() == other.materialize()
+    }
+}
+
+impl Eq for OutboundHeaders {}
+
+/// Push `values` into `pairs`, cloning `name` for every value except the LAST
+/// (which moves it) — the [`HeaderMap::into_pairs`] drain pattern.
+fn push_name_value_pairs(
+    pairs: &mut Vec<(String, String)>,
+    name: String,
+    values: Vec<String>,
+) {
+    let total = values.len();
+    let mut iter = values.into_iter();
+    for _ in 0..total.saturating_sub(1) {
+        let value = iter.next().expect("prefix count == values.len() - 1");
+        pairs.push((name.clone(), value));
+    }
+    if let Some(value) = iter.next() {
+        pairs.push((name, value));
     }
 }
 
@@ -337,40 +659,44 @@ impl Transformer {
     }
 
     /// Apply all rules in order to `headers` (in place).
-    pub fn apply(&self, headers: &mut HeaderMap) {
+    ///
+    /// Generic over [`HeaderOps`]: `H` is a [`HeaderMap`] for the materialized
+    /// paths (inbound transform) or an [`OutboundHeaders`] for the lazy
+    /// outbound build (AM-6b) — one rule implementation, no drift possible.
+    pub fn apply<H: HeaderOps>(&self, headers: &mut H) {
         for rule in &self.rules {
             match rule.op {
                 TransformOp::Remove => {
-                    headers.remove(&rule.source);
+                    headers.header_remove(&rule.source);
                 }
                 TransformOp::Rename => {
                     if let Some(dest) = &rule.dest {
-                        let values: Vec<String> = headers.get_all(&rule.source).to_vec();
+                        let values: Vec<String> = headers.header_get_all(&rule.source).to_vec();
                         for v in values {
-                            headers.append(dest, v);
+                            headers.header_append(dest, v);
                         }
-                        headers.remove(&rule.source);
+                        headers.header_remove(&rule.source);
                     }
                 }
                 TransformOp::Dedupe => {
-                    let values = headers.get_all(&rule.source);
+                    let values = headers.header_get_all(&rule.source);
                     if values.len() > 1 {
                         let kept = match rule.mode.unwrap_or(RetainMode::RetainFirst) {
                             RetainMode::RetainFirst => values.first().cloned(),
                             RetainMode::RetainLast => values.last().cloned(),
                         };
                         if let Some(v) = kept {
-                            headers.insert(&rule.source, v);
+                            headers.header_insert(&rule.source, v);
                         } else {
-                            headers.remove(&rule.source);
+                            headers.header_remove(&rule.source);
                         }
                     }
                 }
                 TransformOp::Backup => {
                     if let Some(dest) = &rule.dest {
-                        let values: Vec<String> = headers.get_all(&rule.source).to_vec();
+                        let values: Vec<String> = headers.header_get_all(&rule.source).to_vec();
                         for v in values {
-                            headers.append(dest, v);
+                            headers.header_append(dest, v);
                         }
                     }
                 }
@@ -616,5 +942,148 @@ mod tests {
         .apply(&mut h2);
         assert!(!h2.contains("a"));
         assert!(!h2.contains("b"));
+    }
+
+    // ----- AM-6b: OutboundHeaders (lazy overlay) ≡ clone-then-mutate HeaderMap -----
+
+    /// A realistic base: single-value names + a multi-value `set-cookie` +
+    /// duplicate-cased `x-gpustack-route-name` (the transformer-outbound dedupe
+    /// input) + the mirrored `:path`.
+    fn base_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("Host", "llm.gpustack.local");
+        h.insert("content-type", "application/json");
+        h.insert("Authorization", "Bearer sk-client");
+        h.insert("X-Higress-Llm-Model", "org1/llama-3-8b");
+        h.insert("x-organization-id", "org-42");
+        h.insert("content-length", "128");
+        h.append("set-cookie", "a=1");
+        h.append("SET-COOKIE", "b=2");
+        h.append("x-gpustack-route-name", "r1");
+        h.append("X-GPUStack-Route-Name", "r2");
+        h.insert(":path", "/v1/chat/completions");
+        h
+    }
+
+    /// The op sequence a mutating outbound candidate runs (auth write-back
+    /// replace, ⑨ pre-route inserts, multi-value append, hop-by-hop guard
+    /// removes) — executed through the SAME [`HeaderOps`] surface on both the
+    /// clone-then-mutate [`HeaderMap`] and the [`OutboundHeaders`] overlay.
+    fn golden_outbound_sequence(h: &mut impl HeaderOps) {
+        // ext-auth write-back REPLACES the client credential / adds cookie.
+        h.header_insert("Authorization", "Bearer reg-token".to_string());
+        h.header_insert("Cookie", "session=writeme".to_string());
+        h.header_insert("X-Mse-Consumer", "ak.gpustack-7".to_string());
+        // ⑨ set-instance / route-name.
+        h.header_insert("X-GPUStack-Model-Instance", "model-1-10.static".to_string());
+        h.header_insert(
+            "X-GPUStack-Route-Name",
+            "higress-system/ai-route-route-1.internal".to_string(),
+        );
+        // multi-value append over a base-present name.
+        h.header_append("set-cookie", "c=3".to_string());
+        // hop-by-hop guard removes: present -> deleted, absent -> no-op.
+        h.header_remove("content-length");
+        h.header_remove("connection");
+        // remove-then-reinsert cycle.
+        h.header_remove("x-mse-consumer");
+        h.header_insert("X-Mse-Consumer", "ak.gpustack-7".to_string());
+        h.header_remove("x-organization-id");
+    }
+
+    #[test]
+    fn outbound_overlay_matches_clone_then_mutate_golden() {
+        let mut reference = base_headers();
+        golden_outbound_sequence(&mut reference);
+        let mut overlay = OutboundHeaders::new(base_headers());
+        golden_outbound_sequence(&mut overlay);
+        // The materialized overlay equals the clone-then-mutate HeaderMap.
+        assert_eq!(overlay.materialize(), reference);
+        // Reads over the overlay equal reads over the reference map.
+        assert_eq!(overlay.get("authorization"), reference.get("authorization"));
+        assert_eq!(overlay.get("cookie"), reference.get("cookie"));
+        assert_eq!(
+            overlay.get("x-gpustack-model-instance"),
+            reference.get("x-gpustack-model-instance")
+        );
+        assert_eq!(overlay.count("set-cookie"), reference.count("set-cookie"));
+        assert_eq!(overlay.get_all("set-cookie"), reference.get_all("set-cookie"));
+        assert_eq!(
+            overlay.get("x-organization-id"),
+            reference.get("x-organization-id")
+        );
+        assert!(!overlay.contains("content-length"));
+        assert_eq!(overlay.count("x-mse-consumer"), reference.count("x-mse-consumer"));
+        assert_eq!(
+            overlay.contains("x-mse-consumer"),
+            reference.contains("x-mse-consumer")
+        );
+        assert_eq!(
+            overlay.get("content-length"),
+            reference.get("content-length")
+        );
+    }
+
+    #[test]
+    fn outbound_overlay_into_pairs_matches_materialized_drain() {
+        let mut reference = base_headers();
+        golden_outbound_sequence(&mut reference);
+        let mut overlay = OutboundHeaders::new(base_headers());
+        golden_outbound_sequence(&mut overlay);
+
+        let mut pairs_overlay = overlay.clone().into_pairs();
+        let mut pairs_reference = reference.into_pairs();
+        // Pair SET + per-name value order are the contract; name-level order is
+        // not (the reference drained a HashMap).
+        pairs_overlay.sort();
+        pairs_reference.sort();
+        assert_eq!(pairs_overlay, pairs_reference);
+        assert!(
+            !pairs_overlay.iter().any(|(n, _)| n == "content-length"),
+            "content-length was removed and must not be drained: {pairs_overlay:?}"
+        );
+    }
+
+    #[test]
+    fn outbound_overlay_reads_are_case_insensitive() {
+        let mut o = OutboundHeaders::new(base_headers());
+        // Base reads with any casing.
+        assert_eq!(o.get("AUTHORIZATION"), Some("Bearer sk-client"));
+        assert_eq!(o.count("Set-Cookie"), 2);
+        // Overlay insert shadows the base under any casing, read under any.
+        o.insert("AUTHORIZATION", "Bearer swapped");
+        assert_eq!(o.get("authorization"), Some("Bearer swapped"));
+        assert_eq!(o.count("AUTHORIZATION"), 1);
+        o.remove("Authorization");
+        assert_eq!(o.get("authorization"), None);
+        assert!(!o.contains("AUTHORIZATION"));
+        assert_eq!(o.count("authorization"), 0);
+    }
+
+    #[test]
+    fn outbound_overlay_transformer_apply_matches_header_map() {
+        // The outbound keep rule set over the overlay (the build_outbound path)
+        // dedupes the base-carried duplicate route-name exactly as over a map.
+        let mut reference = base_headers();
+        Transformer::outbound().apply(&mut reference);
+        let mut overlay = OutboundHeaders::new(base_headers());
+        Transformer::outbound().apply(&mut overlay);
+        assert_eq!(overlay.materialize(), reference);
+        // The dedupe actually happened (retained first).
+        assert_eq!(overlay.count("x-gpustack-route-name"), 1);
+        assert_eq!(overlay.get("x-gpustack-route-name"), Some("r1"));
+    }
+
+    #[test]
+    fn outbound_overlay_equality_is_semantic_not_structural() {
+        // Identical content reached by different base/delta splits compares
+        // equal (materialized equality), the property PartialEq is defined on.
+        let mut a = OutboundHeaders::new(base_headers());
+        golden_outbound_sequence(&mut a);
+        let mut b = OutboundHeaders::new(base_headers());
+        golden_outbound_sequence(&mut b);
+        assert_eq!(a, b);
+        b.remove("cookie");
+        assert_ne!(a, b);
     }
 }

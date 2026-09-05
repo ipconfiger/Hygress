@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use hygress_core::prelude::MatchKind;
-use hygress_core::transform::HeaderMap;
+use hygress_core::transform::{HeaderMap, OutboundHeaders};
 
 /// Wire-header names (contract-pin §3.1). Centralized so the stages and the
 /// egress/pipeline modules reference a single source of truth.
@@ -175,7 +175,14 @@ pub struct OutboundRequest {
     pub host: String,
     /// Outbound headers (already carry the set-instance / route-name / auth
     /// write-back; do NOT include hop-by-hop).
-    pub headers: HeaderMap,
+    ///
+    /// AM-6b: a **lazy overlay** over `PreparedRequest.base_headers` (see
+    /// [`hygress_core::transform::OutboundHeaders`]) — the candidate's header
+    /// delta only, so `build_outbound` never deep-copies the base. The base is
+    /// materialized exactly once: drained into pairs at the direct dial
+    /// (`OutboundHeaders::into_pairs`) or into a full map for the provider
+    /// branch (`OutboundHeaders::materialize`).
+    pub headers: OutboundHeaders,
     /// The (possibly model-mapper-rewritten) body.
     pub body: Bytes,
     /// Content-type forwarded to the upstream.

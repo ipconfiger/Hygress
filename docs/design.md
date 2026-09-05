@@ -242,7 +242,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 │  ┌──────────────────────────────── HYC ────────────────────────────────────┐ │  │
 │  │  Hygress 二进制（s6 服务: hygress, 依赖 GPUSTACK_API_PORT 就绪）         │ │  │
 │  │  ┌─ 控制面适配器 gateway-adapter ─────────────────────────────────────┐  │ │  │
-│  │  │ kube-rs 启动全量 LIST(managed=true) → 快照 → WATCH 事件/30s tick   │  │ │  │
+│  │  │ kube-rs 启动全量 LIST(managed=true) → 快照 → WATCH 事件/~1s poll 收敛   │  │ │  │
 │  │  │ → Ingress/McpBridge/WasmPlugin/EnvoyFilter/ConfigMap/Secret       │  │ │  │
 │  │  │ → 路由表快照 ArcSwap<ConfigData>（无本地持久化）                    │  │ │  │
 │  │  └───────────────────────────────────────────────────────────────────┘  │ │  │
@@ -268,7 +268,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 分层职责：
 - **控制面适配层（`gateway-adapter`）**：唯一与 k8s/apiserver 打交道的模块。启动 api-resources
   discovery → 全量 LIST（label selector `gpustack.ai/managed=true`）建初始快照 → 后续收敛由 WATCH 事件
-  （拓扑 B/external）或 **30s 兜底 tick**（拓扑 A：GPUStack 内嵌 apiserver 不支持 WATCH，tick-only 收敛）
+  （拓扑 B/external）或 **~1s 轮询收敛**（拓扑 A：GPUStack 内嵌 apiserver 不支持 WATCH → poll 收敛，`POLL_INTERVAL` 默认 1000ms，与真实 Higress pilot 1s 轮询平价）
   驱动；每次唤醒全量重译（rv 指纹幂等短路）→ `ConfigStore::reload_all()`。**纯只读消费者，不实现 k8s
   API**（策略 2）；无本地写库。
 - **路由引擎（route engine）**：Ingress 注解 → 路由规则，McpBridge registry 解析，SWRR 目标组 + 动态
@@ -286,7 +286,7 @@ Hydra 已被宣称生产就绪（评估 9.2/10：11,056 RPS、p99 4.39ms、65 Mi
 - 启动序列：`wait_for_apiserver_ready`（GET `/api`，60s 内 5s 重试）→ 逐资源 discovery
   (McpBridge/WasmPlugin/Ingress/EnvoyFilter/IngressClass) → 全量 LIST（label selector）建初始快照 →
   **首快照完成后才绑定数据面 80/443**（避免 GPUStack 300×2s 就绪窗口被慢同步耗尽而在 10 分钟才判定
-  失败）→ 进入收敛循环：WATCH 事件驱动（拓扑 B/external）或 **30s 兜底 tick**（拓扑 A：embedded
+  失败）→ 进入收敛循环：WATCH 事件驱动（拓扑 B/external）或 **~1s 轮询收敛**（拓扑 A：embedded
   apiserver 不支持 WATCH）→ 全量重译 + rv 指纹幂等短路 → swap。
 - **只读消费，不实现写路径**。策略 1 假 apiserver 时才有写接口（§5.4）。CPU 上无「所有 CRUD 返回
   成功」语义，那属于策略 1。
@@ -487,7 +487,7 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 ## 8. 数据模型与持久化
 
 **策略 2（MVP）下不新增本地持久化**：CRD（file-storage apiserver）= 持久真相源；GPUStack 是唯一写者，
-孤儿清理由其自身完成。Hygress 启动 L0 = 全量 LIST → 快照；运行时 = WATCH（拓扑 B）/30s 兜底 tick
+孤儿清理由其自身完成。Hygress 启动 L0 = 全量 LIST → 快照；运行时 = WATCH（拓扑 B）/~1s poll 收敛（拓扑 A）
 （拓扑 A）触发全量重译 → ArcSwap swap；重启 = 重 LIST。无迁移、无发散、无恢复逻辑。
 
 仅**策略 1（假 apiserver，全量替换后期）**启用本地 SQLite（沿用 Hydra sqlx）+ 新表 `k8s_object`
@@ -602,8 +602,8 @@ struct Registry { id, kind: Static|Dns|Proxy|Tunnel, domain, port, proxy_ref }
 
 | 阶段 | 内容 | 依赖 | 估算（人周） |
 |---|---|---|---|
-| L0 | 控制面适配器：kube-rs 启动全量 LIST → 快照 → WATCH/30s tick 收敛 → ArcSwap swap；label selector/孤儿容忍；**(拓扑 B) IngressClass 播种**；Response-shape/就绪时序（首快照后绑端口） | D4 | 1–2 |
-| L0-2 | **路由引擎（核心）**：RouteRule 数据模型（含 model_mapping）、header+path 匹配、registry(static/dns/proxy/tunnel) 解析、SWRR 目标组、动态实例刷新（WATCH/30s tick 收敛）、mirror 直连、rewrite/别名 | L0 | 3–4 |
+| L0 | 控制面适配器：kube-rs 启动全量 LIST → 快照 → WATCH/~1s poll 收敛 → ArcSwap swap；label selector/孤儿容忍；**(拓扑 B) IngressClass 播种**；Response-shape/就绪时序（首快照后绑端口） | D4 | 1–2 |
+| L0-2 | **路由引擎（核心）**：RouteRule 数据模型（含 model_mapping）、header+path 匹配、registry(static/dns/proxy/tunnel) 解析、SWRR 目标组、动态实例刷新（WATCH/~1s poll 收敛）、mirror 直连、rewrite/别名 | L0 | 3–4 |
 | L1 | forward-auth(/token-auth, 路由名作用域, cookie 写回)、`GpustackSink`(HMAC jwt key 解析、完整字段、completed)、model-router 等价(multipart/别名/body 改写/maxBodyBytes) | L0-2 | 1–1.5 |
 | L2 | transformer 规则、fallback(含空目标特例)、ai-proxy v1(OpenAI 子集+优雅透传)、worker-proxy 寻址、TLS Secret→SNI、model-mapper 逐目的地 | L1 | **4–6**（=deep-dive 逐项之和，不再乐观压缩） |
 | L3 | 可观测性：15020(env 端口) /stats/prometheus 浅兼容 + envoy 指标名映射；Grafana 重画（可选） | L2 | ~1 |

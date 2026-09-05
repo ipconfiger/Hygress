@@ -17,8 +17,8 @@
 //!    gateway token (design §9), build the [`forward_auth::Client`] + [`GpustackSink`] (loopback;
 //!    the sink's `on_drop` counts usage drops on `/metrics` — ORA3-M4).
 //! 3. Control-plane [`hygress_adapter::Controller`]: build (with the ORA3-MAJ-1 metrics hooks),
-//!    optional topology-B IngressClass seed, spawn the controller loop (watch-driven, 30s
-//!    safety-net tick), and **await `ready()`** (first snapshot — bind-ready).
+//!    optional topology-B IngressClass seed, spawn the controller loop (watch-driven, ~1s
+//!    poll-based convergence backstop), and **await `ready()`** (first snapshot — bind-ready).
 //! 4. Attach the terminate-mode [`HygressProxy`] data plane (+ TLS when the snapshot has material),
 //!    **only after** `ready()`. admin/stats listeners ride the same Pingora [`Server`].
 //!
@@ -593,19 +593,20 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             guardrail_clients: Arc::new(dashmap::DashMap::new()),
         });
 
-        // 3b. Design §2.1 / D-7: the mtime poll task on the gateway's 30s
-        //     dutycycle (the same cadence as the adapter's 30s safety-net
-        //     tick). A changed `policy.yaml` swaps the live `ArcSwap` on the
-        //     next tick; the admin `POST /reload` forces it. Also performs
-        //     periodic eviction of idle quota counters and rate-limit buckets
-        //     (BLOCK-2: leak prevention).
+        // 3b. Design §2.1 / D-7: the policy-mtime poll + idle-eviction dutycycle
+        //     on a 30s cadence (policy reload is not hot-path — the admin
+        //     `POST /reload` forces an immediate swap; the 30s cadence is
+        //     unrelated to the adapter's ~1s control-plane poll). A changed
+        //     `policy.yaml` swaps the live `ArcSwap` on the next tick; also
+        //     performs periodic eviction of idle quota counters and rate-limit
+        //     buckets (BLOCK-2: leak prevention).
         let policy_poll = ds.policy.clone();
         let quota_evict = gateway_state.quota.clone();
         let ratelimit_evict = gateway_state.ratelimit_buckets.clone();
         tokio::spawn(async move {
-            // R-8: run the dutycycle on a 30s cadence (the old 1s full-table
-            // evict scans competed with the data plane for no benefit — the
-            // idle threshold is 5 minutes).
+            // R-8: policy/quota-eviction dutycycle on a 30s cadence (the old 1s
+            // full-table evict scans competed with the data plane for no benefit
+            // — the idle threshold is 5 minutes).
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.tick().await; // the first tick is immediate
                                    // Idle threshold: 5 minutes (hardcoded; not currently
@@ -615,7 +616,7 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
                 interval.tick().await;
                 // L10: the policy poll does synchronous fs metadata + (on a
                 // change) a YAML parse — run the sync work on the blocking
-                // pool so the 30s tick never blocks a runtime worker.
+                // pool so the 30s cadence never blocks a runtime worker.
                 let owner = policy_poll.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || owner.poll()).await {
                     debug!(error = %e, "policy poll task failed");
@@ -650,7 +651,8 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         // 4. Control plane: build the Controller (gating the topology-B
         //    IngressClass seed on `config.topology_b` — the seed runs once
         //    inside `Controller::run`, AM-1) and run the controller loop as a
-        //    task (watch-driven; 30s safety-net tick; stopped on
+        //    task (watch-driven; poll-based convergence at `poll_interval`
+        //    (default 1s) for degraded/embedded operation; stopped on
         //    shutdown_signal()).
         //
         //    ORA3-MAJ-1: wire the adapter's observability hooks to the gateway
@@ -699,13 +701,13 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         // ORA3-MAJ-1: log the effective convergence mode once at bind-ready
         // (best-effort: a first permanent watcher error can only surface after
         // this point — the adapter then logs "convergence degraded to
-        // tick-only (embedded apiserver)" once and the metric counts it).
+        // poll-based (embedded apiserver)" once and the metric counts it).
         info!(
             topology_b = config.topology_b,
             convergence_mode = if config.topology_b {
                 "watch-driven (topology B: external apiserver serves watch resource-versions)"
             } else {
-                "tick-driven (topology A / embedded: apiserver serves no watch resource-versions; ~30s safety-net tick)"
+                "poll-driven (topology A / embedded: apiserver serves no watch resource-versions; ~1s poll cadence, POLL_INTERVAL)"
             },
             "controller ready: first snapshot stored; binding data plane"
         );

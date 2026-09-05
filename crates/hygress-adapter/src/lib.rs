@@ -84,11 +84,18 @@ pub use translate::{Object, ObjectKind};
 /// Mirror-ingress name env var (GPUStack `GATEWAY_MIRROR_INGRESS_NAME`, design §2.1.1 / §4.3).
 const MIRROR_NAME_ENV: &str = "GATEWAY_MIRROR_INGRESS_NAME";
 
-/// Low-frequency safety-net tick for the watch streams (P4/1.1). NOT the old 1s poll: the
-/// primary update path is now event-driven (kube WATCH), and this tick is only a backstop for
-/// a missed / restarted watch stream. [`Controller::run`] uses `max(this, poll_interval)`, so
-/// the configured cadence can never make the backstop run more often than 30s.
-const FALLBACK_TICK: Duration = Duration::from_secs(30);
+/// Convergence poll cadence (P4/1.1). The primary fast path is event-driven
+/// (kube WATCH); this tick is the **convergence backstop** and — on the embedded
+/// GPUStack apiserver, where WATCH is permanently unavailable
+/// (`NoResourceVersion`) — the **only** propagation path for route/model
+/// changes. The cadence is `max(poll_interval, this floor)`: the default
+/// `POLL_INTERVAL=1000ms` therefore converges in ~1s, matching the cadence of
+/// the real embedded-Higress pilot (a ~1s LIST poll) that this gateway replaces.
+/// The rv-fingerprint short-circuit inside [`Controller::run`] → `sync_once`
+/// keeps a steady-state wake a no-op store, and watcher-error logs are
+/// rate-limited separately — so the tighter cadence adds LIST traffic, not log
+/// or store churn.
+const CONVERGE_MIN_TICK: Duration = Duration::from_secs(1);
 
 /// ORA3-MAJ-1: optional observability hooks the controller invokes so the
 /// gateway can expose control-plane health on `/metrics` (the adapter itself
@@ -100,7 +107,7 @@ pub struct ControllerHooks {
     /// Called `(kind, class)` on **every** classified watcher error — `kind`
     /// is the watched resource kind (`configmap`/`ingress`/`secret`/…),
     /// `class` is `"permanent"` (watch unsupported by the apiserver →
-    /// convergence degraded to the safety-net tick) or `"transient"`
+    /// convergence degraded to the ~1s poll tick) or `"transient"`
     /// (recoverable watch failure). Invoked regardless of log-rate limiting.
     pub on_watch_error: Option<Arc<dyn Fn(&'static str, &'static str) + Send + Sync>>,
     /// Called after **every** successful store of a new snapshot (the store
@@ -141,9 +148,11 @@ impl Controller {
     /// `shared` is the gateway's config holder (the adapter stores snapshots into it);
     /// `kubeconfig` is the embedded file kubeconfig path (`None` → in-cluster / `KUBECONFIG`);
     /// `ingress_class` is the IngressClass name to probe/seed (topology B); `poll_interval`
-    /// is the floor for the safety-net reconcile tick — [`Controller::run`] reconciles
-    /// **event-driven** on watch changes with a `max(30s, poll_interval)` backstop (a 1s config
-    /// value therefore still yields the 30s tick); `seed_ingress_class` gates the single
+    /// is the cadence of the poll-based convergence — [`Controller::run`] reconciles
+    /// **event-driven** on watch changes with a `max(poll_interval, 1s)` tick as the backstop /
+    /// degraded-mode propagation path (default `POLL_INTERVAL=1000ms` → ~1s convergence on the
+    /// embedded apiserver where WATCH is unavailable, matching the real Higress pilot cadence;
+    /// a shorter config value is floored to 1s); `seed_ingress_class` gates the single
     /// IngressClass seed inside [`Controller::run`] (AM-1) — set it for topology B /
     /// external, leave it `false` for topology A (embedded apiserver, zero writes);
     /// `hooks` carries the optional ORA3-MAJ-1 observability callbacks.
@@ -211,9 +220,13 @@ impl Controller {
     /// 5. **Event-driven** (P4/1.1): one `kube::runtime::watcher` per managed kind. Each
     ///    `Ok` event marks a shared dirty flag + notifies the main loop; `Err` items are
     ///    logged and the stream is kept alive (kube-runtime reconnects / relists internally).
-    ///    The main loop reconciles on a dirty flag or a low-frequency safety-net tick
-    ///    (`max([`FALLBACK_TICK`], poll_interval)`); a LIST/transport failure keeps the
-    ///    last-known-good snapshot and keeps watching.
+    ///    The main loop reconciles on a dirty flag or the convergence poll tick
+    ///    (`max([`CONVERGE_MIN_TICK`], poll_interval)` — default ~1s); a LIST/transport
+    ///    failure keeps the last-known-good snapshot and keeps polling.
+    ///
+    ///    On the embedded GPUStack apiserver (topology A) every watch is permanently
+    ///    unsupported, so this poll tick **is** the route/model propagation path — at the
+    ///    default 1s cadence it matches the real embedded-Higress pilot's ~1s LIST poll.
     ///
     /// Returns `Err` only on connect/discovery failure (the event loop never aborts on a
     /// transient error).
@@ -295,9 +308,10 @@ impl Controller {
             ),
         ];
 
-        // ③ Main loop: reconcile on a dirty flag, the low-frequency safety-net tick, or
-        //    shutdown. The fallback is a backstop for the watch streams — NOT the old 1s poll.
-        let fallback_tick = FALLBACK_TICK.max(self.poll_interval);
+        // ③ Main loop: reconcile on a dirty flag, the convergence poll tick, or shutdown.
+        // On the embedded apiserver (WATCH permanently unavailable) this tick is the
+        // route/model propagation path — default ~1s (see [`CONVERGE_MIN_TICK`]).
+        let poll_tick = self.poll_interval.max(CONVERGE_MIN_TICK);
         // Pin the opaque shutdown future so `select!` can poll it (it isn't guaranteed `Unpin`).
         let mut shutdown = Box::pin(shutdown);
         loop {
@@ -312,10 +326,10 @@ impl Controller {
                     break;
                 }
                 _ = &mut notified => {}
-                _ = tokio::time::sleep(fallback_tick) => {}
+                _ = tokio::time::sleep(poll_tick) => {}
             }
             // R-2: reconcile on EVERY wake (event burst debounced by `dirty`, or the
-            // low-frequency safety-net tick). The rv-fingerprint short-circuit inside
+            // convergence poll tick). The rv-fingerprint short-circuit inside
             // `sync_once` no-ops on a genuinely unchanged snapshot, and a rejected /
             // failed LIST is retried by the next wake (the old fingerprint is kept on
             // failure, so the same snapshot is re-attempted rather than skipped forever).
@@ -335,8 +349,8 @@ impl Controller {
     /// through the ORA3-MAJ-1 `hooks.on_watch_error` callback, and the loop backs off before
     /// polling again (kube-runtime does no backoff itself — see the inline comment). A
     /// transient error must never terminate the watcher task (P4/1.1); a permanently-unsupported
-    /// watch (`NoResourceVersion`, embedded apiserver) retries slowly and the 30s fallback tick
-    /// in [`Controller::run`] remains the convergence backstop.
+    /// watch (`NoResourceVersion`, embedded apiserver) retries slowly and the poll tick in
+    /// [`Controller::run`] remains the convergence path.
     fn spawn_watcher<K>(
         api: Api<K>,
         config: Config,
@@ -359,8 +373,8 @@ impl Controller {
             //  - `NoResourceVersion`: the embedded GPUStack apiserver serves LISTs without
             //    a resourceVersion, so WATCH is permanently unsupported for this kind —
             //    retry slowly (the event stream can only ever work if the apiserver
-            //    starts serving rv), never hot-loop. The 30s fallback tick in `run()`
-            //    already reconciles, so this watcher is best-effort only.
+            //    starts serving rv), never hot-loop. The poll tick in `run()` (~1s by
+            //    default) already reconciles, so this watcher is best-effort only.
             //  - other (transient: network / 5xx / restart races): retry briskly but not
             //    at line rate; cap so a persistently failing watch stays quiet.
             const PERMANENT_RETRY: Duration = Duration::from_secs(60);
@@ -407,15 +421,15 @@ impl Controller {
                             );
                             last_log = std::time::Instant::now();
                             // ORA3-MAJ-1: a permanently-unsupported watch means this kind
-                            // can only ever converge through the safety-net tick — say so
+                            // can only ever converge through the poll tick — say so
                             // once, loudly (the metric carries the ongoing count).
                             if permanent && !degraded_logged {
                                 degraded_logged = true;
                                 tracing::info!(
                                     kind,
-                                    "convergence degraded to tick-only (embedded apiserver): \
+                                    "convergence degraded to poll-based (embedded apiserver): \
                                      {kind} watch unsupported; snapshot refreshes ride the \
-                                     30s safety-net tick"
+                                     ~1s poll tick (POLL_INTERVAL)"
                                 );
                             }
                         }
@@ -431,10 +445,10 @@ impl Controller {
                 }
             }
             // The `watcher` stream is self-healing/infinite; reaching here means it ended
-            // unexpectedly — log it loudly and mark dirty so the safety-net tick reconciles.
+            // unexpectedly — log it loudly and mark dirty so the poll tick reconciles.
             tracing::error!(
                 kind,
-                "watch stream ended unexpectedly; degraded to fallback tick until back"
+                "watch stream ended unexpectedly; degraded to poll-based convergence until back"
             );
             dirty.store(true, Ordering::Relaxed);
             notify.notify_one();

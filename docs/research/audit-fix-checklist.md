@@ -145,3 +145,15 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
   （无 token /reload→401 fail-closed 复原）。
 - 清理复原：mock provider/route 删除、ssemock 停止、compose 还原（token 移除）、末次 chat OK + readyz=200。
 - b96.log "A-usage=0" 为脚本引号转义假象（原始 /tmp/A.sse 含 usage chunk）——记录在 verdict 以免误读。
+
+### B9.7 — AM-6 头物化专项批（提交 2bfbc20；镜像 4b8b5401；远端 /root/hygress-b3/b97*.log + b97-verdict.txt）
+| 项 | 落地 | 证据 |
+|---|---|---|
+| alloc_guard 计量先行 | `measure_counted`（bytes+alloc 事件数）+ 5 个 `am6_*` 测试覆盖 prepare / build_outbound(1候选/写回/3候选) / dial 物化 | 见下实测 |
+| HeaderMap::into_pairs | core transform.rs:129 新增消费式导出：独占(Arc::try_unwrap)→**移动**键值 0 额外 String 分配；共享→深拷（与历史一致） | 语义/derive/公共面不变（additive） |
+| direct dial drain | `send_outbound` 按值收 `OutboundRequest`（headers 在 dial 后确证无消费者）；单趟 fold 跳过 ':'/DIAL_SKIP，host/content-type/body 移动不拷贝；删除两个中间 Vec | 行为：同集合同相对顺序、':path' 永不外发 |
+| 拷贝次数收敛 | prepare_inner 已恰一次 make_mut（注释固化）；HOP_BY_HOP 改 contains 守卫（无变更候选保持共享 base 免空深拷）；去掉多余 Vec<&str> collect | build_outbound 单测语义不变 |
+| **实测（release alloc_guard）** | prepare 3018B/91；build_outbound 1候选 3865B/66、+写回 4019B/77、3候选 11595B/198；**dial drain(独占) 672B/1 alloc**（原 ~1.9-2.2KiB/~30 → 削减 ~70%）；共享路径 1090B/29 | 预算已收紧（×2 余量）双 profile 复跑 11/11 |
+| 真机冒烟 ✅ | 镜像 4b8b5401：readyz 200@28s、3×chat 200（走新 drain 路径）、usage_push_dropped=0、无 token /reload→401、server 稳定 | b97-verdict.txt |
+
+诚实边界：逐候选一次 make_mut 深拷保留（候选 map 须与存活 base 分叉——语义必需，为最大残余成本）；provider dial 的 drain 未做（frozen egress 契约取 &outbound + 头读取）；shared-map 无变更候选多 2 个瞬时对（:path/content-type 克隆即弃）——独占常态无影响；read_headers 入站物化未动（非纯阶段）；AM-2 per-candidate 复核依赖 profile 随 PreparedRequest（M14 注记，独立后续）。

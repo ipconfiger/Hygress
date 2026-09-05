@@ -35,7 +35,7 @@
 | R-13 对齐 | README env 表/launcher export 一致；测试数更新；MSRV≥1.89；未用依赖删除；日志重定向文档化 | ✅ |
 | B3 门禁 | 全仓测试+clippy 双模式 | ✅ |
 
-## B4 — 全量门禁  [✅ 538 tests / clippy 双模式 0 / alloc_guard 6/6，2026-09]
+## B4 — 全量门禁 [✅ 538 tests / clippy all-targets 双模式 0 / alloc_guard 6/6]
 
 | 项 | 状态 |
 |---|---|
@@ -44,7 +44,7 @@
 | `cargo test -p hygress-gateway --test alloc_guard -- --test-threads=1` | ⏳ |
 | `cargo test -p hygress-gateway --test integration`（22 项 e2e） | ⏳ |
 
-## B5 — 真机矩阵（待凭据；见状态行）
+## B5 — 真机矩阵 [⏸ 未执行：本沙箱 darwin/arm64 无法产出 linux ELF（zig/aws-lc 汇编、远端无 rust、registry 受限）；真机已回滚恢复。执行套件见 audit-fix-report.md §3]
 > 状态：⏳ 等待用户提供 GPUStack 测试机连接（历史 frp TEST_HOST:33006 未建立；本机 ssh/docker 可用）。若不可达 → ⏸ 未执行 + 交付可执行套件。
 
 > 凭据按需提供；若不可达 → ⏸ 未执行 + 交付可执行套件。

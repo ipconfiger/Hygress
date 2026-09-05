@@ -168,3 +168,10 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
 | **诚实未知收尾（P1/P2，b98-unknowns-verdict.txt）** | P1 建路由→Hygress 生效：**实测 17s**（≤文档 30s tick 界）——UI/API 建后立即推理可短暂 404 属预期，已量化；P2 默认安装（无 --ssl）:443 = connection refused，监听仅 80/30080/8081/15020——与文档化差异一致 | — |
 
 诚实边界：wire 上 header 名级顺序变为确定性 base→delta（原 HashMap 随机序；HTTP 头序非契约，语义=多重集+同名内序保留）；provider 每次拨号付一次 materialize 深拷（可接受）；HeaderMap::into_pairs 现仅测试/独占 drain 使用（保留 pub）；prepare 的 3018B/91 不变（结构必需）。
+
+### B9.9 — P1 控制面收敛修复（提交 8c183fe；镜像 bc3eb452；远端 b99*.log + b99-verdict.txt）
+| 项 | 落地 | 真机实测 |
+|---|---|---|
+| 收敛节奏 30s tick → ~1s poll | adapter `CONVERGE_MIN_TICK`=1s，tick=`max(poll_interval,1s)`（POLL_INTERVAL env 默认 1000ms 可调）；指纹短路保稳态零 store；watch 事件仍为健康态快路径；策略 mtime 30s dutycycle 独立保留（非热路径） | **P1 建路由→生效 17s → 2s**（对齐真实 Higress pilot 1s LIST 轮询平价） |
+| 文案同步 | 启动收敛模式日志/注释/README/design/equivalence 拓扑 A 表述改 ~1s poll（audit/checklist 历史记录保留原样） | 60s 日志增量 +1690B（仅 watch 限速行；1s 轮询静默） |
+| 门禁 | 640 tests / clippy 双模式 0 | chat 基线 200 HYGRESS_B99_OK；store_total 按变更推进 |

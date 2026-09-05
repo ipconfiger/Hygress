@@ -74,4 +74,10 @@
 | ↳ AM-3 断流不派发 | ✅ 半关闭 → HTTP 400 + Connection: close；metrics `short_circuit status=400` 0→1；无新 usage 行（未派发） |
 | ↳ AM-5 短路计数 | ✅ `requests_total{kind="short_circuit"}` 401×1/403×1/429×2（+400×1）；auth_decisions denied=1；guardrail in=1；rate_limit consumer=2 |
 | ↳ 基线回归 | ✅ readyz=200@2s、hygress×1/envoy·pilot×0、端口 80/30080/8081/15020/18443、chat 200 `HYGRESS_B7_OK` 34/5、限流 200/429/429、护栏 403、复位 200；回滚点 `gpustack:hygress-b5`(e6eb3458)/`hygress-pre`(3b6beabc) |
+
+## B7b — 遗留观察项处理（2026-09-05）
+| 项 | 结论 | 状态 |
+|---|---|---|
+| 观察项 1：AM-2 SSE-chunk 真机判别 | 根因：该机后端为 GPUStack 测试用**手写最小 OpenAI 兼容服务器**（`serve.py`，llama-cpp-python CPU），`_chat` 忽略 `stream` 字段、恒非流式单块返回——非流式是**测试替身特性**，与 Hygress 无关；真实 llama-box/vLLM 才流式。SSE-chunk 判别证据由集成层 35 e2e 承担（假上游断言收到注入体）；如需真机强判别须流式后端（llama-box/vLLM）环境 | ✅（文档固化，无需改代码或 serve.py） |
+| 观察项 2：embedded apiserver WATCH 刷屏 | 根因：embedded apiserver LIST 无 resourceVersion → 6 类 watcher 均 `NoResourceVersion`，kube-runtime 无自退避 → 热循环（实测 ~2000 行/s、日志 17.6GB）。修复：`spawn_watcher` Err 分支**分类退避**（永久错误 60s / 瞬时 5s）+ **30s 日志限速**（adapter lib.rs）；收敛仍由 30s 安全网 tick 保证（R-2，每唤醒无条件 sync_once + 指纹短路） | ✅（587 tests / clippy 双模式 0；待真机验证日志降噪，见 equivalence §A3 注） |
 > 凭据按需提供；若不可达 → ⏸ 未执行 + 交付可执行套件。

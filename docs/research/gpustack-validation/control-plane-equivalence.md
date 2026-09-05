@@ -58,7 +58,7 @@ GPUStack 控制器实际写入的 CRD 种类：Ingress（model/fallback/mirror �
 
 | 维度 | Higress（pilot/xDS） | Hygress（WATCH 快照） | 判定 |
 |---|---|---|---|
-| 配置下发 | MCP-over-xDS `xds://127.0.0.1:15051` + k8s → Envoy LDS/RDS/CDS/EDS/SDS，增量推送（亚秒） | 6 类 WATCH（`kube-runtime` watcher，reconnect/relist 内建）→ 去抖 → 一次全量 LIST+translate+ArcSwap store；rv 指纹幂等短路（rv==0 加固）；30s 安全网 tick | **EQUIVALENT-WITHIN-SCOPE**：变更收敛 ≤1 事件周期（亚秒级 vs xDS 毫秒级，同量级）；无事件时 30s 兜底（实例缩扩容等 k8s 事件必然触发 WATCH，不依赖兜底） |
+| 配置下发 | MCP-over-xDS `xds://127.0.0.1:15051` + k8s → Envoy LDS/RDS/CDS/EDS/SDS，增量推送（亚秒） | 6 类 WATCH（`kube-runtime` watcher，reconnect/relist 内建）→ 去抖 → 一次全量 LIST+translate+ArcSwap store；rv 指纹幂等短路（rv==0 加固）；30s 安全网 tick | **EQUIVALENT-WITHIN-SCOPE**：变更收敛 ≤1 事件周期（亚秒级 vs xDS 毫秒级，同量级）；无事件时 30s 兜底（实例缩扩容等 k8s 事件必然触发 WATCH，不依赖兜底）。⚠️ 实测注：GPUStack **embedded apiserver 不提供 resourceVersion**（LIST 结果无 rv），6 类 WATCH 均报 `NoResourceVersion` 而不可用 → 实际收敛路径是 **30s 安全网 tick**（每唤醒无条件 sync_once，指纹短路）。watcher 错误已加 60s 退避 + 30s 日志限速（2026-09-05），避免热循环刷屏（此前 ~2000 行/s、17.6GB 日志）；事件驱动仅在 external 拓扑（apiserver 支持 WATCH）时生效 |
 | 实例 join/scale/delete | EDS 增量 | McpBridge registries 变更 → WATCH 事件 → SWRR 池重建 | EQUIVALENT-WITHIN-SCOPE（全量重建 vs 增量——namespace 规模下 O(对象数) 可忽略；未基准测实例扩缩收敛延迟，🟢 注） |
 | 配置校验失败 | NACK（per-object，`proxy-status` 可见） | per-object skip+warn / 结构性整快照拒绝 keep-last-good（lib.rs:395） | **EQUIVALENT-WITHIN-SCOPE**（语义同向；可见性差异见 §B-C4） |
 | 启动门控 | envoy 先起、配置后到（空配置期） | **fail-fast**：首快照成功才绑 :80（300s 窗口，bootstrap.rs） | 行为差异（有意）：hygress 不出现"无配置裸奔窗口"；代价是 apiserver 未就绪则网关不就绪 |

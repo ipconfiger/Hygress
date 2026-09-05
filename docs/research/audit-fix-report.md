@@ -73,4 +73,6 @@
 - connect 超时判别测试以"悬挂上游+reqwest .timeout()"等价实现（同一 `e.is_timeout()` 路径），未单独构造 OS 级 connect timeout。
 - 文档漂移批内 `pack/hygress-s6/README.md` 与 `ROLLBACK.md` 位于 pack/ 下但按文档处理（任务边界注明）；带日期过程记录用 era 注澄清而非篡改档案。
 - MINOR 批个别 warn/恒定时间"时序均匀性"无法在无 tracing-test 依赖下单测断言（语义已钉扎）。
-- 观察项（非本批引入、已记录）：embedded apiserver 对 mcpbridge/envoyfilter/ingress/secret/configmap 等 kind 的 WATCH 持续报 "no metadata.resourceVersion"（09-05 03:10 旧日志即有，7615 万条累积）——事件驱动降级为 30s fallback tick 兜底（R-2 设计内），watch 错误日志量本身偏大，可作为后续可运维优化（降噪/退避）候选。
+- 观察项处理（2026-09-05，提交见 git log）：
+  1. **embedded apiserver WATCH 刷屏已修复**：根因=embedded apiserver LIST 无 resourceVersion → 6 类 watcher 报 `NoResourceVersion` 且 kube-runtime 无自退避 → 热循环（实测 ~2000 行/s，hygress.log 17.6GB）。`adapter/src/lib.rs` `spawn_watcher` Err 分支现做分类退避（永久错误 60s / 瞬时 5s）+ 30s 日志限速；收敛仍由 30s 安全网 tick（R-2）保证。equivalence §A3 同步修正"6 类 WATCH 可用"的旧表述（embedded 下实际退化为 tick）。
+  2. **AM-2 SSE-chunk 真机判别环境限制已固化**：该机后端是 GPUStack 测试用手写最小 OpenAI 兼容服务器（serve.py，忽略 stream 字段恒非流式），非流式是测试替身特性；强判别需 llama-box/vLLM 流式后端环境。

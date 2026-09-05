@@ -285,9 +285,11 @@ impl Controller {
     }
 
     /// Spawn one `kube::runtime::watcher` stream for a managed kind. Each `Ok` event marks the
-    /// shared dirty flag + notifies the main loop; `Err` items are logged and the stream is kept
-    /// alive (kube-runtime reconnects / relists internally) — a transient error must never
-    /// terminate the watcher task (P4/1.1).
+    /// shared dirty flag + notifies the main loop; `Err` items are rate-limit-logged and the
+    /// loop backs off before polling again (kube-runtime does no backoff itself — see the
+    /// inline comment). A transient error must never terminate the watcher task (P4/1.1); a
+    /// permanently-unsupported watch (`NoResourceVersion`, embedded apiserver) retries slowly
+    /// and the 30s fallback tick in [`Controller::run`] remains the convergence backstop.
     fn spawn_watcher<K>(
         api: Api<K>,
         config: Config,
@@ -303,6 +305,22 @@ impl Controller {
         tokio::spawn(async move {
             let stream = watcher(api, config);
             futures::pin_mut!(stream);
+            // Backoff for watcher errors. kube-runtime makes NO recovery backoff of its
+            // own: errors surface on every poll and the loop below would retry
+            // immediately. Two regimes:
+            //  - `NoResourceVersion`: the embedded GPUStack apiserver serves LISTs without
+            //    a resourceVersion, so WATCH is permanently unsupported for this kind —
+            //    retry slowly (the event stream can only ever work if the apiserver
+            //    starts serving rv), never hot-loop. The 30s fallback tick in `run()`
+            //    already reconciles, so this watcher is best-effort only.
+            //  - other (transient: network / 5xx / restart races): retry briskly but not
+            //    at line rate; cap so a persistently failing watch stays quiet.
+            const PERMANENT_RETRY: Duration = Duration::from_secs(60);
+            const TRANSIENT_RETRY: Duration = Duration::from_secs(5);
+            // Log-rate limit: a permanently-failing watch must not flood the log (real
+            // box: ~2000 lines/s from 6 kinds once every few ms).
+            const LOG_INTERVAL: Duration = Duration::from_secs(30);
+            let mut last_log = std::time::Instant::now() - LOG_INTERVAL;
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(_event) => {
@@ -310,8 +328,36 @@ impl Controller {
                         notify.notify_one();
                     }
                     Err(e) => {
-                        // Keep the stream alive: kube-runtime reconnects / relists internally.
-                        tracing::warn!(kind, "watch error (keeping stream alive): {e}");
+                        let permanent =
+                            matches!(e, kube::runtime::watcher::Error::NoResourceVersion);
+                        // Rate-limited warn (first occurrence of a burst is logged, then
+                        // at most one line per LOG_INTERVAL per kind).
+                        if last_log.elapsed() >= LOG_INTERVAL {
+                            tracing::warn!(
+                                kind,
+                                permanent,
+                                "watch error ({}): {e}; backoff {}s",
+                                if permanent {
+                                    "watch unsupported by apiserver"
+                                } else {
+                                    "keeping stream alive"
+                                },
+                                if permanent {
+                                    PERMANENT_RETRY.as_secs()
+                                } else {
+                                    TRANSIENT_RETRY.as_secs()
+                                }
+                            );
+                            last_log = std::time::Instant::now();
+                        }
+                        // Pause before polling again: kube-runtime recovers on the next
+                        // poll, so sleeping here IS the backoff (watcher docs).
+                        tokio::time::sleep(if permanent {
+                            PERMANENT_RETRY
+                        } else {
+                            TRANSIENT_RETRY
+                        })
+                        .await;
                     }
                 }
             }

@@ -120,3 +120,28 @@
 - watcher 节律：70s 日志增量 +1690B（≈6 行，对比修复前 ~2000 行/s）——退避+限速持续成立。
 - ORA3-M2 `/reload` 运行时探测：SKIP——容器未设 HYGRESS_ADMIN_TOKEN，fail-closed 下 /reload 按设计拒绝；
   缺文件保 LKG 返回 false 的 500 行为由单测 + 35 e2e 覆盖（本机无法免 token 触发）。
+
+### B9.6 — 扩容轮结构批 ORA3-M10..M15 + 真机补验（提交 beaf83c；镜像 75802cca；远端 /root/hygress-b3/{b96*.log,b96-verdict.txt}）
+| id | 修复 | 验证 |
+|---|---|---|
+| ORA3-M10 | 字节/multipart 工具跨 crate 三份复制收敛为 `hygress-core::bytes`（find_subseq/replace_bytes/contains_form_field/first_form_value_span）；两个 multipart 扫描器合并为一个定位器，body.rs/model_mapping.rs/usage.rs 变薄包装 | ✅ 单测 8（含等价性/畸形 part 跳过） |
+| ORA3-M11 | 重复顶层 JSON 扫描器合一为 `top_level_members` 无 DOM 成员迭代器（深度上限 128、serde 精确语法），scan_top_level_value/scan_top_level_stream 建于其上 | ✅ 单测 3（双扫描器与 profile 一致性/畸形拒绝一致） |
+| ORA3-M14 | 三次体扫→一次：`scan_top_level_profile` 融合(model 值+span, stream, has_stream_options, 收尾花括号)；prepare 驱动 resolve_fused/R-5 恒等与改写；AM-2 保持逐候选字节精确（注释说明 profile 已就绪待 PreparedRequest 承载）；不预注入 prepared.body（保 quota/request_content_bytes 不变式） | ✅ 单测 5（fused==legacy、字节精确、显式 stream_options 不被改写） |
+| ORA3-M12 | 出站头构建统一 `copy_headers_excluding` + `utf8_header_value`（非 UTF-8 一律 drop+warn，不静默不 lossy）；响应方向单一 `RESPONSE_STRIP`，请求方向用 pipeline::HOP_BY_HOP；四处拷贝点统一 | ✅ 单测 3（含 HOP_BY_HOP 漂移守卫） |
+| ORA3-M13 | 撤"frozen"说法：GatewayError 增 `BodyReadAborted`(400/slug)，`BodyTooLarge` 成为唯一 413 产出源；模块私有 BodyReadFailure 删除，截断→400+close 不派发语义字节保持 | ✅ error.rs 单测 3 + 既有截断 e2e |
+| ORA3-M15 | 响应侧 usage 仅在 `prepared.usage.is_some()`（mirror 无）且 content-type 含 json/event-stream 时 feed（文本/octet/缺省跳过 DOM）；SSE/JSON 模型路由路径不变 | ✅ 单测 1 + 既有 usage e2e 全绿 |
+
+门禁（beaf83c 后）：**630 tests** / clippy 双模式 0 / Cargo.lock 未动。主控修复：bytes 测试双借用、
+HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→收集 Vec 折叠、multipart "file" 断言纠错。
+
+### B9.6 真机验证 ✅（镜像 75802cca，rollback gpustack:hygress-b95）
+- readyz=200@~14s；基线 chat 200 HYGRESS_B96_OK；MAJ-1 控制面指标活体；usage_push_dropped=0；fallback_exhausted=0。
+- **AM-2 真实流式引擎判别（关闭 ora-3/ora-4 诚实未知）**：GPUStack OpenAI Provider 路由（custom base_url=
+  host mock SSE 服务器 18080，经 /v2/model-providers + /v2/model-routes 全 API 创建）→ 真机证明
+  case A 裸 stream=true → 上游实收 include_usage=true（注入生效）→ 客户端 5 行 SSE + usage chunk + [DONE]；
+  case B 显式 include_usage=false → 上游实收 false → 无 usage chunk。判据基于上游实收日志 + 原始 SSE 抓包。
+- **ORA3-M2 /reload 运行时探测（关闭单测外欠账）**：compose 注入 HYGRESS_ADMIN_TOKEN 后实测
+  缺文件→500（诚实文案）、有效文件→200、/config 无泄露、错 token→401；随后移除 token 恢复默认
+  （无 token /reload→401 fail-closed 复原）。
+- 清理复原：mock provider/route 删除、ssemock 停止、compose 还原（token 移除）、末次 chat OK + readyz=200。
+- b96.log "A-usage=0" 为脚本引号转义假象（原始 /tmp/A.sse 含 usage chunk）——记录在 verdict 以免误读。

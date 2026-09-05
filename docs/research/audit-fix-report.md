@@ -104,3 +104,14 @@
 - 集成维三项诚实未知维持：AM-2 真实流式引擎判别、拓扑 A ≤30s 收敛对 UI create→infer 流敏感度、默认安装 :443。
 - 并行实施期间 5 个代理按文件属主严格分工；跨代理契约（GpustackSink::new 尾参 on_drop、metrics 记录方法名）
   在主控侧预置/钉死，合并后统一编译验证。
+
+## 9. B9.6 — 扩容轮结构批 + 真机补验（提交 beaf83c，镜像 75802cca）
+- 实施：ORA3-M10（bytes 工具收敛）、M11（JSON 成员迭代器合一）、M12（头拷贝/非 UTF-8 策略统一）、
+  M13（错误体系读侧变体 + 撤 frozen）、M14（一次 prepare 扫描复用）、M15（mirror/非 JSON 跳过 usage feed）。
+- 门禁：630 tests / clippy 双模式 0 / Cargo.lock 未动；主控修复 5 处编译/断言问题后全绿。
+- 真机（/root/hygress-b3/b96*.log + b96-verdict.txt）：基线/指标/管理接口全绿；
+  **AM-2 真实流式引擎判别关闭**（GPUStack OpenAI Provider → mock SSE：裸 stream 注入生效含 usage chunk、
+  显式 false 不覆盖）；**/reload 运行时探测关闭**（注入 token：缺文件 500/有效 200/错 token 401，已复原默认）。
+- 诚实边界：b96.sh 中 A-usage grep 引号转义假象（原始抓包含 usage chunk，verdict 已注明）；结构批的
+  once-per-request AM-2 完全形态依赖 profile 随 PreparedRequest 传递（context.rs），本批以注释+幂等测试锚定，
+  未跨结构改管道——如需可作下一独立小批。

@@ -2,7 +2,7 @@
 
 > 结论速览
 > 1. 最终同 rig wrk 对比（同一 GPUStack 主机、同 wrk、同 `:80/readyz`，顺序 hygress→higress→hygress）中，hygress 吞吐 c16 +4.8%、c64 +20.3%，p50 −7.8%/−12.0%、p99 −5.3%/−20.6%（证据 `bench_final_*.txt`，构建 `3b6beabc` vs `55ecc762`）。
-> 2. 不含上游时网关自身可达 13.6k req/s，p99 稳定在 6ms、无周期尖峰（`§11` 自服务 healthz 判定器）。`:80/readyz` 的 ~1.1k req/s 与周期性 p99 尾部归因于共享镜像上游而非网关内核，两侧在镜像路径上呈现同样的周期性尾部。
+> 2. 不含上游时网关自身可达 13.6k req/s，p99 稳定在 6ms、无周期尖峰（`§11` 自服务 healthz 判定器）。`:80/readyz` 的 ~1.1k req/s 与周期性延迟尖峰归因于共享镜像上游而非网关内核，两侧走镜像路径时表现相同。
 > 3. 数据面 1 进程 / ~108MB RSS vs envoy 套件 4 进程 / ~2.54GB（≈23×）；镜像内网关二进制 27MB vs ~905MB（≈34×）。
 > 4. 单二进制原位替换（零 Python 改动、s6 一键回滚）、9 插件等价原生 Rust 管线、控制面 WATCH 事件化热更（稳态零 LIST）、限流/配额/路由策略/护栏真机验证通过。
 
@@ -31,8 +31,8 @@
 | Transfer/run | ~4.4 MB | ~7.7 MB | envoy 响应体更大（见口径说明） |
 
 - hygress 全部四项主指标（吞吐/p50/p99）**均优于原生 envoy**；c64 优势（+20.3%）大于 c16（+4.8%），与并发提高后单请求 CPU 与连接开销占比上升一致（P2 多线程 + P1 keep-alive 的收益随并发放大）。
-- c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之后的尾部样本贡献（两侧 p99 相近、hygress 极端尾样本更重）；主判据（吞吐/p50/p99）均优。
-- 两侧在 `:80/readyz` 上都有周期性 ~300-500ms p99 尾部，归因见 §1.2（非网关内核所致）。
+- c16 avg 一项 hygress 偏高（31.75 vs 28.23）：由 p99 之外的高延迟样本贡献（两侧 p99 相近、hygress 的极端高延迟样本更重）；主判据（吞吐/p50/p99）均优。
+- 两侧在 `:80/readyz` 上都有周期性 ~300-500ms 的延迟尖峰，归因见 §1.2（非网关内核所致）。
 
 ### 1.2 网关内核下限（`:8081/healthz` 自服务端点，无上游，Phase 3.1）
 
@@ -43,7 +43,7 @@
 | c16 p99（30s + 重复×3） | **6.07 ms（重复 5.6-6.9，无周期峰）** | 385.8 ms（周期性尖峰） |
 | c64 吞吐 / p50 / p99 | 14,537 / 2.49 / 24.4 ms | 916.1 / 51.8 / 421.5 ms |
 
-判定：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）延迟分布稳定、无周期峰，快 ~12×，p99 个位数毫秒。`:80/readyz` 的吞吐天花板（~1.1k）与周期性尾部**归因于共享镜像上游**（GPUStack worker 的 `/readyz` 往返与抖动）；envoy 侧同路径同样呈现尾部（407/530ms），两侧表现一致。§8→§10 期间逐项消除 P1（连接churn）、P2（单线程）、P4（控制面轮询）等网关侧开销后，`:80/readyz` 的 p99 只随上游波动。
+判定：网关内核（pingora accept+parse+respond，不经过 request_filter 管线/路由/上游）延迟分布稳定、无周期峰，快 ~12×，p99 个位数毫秒。`:80/readyz` 的吞吐天花板（~1.1k）与周期性延迟尖峰**归因于共享镜像上游**（GPUStack worker 的 `/readyz` 往返与抖动）；envoy 侧同路径同样呈现此尖峰（407/530ms），两侧表现一致。§8→§10 期间逐项消除 P1（连接churn）、P2（单线程）、P4（控制面轮询）等网关侧开销后，`:80/readyz` 的 p99 只随上游波动。
 诚实说明：admin 端点当前仍为 close-delimited 响应（`read errors ≈ 全量`，P1 nitpick #1），即 13.6k req/s 是在每请求 TCP 拆建的不利条件下测得的内核下限，只会低估；如需 keep-alive 口径属一行 CL 修复（非热路径、可选）。跨网关“纯内核对纯内核”的正式对比（envoy admin 端点等效测量）留作 Phase 3.2 可选待办。
 
 ### 1.3 优化全程曲线（同 rig wrk，`:80/readyz`）
@@ -55,12 +55,12 @@
 | **5df02f2**（B1-B4 零拷贝，§7） | 1099.3 | 13.4 / 390 | 834.4 | 56.6 / 548 | ≈全量 | 热路径零拷贝（大 body/SSE 受益，readyz 轻路径持平） |
 | **815ebd3**（P1/P2/P5，§8） | 1091.7 | — / 388 | **898.3** | 53.1 / 539 | **0** | 响应 framing（keep-alive 真实生效）+ 数据面 16 线程 |
 | **493dc21**（P4 指纹短路，§9） | **1152.3** | 13.0 / **299** | **968.3** | 51.3 / **403** | 0 | 控制 1s 全量 LIST+重建消除 → p99 −23/−25% |
-| **cf4f6c5**（Phase 1.1 WATCH，§10） | 1119-1143 | 12.6 / 388-481 | 824 | 50.0 / 577 | 0 | 控制面稳态零 LIST；尾部未变平 → 与控制面轮询无关 |
-| **fc25a87**（§11 内核下限） | **13,598.67**（p50 0.74ms / p99 6.1ms 无周期峰） | — | 14,537（c64） | — | （admin close-delimited） | 据此判定：尾部来自共享上游 |
+| **cf4f6c5**（Phase 1.1 WATCH，§10） | 1119-1143 | 12.6 / 388-481 | 824 | 50.0 / 577 | 0 | 控制面稳态零 LIST；延迟尖峰仍在 → 与控制面轮询无关 |
+| **fc25a87**（§11 内核下限） | **13,598.67**（p50 0.74ms / p99 6.1ms 无周期峰） | — | 14,537（c64） | — | （admin close-delimited） | 据此判定：延迟尖峰来自共享上游 |
 | **最终 A/B（本报告，`3b6beabc`）** | **1127.4** | **12.73 / 385.78** | **916.1** | **51.8 / 421.5** | 0 | 对 envoy：+4.8%/+20.3%，p50/p99 全优 |
 | 原生 envoy（同 rig） | 1075.3 | 13.8 / 407.2 | 761.7 | 58.9 / 530.6 | 0 | — |
 
-P1 根治 read-errors（close-delimited framing 根因，pingora `init_close_delimited` 实证）；P2 消除单 worker 串行化（c64 +7.7%）；P4 消除控制面周期重建尖峰（p99 −23/−25%）；WATCH 后尾部未变平；§11 测得内核无周期峰，周期尾最终归因共享上游（非网关）；同 rig 下 hygress 全指标 ≥ envoy。
+P1 根治 read-errors（close-delimited framing 根因，pingora `init_close_delimited` 实证）；P2 消除单 worker 串行化（c64 +7.7%）；P4 消除控制面周期重建尖峰（p99 −23/−25%）；WATCH 后延迟尖峰仍在；§11 测得内核无周期峰，延迟尖峰最终归因共享上游（非网关）；同 rig 下 hygress 全指标 ≥ envoy。
 
 ### 1.4 e2e 推理（`/v1/chat/completions`，GPU 受限，纯参考）
 
@@ -80,7 +80,7 @@ GPU/模型实例决定推理时长，网关增量（ms 级）不可从此分离�
 | 数据面进程数 | **1**（单二进制 hygress；supercronic 除外，两侧同） | **4**（envoy 1.83GB + pilot-agent 0.51GB + pilot-discovery 85MB + higress 87MB ≈ **2.54GB**） | 4 → 1 |
 | 网关 RSS | **~108 MB**（VmRSS 111,152 kB） | ~2.54 GB | **≈23×** |
 
-诚实更新：早期报告（benchmark.md §1，P2 多线程之前）实测 hygress RSS ≈22MB；当前 ~108MB 的增长来自 P2 的数据面多线程（threads=vCPU=16，3 个 pingora service + 控制面 runtime，实测 `ps -eLf` ≈68 线程/进程）与 WATCH 任务。以 ~16× 线程换取 c64 +20% 吞吐与尾延迟改善，属有意权衡；**即便如此仍 ≈23× 低于 envoy 套件**。早期 server 容器级口径（§1：794MiB vs 2.514GiB，净省 ≈1.7GB/68%）未在最终轮重测，引用时注意其为 P2 前数据。
+诚实更新：早期报告（benchmark.md §1，P2 多线程之前）实测 hygress RSS ≈22MB；当前 ~108MB 的增长来自 P2 的数据面多线程（threads=vCPU=16，3 个 pingora service + 控制面 runtime，实测 `ps -eLf` ≈68 线程/进程）与 WATCH 任务。以 ~16× 线程换取 c64 +20% 吞吐与延迟改善，属有意权衡；**即便如此仍 ≈23× 低于 envoy 套件**。早期 server 容器级口径（§1：794MiB vs 2.514GiB，净省 ≈1.7GB/68%）未在最终轮重测，引用时注意其为 P2 前数据。
 
 ### 2.2 镜像与容器
 
@@ -123,7 +123,7 @@ GPU/模型实例决定推理时长，网关增量（ms 级）不可从此分离�
 3. 无 Wasm 扩展机制：第三方以 Wasm/Go 扩展网关的方式不可用；扩展须走 hygress 原生管线 + policy.yaml（v1 边界见 extensions-design §10.2：响应侧 `mode: buffer` 未实现、路由级 `limits.ip` 覆盖不生效、async LLM 护栏为旁路记录）。
 4. 单集群单机聚焦：面向 GPUStack 内嵌单 apiserver 命名空间（只读 CRD）；无多集群/多命名空间联邦。
 5. admin/stats 端点 close-delimited（P1 nitpick #1，§11 实测 read-errors=全量）：`ServeHttp` 响应未带 CL/chunked framing，非数据面热路径（仅 8081/15020 管理面），一行 CL 修复可选；不影响 `:80` 数据面（P1 后 keep-alive 实测 0 错误）。
-6. `:80/readyz` 的周期尾部来自上游（非网关）：§11 测得内核无周期峰（p99 6.1ms），envoy 同路径也有同样的尾部（407/530ms），两者都归因于共享 GPUStack worker；该尾部不在 hygress 可修复范围。
+6. `:80/readyz` 的周期性延迟尖峰来自上游（非网关）：§11 测得内核无周期峰（p99 6.1ms），envoy 同路径也有同样的尖峰（407/530ms），两者都归因于共享 GPUStack worker；这类尖峰不在 hygress 可修复范围。
 7. 跨网关纯内核对比未完成：envoy 无等效 admin 基准被测（Phase 3.2 静态 sink 可选待办）。当前内核结论（13.6k req/s、p99 6ms 无周期峰）仅 hygress 单侧；跨网关内核对比留待需要时补测。
 8. e2e 采样噪声：GPU 受限路径单次采样（首采样 2.60s 冷态）不构成网关判据（§3 口径）。
 9. RSS 增长：~22MB → ~108MB（threads=16 + WATCH），仍 ≈23× 优于 envoy 套件（§2.1）；如需常驻内存最小化可调 `threads`，但以 c64 吞吐为代价（§8 实证 +7.7% 来自多线程）。

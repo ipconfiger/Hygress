@@ -156,7 +156,7 @@ Intel Xeon Platinum 8380 ×16vCPU，Ubuntu 24.04.4，58GiB RAM，docker），**�
   网关内核）。
 - **周期性 p99 尾部仍在**（c16 ~388 / c64 ~539ms）：ora-2 预判与 P1 连接 churn 无关、头号嫌疑为
   **P4**（adapter 每 1s 全量 kube LIST → 路由表重建 → ArcSwap store，无 resourceVersion 短路）——
-  本表数据佐证该方向（P1 未消尾），其次候选 P6（`read_headers` 每请求 String 克隆）。
+  本表数据佐证该方向（P1 未消除此尖峰），其次候选 P6（`read_headers` 每请求 String 克隆）。
 - 证据：`fixtures-hygress/bench_after3_wrk_c{16,64}.txt`、`after3_image.txt`（提交随本报告）。
 
 ## 9. P4 快照短路后重测（wrk，2026-09-05）：p99 尾部 −23-25%、吞吐继续上台阶

@@ -171,7 +171,7 @@ pub struct OutboundRequest {
     pub method: String,
     /// The (possibly rewritten) path + query to send upstream.
     pub path: String,
-    /// The upstream `Host` header value (the target host[:port] host part).
+    /// The upstream `Host` header value (the target `host[:port]` host part).
     pub host: String,
     /// Outbound headers (already carry the set-instance / route-name / auth
     /// write-back; do NOT include hop-by-hop).
@@ -238,7 +238,7 @@ pub struct UsageTarget {
 /// ⑦) for the async forward stage to execute. It carries the **base** request
 /// state (post inbound-strip / model-overwrite / inbound-transform, pre
 /// forward-auth write-back, pre per-candidate ⑧/⑨) plus the SWRR-ordered
-/// candidate list. The per-candidate [`pipeline::build_outbound`] (⑧ model-mapper
+/// candidate list. The per-candidate [`crate::pipeline::build_outbound`] (⑧ model-mapper
 /// and ⑨ set-instance/route-name plus transformer-outbound and Host) is invoked
 /// by the forward stage for the selected candidate and, on failover, for each
 /// fallback candidate.
@@ -288,13 +288,12 @@ pub struct PreparedRequest {
 /// Shared, long-lived gateway state threaded through every request. Cheap to
 /// `Arc`-clone per request task (all fields are `Arc` / `Clone`).
 ///
-/// **P5-pending / `integrations`-gated:** the three egress fields hold the
+/// **`integrations`-gated (default feature):** the three egress fields hold the
 /// frozen-contract client types from `hygress-egress` (`forward_auth::Client`,
-/// `usage_sink::GpustackSink`, `provider::ProviderClient`). Those symbols are
-/// implemented by the egress lane and do not yet exist in the placeholder
-/// crate, so this struct is compiled only under the `integrations` feature.
-/// The pure pipeline stages do **not** depend on it — they take explicit
-/// inputs (see [`crate::pipeline`]).
+/// `usage_sink::GpustackSink`, `provider::ProviderClient`). Those symbols live
+/// in the egress lane, so this struct is compiled only under the
+/// `integrations` feature. The pure pipeline stages do **not** depend on it —
+/// they take explicit inputs (see [`crate::pipeline`]).
 #[cfg(feature = "integrations")]
 #[derive(Clone)]
 pub struct GatewayState {

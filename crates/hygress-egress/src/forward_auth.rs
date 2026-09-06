@@ -80,7 +80,7 @@ fn ext_auth_timeout_from_env(value: Option<&str>) -> Duration {
 
 /// Inbound (already-transformed) request to authenticate.
 ///
-/// `headers` is the post-transformer inbound header set. Only the [allowlist][ALLOWLIST] is picked
+/// `headers` is the post-transformer inbound header set. Only the allowlist is picked
 /// out of it for the outbound `/token-auth` GET (the rest is dropped — forward-auth forwards a
 /// fixed, minimal set).
 #[derive(Clone, Debug, Default)]
@@ -101,7 +101,7 @@ impl ForwardAuthRequest {
 /// from a 4xx rejection (request must be rejected). A transport error / 5xx produces `None` —
 /// "no verdict": the egress client could not authenticate, and the gateway applies its configured
 /// fail mode to the missing verdict — never a `ForwardAuthVerdict`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ForwardAuthVerdict {
     /// `true` for a 2xx auth success; `false` for a 4xx/3xx rejection.
     pub authenticated: bool,
@@ -115,9 +115,24 @@ pub struct ForwardAuthVerdict {
     pub auth_cache: Option<String>,
 }
 
+// O11: manual `Debug` — the auth-service write-back carries credentials
+// (`authorization` = `Bearer <registration_token>`, `auth_cache` = a JWT);
+// those two are redacted so a `{:?}` in logs cannot leak them.
+impl std::fmt::Debug for ForwardAuthVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardAuthVerdict")
+            .field("authenticated", &self.authenticated)
+            .field("consumer", &self.consumer)
+            .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
+            .field("set_cookie", &self.set_cookie)
+            .field("auth_cache", &self.auth_cache.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Out-of-band forward-auth client — `GET {base_url}/token-auth` with header pass-through and
 /// write-back (design §7 ext-auth row).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     /// Auth-service base URL (scheme + authority), e.g. `http://127.0.0.1:8080`.
     base_url: String,
@@ -130,6 +145,18 @@ pub struct Client {
     timeout: Duration,
 }
 
+// O11: manual `Debug` — the derived `X-GPUStack-Auth-Token` is redacted so a
+// `{:?}` of the client in logs cannot leak the credential.
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 impl Client {
     /// Build a client that `GET`s `{base_url}/token-auth`.
     ///
@@ -138,7 +165,7 @@ impl Client {
     /// resolved `jwt_secret_key` in hand); a client built without it does not inject the token.
     ///
     /// The overall request timeout is read from `HIGRESS_EXT_AUTH_TIMEOUT_MS` (ms) at this point —
-    /// see [`ext_auth_timeout_from_env`] — falling back to the 30 s default; a later
+    /// see `ext_auth_timeout_from_env` — falling back to the 30 s default; a later
     /// [`with_timeout`](Self::with_timeout) call overrides it.
     pub fn new(base_url: &str, http: reqwest::Client) -> Self {
         Self {

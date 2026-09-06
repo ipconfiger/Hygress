@@ -22,7 +22,7 @@
 //! - [`model_router`]      ②  body/alias model resolution + `x-higress-llm-model` overwrite + cap
 //! - [`transformer`]       ①③ inbound untrusted-strip / rename / original-path backstop; outbound keep
 //! - [`route_match`]       ④  `x-higress-llm-model` + full-match path → Main route, else mirror
-//! - [`auth`]              ⑤  scope = origin ingress name `ai-route-route-` prefix (pure) + FAIL_OPEN glue (P5)
+//! - [`auth`]              ⑤  scope = origin ingress name `ai-route-route-` prefix (pure; the exchange lives in `pipe` under `integrations`)
 //! - [`registry_resolve`]  ⑦  `name.type:port` → static/dns/proxy/tunnel connect target
 //! - [`swrr_select`]       ⑦  Nginx SWRR weighted order over the per-route-group shared state
 //! - [`model_mapper`]      ⑧  per-destination (`name.type`) outbound body `model` rewrite

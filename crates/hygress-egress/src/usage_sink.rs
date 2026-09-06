@@ -68,9 +68,11 @@ pub struct GpustackSink {
 impl std::fmt::Debug for GpustackSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Manual impl: the `dyn Fn` drop hook is not `Debug` (and should not end up in logs anyway).
+        // G4/O11: the derived credential is NEVER printed — a `{:?}` of the sink in logs must not
+        // leak the `X-GPUStack-Auth-Token` value.
         f.debug_struct("GpustackSink")
             .field("endpoint", &self.endpoint)
-            .field("token", &self.token)
+            .field("token", &"<redacted>")
             .field("on_drop", &self.on_drop.as_ref().map(|_| "<closure>"))
             .finish()
     }

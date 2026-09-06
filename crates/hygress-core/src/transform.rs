@@ -239,11 +239,12 @@ impl HeaderOps for HeaderMap {
 ///
 /// Semantics are content-identical to running the same operation sequence on a
 /// cloned [`HeaderMap`]: keys are lowercased on write, `insert` replaces,
-/// `append` extends (a first `append` over a base name inherits the base
-/// values), `remove` deletes, and every read (`get` / `get_all` / `count` /
-/// `contains` / `names`) sees the same effective set the materialized map
-/// would. The materialized result of an overlay therefore equals exactly what
-/// today's clone-then-mutate `HeaderMap` yields for the same op sequence.
+/// `append` extends (a first `append` over a live base name inherits the base
+/// values; after a `remove` it starts fresh), `remove` deletes, and every read
+/// (`get` / `get_all` / `count` / `contains` / `names`) sees the same effective
+/// set the materialized map would. The materialized result of an overlay
+/// therefore equals exactly what today's clone-then-mutate `HeaderMap` yields
+/// for the same op sequence.
 ///
 /// Layout:
 /// * `overrides` — a name whose final value list the overlay fully owns (first
@@ -290,13 +291,17 @@ impl OutboundHeaders {
         }
     }
 
-    /// Append a value (multi-value semantics). The FIRST `append` over a base
-    /// name inherits the base's current values (a bounded copy of that one
+    /// Append a value (multi-value semantics). The FIRST `append` over a live
+    /// base name inherits the base's current values (a bounded copy of that one
     /// name's list only — the base entries themselves are never copied);
-    /// `append` over an overlay-owned name extends the overlay list.
+    /// `append` over an overlay-owned name extends the overlay list. A
+    /// re-`append` after a [`OutboundHeaders::remove`] starts a FRESH list (map
+    /// remove-then-append yields just the appended value — Q1: no base
+    /// inheritance through a suppression record).
     pub fn append(&mut self, name: &str, value: impl Into<String>) {
         let key = HeaderMap::lookup(name);
-        if let Some(pos) = self.removed.iter().position(|n| n == key.as_ref()) {
+        let was_removed = self.removed.iter().position(|n| n == key.as_ref());
+        if let Some(pos) = was_removed {
             self.removed.remove(pos);
         }
         if let Some((_, values)) = self
@@ -305,6 +310,10 @@ impl OutboundHeaders {
             .find(|(n, _)| n == key.as_ref())
         {
             values.push(value.into());
+        } else if was_removed.is_some() {
+            // The name was just un-suppressed: a fresh single-value override
+            // (the base list was deleted by the `remove`).
+            self.overrides.push((HeaderMap::key(name), vec![value.into()]));
         } else {
             let mut values = self.base.get_all(key.as_ref()).to_vec();
             values.push(value.into());
@@ -363,15 +372,16 @@ impl OutboundHeaders {
         !self.removed.iter().any(|n| n == key.as_ref()) && self.base.contains(key.as_ref())
     }
 
-    /// All header names present (lowercase form): the base names minus removed /
-    /// shadowed, then the overlay-only names in first-touch order.
+    /// All header names present (lowercase form): the base names minus
+    /// removed, emitted in base-map order, then the overlay-only names in
+    /// first-touch order. A name shadowed by an overlay entry (present in both
+    /// base and `overrides`) is emitted ONCE at its base position — matching
+    /// [`OutboundHeaders::materialize`] / [`OutboundHeaders::into_pairs`], whose
+    /// `names()` the caller must agree with (M2).
     pub fn names(&self) -> impl Iterator<Item = &str> + '_ {
         self.base
             .names()
-            .filter(move |name| {
-                !self.removed.iter().any(|n| n == *name)
-                    && !self.overrides.iter().any(|(n, _)| n == *name)
-            })
+            .filter(move |name| !self.removed.iter().any(|n| n == *name))
             .chain(
                 self.overrides
                     .iter()
@@ -1058,6 +1068,57 @@ mod tests {
         assert_eq!(o.get("authorization"), None);
         assert!(!o.contains("AUTHORIZATION"));
         assert_eq!(o.count("authorization"), 0);
+    }
+
+    #[test]
+    fn overlay_names_match_materialized_names_including_shadowed() {
+        // M2/Q1 regression: a name present in BOTH the base and the overlay
+        // deltas (the normal auth-write-back replace / ⑨ pre-route case) was
+        // dropped from both `names()` passes and never yielded. `names()` must
+        // equal the materialized map's names (each name exactly once).
+        let mut reference = base_headers();
+        golden_outbound_sequence(&mut reference);
+        let mut overlay = OutboundHeaders::new(base_headers());
+        golden_outbound_sequence(&mut overlay);
+
+        let mut materialized: Vec<String> = overlay.materialize().names().map(str::to_owned).collect();
+        materialized.sort();
+        let mut via_overlay: Vec<String> = overlay.names().map(str::to_owned).collect();
+        via_overlay.sort();
+        assert_eq!(
+            via_overlay, materialized,
+            "overlay.names() must equal materialize().names() (shadowed names included once)"
+        );
+        let mut reference_names: Vec<String> = reference.names().map(str::to_owned).collect();
+        reference_names.sort();
+        assert_eq!(
+            via_overlay, reference_names,
+            "overlay.names() must equal the clone-then-mutate reference map's names"
+        );
+        // The specific shadowed names must be present exactly once each.
+        assert_eq!(
+            via_overlay.iter().filter(|n| *n == "authorization").count(),
+            1,
+            "shadowed authorization must be yielded exactly once"
+        );
+    }
+
+    #[test]
+    fn overlay_remove_then_append_starts_fresh() {
+        // Q1 regression: `append` after `remove` must NOT re-inherit the
+        // removed base list through the suppression record (map
+        // remove-then-append yields only the appended value).
+        let mut reference = base_headers();
+        reference.remove("set-cookie");
+        reference.append("set-cookie", "c=3");
+        let mut overlay = OutboundHeaders::new(base_headers());
+        overlay.remove("set-cookie");
+        overlay.append("set-cookie", "c=3");
+
+        assert_eq!(overlay.materialize(), reference);
+        assert_eq!(overlay.get_all("set-cookie"), reference.get_all("set-cookie"));
+        assert_eq!(overlay.count("set-cookie"), 1);
+        assert_eq!(overlay.get("set-cookie"), Some("c=3"));
     }
 
     #[test]

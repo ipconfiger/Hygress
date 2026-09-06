@@ -10,8 +10,8 @@
 //!
 //! Each LIST pass produces a cheap [`SnapshotFingerprint`] — one `(kind, namespace, name,
 //! resource_version)` per object, sorted. The controller's run loop hands in the previous
-//! pass's fingerprint (it reconciles on watch events or the low-frequency safety-net tick);
-//! when the new one matches, the expensive `build_config_data` translate (and the
+//! pass's fingerprint (it reconciles on watch events or the convergence poll tick — ~1s on
+//! the embedded apiserver, POLL_INTERVAL); when the new one matches, the expensive `build_config_data` translate (and the
 //! downstream RouteTable rebuild / regex recompile / ArcSwap swap that [`hygress_core`]
 //! performs on `store`) is skipped entirely, so a steady-state cluster never re-triggers a
 //! full rebuild on a pass where nothing changed. Any k8s mutation bumps `resource_version`,

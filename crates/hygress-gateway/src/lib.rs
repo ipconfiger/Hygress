@@ -5,7 +5,7 @@
 //! itself. The decision pipeline (stages ①–⑨, net semantics) is **pure** and
 //! lives in [`pipeline`]; the async forward (⑩–⑮) lives in [`pipe`]
 //! (`integrations`-gated, consumes the frozen `hygress-egress` /
-//! `hygress-adapter` contracts — P5-pending).
+//! `hygress-adapter` contracts — default feature; see ORA3-M20).
 //!
 //! Pipeline (design §6.1 net semantics):
 //! ① strip untrusted inbound headers · ② model-router (body/alias →

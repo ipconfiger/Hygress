@@ -83,13 +83,19 @@ pub fn load_policy(path: impl AsRef<Path>) -> Result<PolicyConfig, String> {
 ///
 /// The per-request policy cost is one `Arc` load ([`PolicyHandle::shared`] /
 /// [`PolicyHandle::merged_for`]); the merge (and static-rule regex compilation)
-/// happens once per load/reload in [`MergedTable::build`] (H3).
+/// happens once per load/reload in `MergedTable::build` (H3).
 ///
 /// Cheap to `Arc`-clone (all state is `Arc`-shared); the admin `/reload`
 /// closure and the poll task share one handle.
 #[derive(Clone)]
 pub struct PolicyHandle {
     inner: Arc<PolicyInner>,
+    /// O5: optional per-attempt observer fired by [`PolicyHandle::reload_from`]
+    /// (`true` = swap happened, `false` = last-known-good kept). Lives on the
+    /// handle (not `PolicyInner`) so every clone shares the same observer `Arc`
+    /// once it is set — bootstrap attaches it immediately after construction,
+    /// before any clone is made. `None` (default) keeps reloads log-only.
+    reload_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 /// One consistent, atomically-swapped policy view: the parsed config plus its
@@ -158,7 +164,16 @@ impl PolicyHandle {
                 last_mtime: std::sync::Mutex::new(last_mtime),
                 loaded_once: AtomicBool::new(loaded_once),
             }),
+            reload_observer: None,
         }
+    }
+
+    /// O5: attach the per-attempt reload observer (the gateway's metrics
+    /// counter). Call immediately after construction, before the handle is
+    /// cloned/shared — every later clone shares the same observer `Arc`.
+    /// `None` (the default) keeps reloads log-only; unit tests rely on that.
+    pub fn set_reload_observer(&mut self, observer: Option<Arc<dyn Fn(bool) + Send + Sync>>) {
+        self.reload_observer = observer;
     }
 
     /// The current policy snapshot (lock-free `Arc` load — cheap per request).
@@ -188,41 +203,48 @@ impl PolicyHandle {
     /// successful reload, and when a real policy was loaded before it is kept
     /// (no silent downgrade to the built-in all-pass default).
     pub fn reload_from(&self, path: &str) -> bool {
-        // ORA3-M2: a disappeared policy file must not silently swap in the
-        // all-pass default — keep the last-known-good and report the failure.
-        if !Path::new(path).is_file() {
-            if self.inner.loaded_once.load(Ordering::SeqCst) {
-                error!(
-                    path = %path,
-                    "policy file is missing; keeping the last-known-good policy \
-                     (limits/quota/guardrails stay in force)"
-                );
-            } else {
-                error!(
-                    path = %path,
-                    "policy file is missing and no policy was ever loaded; \
-                     limits/quota/guardrails remain disabled (all-pass default)"
-                );
+        let result = (|| {
+            // ORA3-M2: a disappeared policy file must not silently swap in the
+            // all-pass default — keep the last-known-good and report the failure.
+            if !Path::new(path).is_file() {
+                if self.inner.loaded_once.load(Ordering::SeqCst) {
+                    error!(
+                        path = %path,
+                        "policy file is missing; keeping the last-known-good policy \
+                         (limits/quota/guardrails stay in force)"
+                    );
+                } else {
+                    error!(
+                        path = %path,
+                        "policy file is missing and no policy was ever loaded; \
+                         limits/quota/guardrails remain disabled (all-pass default)"
+                    );
+                }
+                return false;
             }
-            return false;
+            match load_policy(path) {
+                Ok(c) => {
+                    self.inner.state.store(Arc::new(PolicyRuntime::of(c)));
+                    *self.inner.last_mtime.lock().unwrap() =
+                        std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+                    self.inner.loaded_once.store(true, Ordering::SeqCst);
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "policy reload failed; keeping the last-known-good policy"
+                    );
+                    false
+                }
+            }
+        })();
+        // O5: ONE measured choke point for admin `/reload` and the mtime poll.
+        if let Some(obs) = &self.reload_observer {
+            obs(result);
         }
-        match load_policy(path) {
-            Ok(c) => {
-                self.inner.state.store(Arc::new(PolicyRuntime::of(c)));
-                *self.inner.last_mtime.lock().unwrap() =
-                    std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
-                self.inner.loaded_once.store(true, Ordering::SeqCst);
-                true
-            }
-            Err(e) => {
-                warn!(
-                    path = %path,
-                    error = %e,
-                    "policy reload failed; keeping the last-known-good policy"
-                );
-                false
-            }
-        }
+        result
     }
 
     /// Reload from the handle's configured path (the admin `POST /reload`).

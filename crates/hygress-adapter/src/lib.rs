@@ -5,11 +5,11 @@
 //! apiserver at `127.0.0.1:18443` (or an external cluster in topology B).
 //!
 //! Responsibilities (design §5):
-//! - [`gvr`]       — Group/Version/Resource + [`ApiResource`]s for the 3 CRDs and the standard kinds
-//! - [`client`]    — kube 4.x `Api` wiring; kubeconfig (file or in-cluster) loading
-//! - [`snapshot`]  — full LIST (label selector `gpustack.ai/managed=true`) -> `ConfigData` objects
+//! - [`gvr`]       — Group/Version/Resource + `ApiResource`s for the 3 CRDs and the standard kinds
+//! - `client`    — kube 4.x `Api` wiring; kubeconfig (file or in-cluster) loading
+//! - `snapshot`  — full LIST (label selector `gpustack.ai/managed=true`) -> `ConfigData` objects
 //! - [`translate`] — **pure** CRD JSON -> `hygress_core` translation (unit-tested with real fixtures)
-//! - [`reconcile`] — api-resources discovery (60s/5s) + the gated topology-B IngressClass seed
+//! - `reconcile` — api-resources discovery (60s/5s) + the gated topology-B IngressClass seed
 //!   (invoked only from [`Controller::run`] when `seed_ingress_class` is enabled)
 //!
 //! Invariants (design):
@@ -114,11 +114,23 @@ pub struct ControllerHooks {
     /// path in [`Controller::run`] → `sync_once`); the gateway counts stores
     /// and stamps its last-store staleness gauge from here.
     pub on_snapshot_store: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called after **every** successful `sync_once` pass — including the
+    /// fingerprint short-circuit no-op, which never reaches
+    /// [`Self::on_snapshot_store`]. The gateway stamps a liveness heartbeat
+    /// from here, so "control plane alive but nothing changed" stays
+    /// distinguishable from "control plane dead" on a quiet healthy cluster
+    /// (O3).
+    pub on_sync_ok: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called on a `sync_once` failure — a LIST/transport failure (`class` =
+    /// `"list"`) or a structurally rejected snapshot (`class` = `"rejected"`).
+    /// Invoked at most once per failure episode (the log warn is gated the
+    /// same way); the gateway counts reconcile errors from here (O4).
+    pub on_sync_failure: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 /// Control-plane adapter (strategy 2): a read-only kube CRD consumer that LISTs the managed
 /// Higress CRDs, translates them into [`hygress_core::ConfigData`], and stores the snapshot
-/// into the gateway's [`SharedConfig`] on a poll interval.
+/// into the gateway's [`hygress_core::prelude::SharedConfig`] on a poll interval.
 pub struct Controller {
     shared: Arc<hygress_core::SharedConfig>,
     kubeconfig: Option<std::path::PathBuf>,
@@ -140,6 +152,12 @@ pub struct Controller {
     last_fingerprint: Mutex<Option<SnapshotFingerprint>>,
     /// ORA3-MAJ-1: observability hooks (see [`ControllerHooks`]).
     hooks: ControllerHooks,
+    /// Warn-once-per-episode latch for the `sync_once` failure log (G1/O4): a
+    /// sustained mid-run apiserver outage or a persisting structurally-rejected
+    /// object must not spam the ~1s tick (~86k lines/day); the latch resets on
+    /// the first successful pass so a recovery + re-outage cycle warns once
+    /// each time.
+    sync_failure_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Controller {
@@ -199,6 +217,7 @@ impl Controller {
             ready_notified: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fingerprint: Mutex::new(None),
             hooks,
+            sync_failure_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -489,8 +508,22 @@ impl Controller {
             Ok(r) => r,
             Err(e) => {
                 // Transport / LIST failure: keep last-known-good (snapshot AND fingerprint),
-                // retry on the next wake.
-                tracing::warn!("snapshot LIST failed; keeping last-known-good: {e}");
+                // retry on the next wake. Warn + hook ONCE per failure episode (G1/O4): the
+                // ~1s tick would otherwise log ~86k lines/day during a sustained outage — the
+                // latch clears on the next successful pass, so a recovery + re-outage cycle
+                // warns once each time.
+                if !self
+                    .sync_failure_warned
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::warn!(
+                        "snapshot LIST failed; keeping last-known-good (further failures \
+                         suppressed until the next successful pass): {e}"
+                    );
+                    if let Some(hook) = &self.hooks.on_sync_failure {
+                        hook("list");
+                    }
+                }
                 return;
             }
         };
@@ -498,12 +531,25 @@ impl Controller {
         // Unchanged since the last successful pass: skip the translate + store entirely
         // (fp == prev; the fingerprint is already correct — no advance needed).
         let Some(data) = data else {
+            // A successful pass — even the fingerprint no-op — clears the failure latch
+            // (G1) and heartbeats the control-plane last-sync gauge (O3; distinct from the
+            // content-change store gauge so a quiet healthy cluster never looks stale).
+            self.sync_failure_warned
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some(hook) = &self.hooks.on_sync_ok {
+                hook();
+            }
             tracing::debug!("snapshot unchanged (fingerprint match); skipping rebuild");
             return;
         };
 
         match self.shared.store(data) {
             Ok(dropped) => {
+                self.sync_failure_warned
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Some(hook) = &self.hooks.on_sync_ok {
+                    hook();
+                }
                 // ORA3-MAJ-1: notify the gateway that a NEW snapshot was stored (it
                 // counts the store and stamps its last-store staleness gauge).
                 if let Some(hook) = &self.hooks.on_snapshot_store {
@@ -535,10 +581,20 @@ impl Controller {
             Err(issues) => {
                 // Structural failure: reject the whole snapshot, keep last-known-good.
                 // The fingerprint is NOT advanced, so the next wake re-attempts it
-                // (retry-next-tick, R-2) rather than skipping it forever.
-                tracing::warn!(
-                    "snapshot structurally rejected; keeping last-known-good: {issues:?}"
-                );
+                // (retry-next-tick, R-2) rather than skipping it forever. Same
+                // warn/hook-once-per-episode discipline as the LIST-failure path (G1/O4).
+                if !self
+                    .sync_failure_warned
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::warn!(
+                        "snapshot structurally rejected; keeping last-known-good (further \
+                         failures suppressed until the next successful pass): {issues:?}"
+                    );
+                    if let Some(hook) = &self.hooks.on_sync_failure {
+                        hook("rejected");
+                    }
+                }
             }
         }
     }
@@ -682,6 +738,8 @@ mod tests {
             on_snapshot_store: Some(Arc::new(move || {
                 s2.fetch_add(1, Ordering::Relaxed);
             })),
+            on_sync_ok: None,
+            on_sync_failure: None,
         };
         let sc = shared(ConfigData::default());
         let c = Controller::new(

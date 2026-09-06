@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use prometheus::core::{Collector, Desc};
 use prometheus::proto;
-use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder};
+use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, TextEncoder};
 
 /// A custom prometheus [`Collector`] that publishes the two core control-plane
 /// snapshot counters ([`hygress_core::SharedConfig::snapshot_reject_total`] /
@@ -105,6 +105,10 @@ struct Inner {
     fallback_total: IntCounter,
     fallback_exhausted_total: IntCounter,
     usage_push_dropped_total: IntCounter,
+    /// Rows handed to the usage sink for delivery, split by whether the
+    /// upstream reported a canonical usage object (G2); the drop counter above
+    /// subtracts rows that never reached GPUStack.
+    usage_pushed_total: IntCounterVec,
     // ORA3-MAJ-1: control-plane health — watcher errors by kind/class, new
     // snapshot stores, and the last-store staleness gauge (the round's only
     // MAJOR: control-plane death / permanent degradation was otherwise a black
@@ -112,6 +116,20 @@ struct Inner {
     control_watch_error_total: IntCounterVec,
     control_snapshot_store_total: IntCounter,
     control_last_store_timestamp_seconds: IntGauge,
+    /// O3: liveness heartbeat — stamped after EVERY successful reconcile pass
+    /// (including fingerprint no-op rounds), unlike the content-change store
+    /// gauge above. `time() - this > ~3×poll_interval` means the controller
+    /// loop is stuck or dead, independent of whether anything changed.
+    control_last_sync_timestamp_seconds: IntGauge,
+    /// O4: control-plane reconcile failure episodes by class (`list` /
+    /// `rejected`). Counts episodes (the adapter's warn-once latch fires the
+    /// hook once per outage), not ~1s-tick repeats.
+    control_reconcile_error_total: IntCounterVec,
+    /// O9: static build provenance gauge (`hygress_build_info{version} = 1`).
+    /// Registered once at construction (no per-event record — see `Metrics::new`).
+    /// O5: policy reload attempts by outcome (admin `/reload` + the 30s mtime
+    /// poll both flow through `PolicyHandle::reload_from`'s observer).
+    policy_reload_total: IntCounterVec,
     auth_decisions: IntCounterVec,
     active_requests: IntGauge,
     // Extension stages (design §4): rate limiting / quota / routing policy /
@@ -187,6 +205,14 @@ impl Metrics {
             "Usage rows dropped without reaching the usage sink (queue-full / sink task gone / final push failure).",
         )
         .expect("usage_push_dropped_total");
+        let usage_pushed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_usage_pushed_total",
+                "Usage rows handed to the GPUStack usage sink, by whether the upstream reported a canonical usage object (completed=\"true\") or the row relies on the GPUStack server's byte/chunk estimation (completed=\"false\"). Rows that never reach GPUStack are counted separately by hygress_usage_push_dropped_total.",
+            ),
+            &["completed"],
+        )
+        .expect("usage_pushed_total");
         // ORA3-MAJ-1: control-plane observability families (see `Inner`).
         let control_watch_error_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -206,6 +232,40 @@ impl Metrics {
             "Unix time (seconds) of the last successful control-plane snapshot store; 0 before the first store.",
         )
         .expect("control_last_store_timestamp_seconds");
+        let control_last_sync_timestamp_seconds = IntGauge::new(
+            "hygress_control_last_sync_timestamp_seconds",
+            "Unix time (seconds) of the last successful control-plane reconcile pass (any outcome, including no-op fingerprint rounds); 0 before the first pass. Distinguishes a stalled/dead controller from a quiet healthy cluster — hygress_control_last_store_timestamp_seconds only advances on content changes.",
+        )
+        .expect("control_last_sync_timestamp_seconds");
+        let control_reconcile_error_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_control_reconcile_error_total",
+                "Control-plane reconcile failure episodes by class (list: snapshot LIST/transport failure; rejected: structurally rejected snapshot). Counts episodes (the adapter's warn-once latch fires once per outage), not per-tick repeats.",
+            ),
+            &["class"],
+        )
+        .expect("control_reconcile_error_total");
+        // O9: static build provenance — always `1` for the compiled version.
+        let build_info = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "hygress_build_info",
+                "Static build provenance: 1 for the compiled gateway version.",
+            ),
+            &["version"],
+        )
+        .expect("build_info");
+        build_info
+            .with_label_values(&[env!("CARGO_PKG_VERSION")])
+            .set(1);
+        // O5: policy reload outcome (success = swapped; failure = last-known-good kept).
+        let policy_reload_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_policy_reload_total",
+                "Policy reload attempts by outcome — success (new policy swapped) or failure (last-known-good kept). Covers the admin POST /reload and the 30s mtime-poll reload; unchanged no-op ticks are not counted.",
+            ),
+            &["result"],
+        )
+        .expect("policy_reload_total");
         let auth_decisions = IntCounterVec::new(
             prometheus::Opts::new("hygress_auth_decisions_total", "Auth decisions."),
             &["result"],
@@ -269,9 +329,14 @@ impl Metrics {
             Box::new(fallback_total.clone()),
             Box::new(fallback_exhausted_total.clone()),
             Box::new(usage_push_dropped_total.clone()),
+            Box::new(usage_pushed_total.clone()),
             Box::new(control_watch_error_total.clone()),
             Box::new(control_snapshot_store_total.clone()),
             Box::new(control_last_store_timestamp_seconds.clone()),
+            Box::new(control_last_sync_timestamp_seconds.clone()),
+            Box::new(control_reconcile_error_total.clone()),
+            Box::new(build_info.clone()),
+            Box::new(policy_reload_total.clone()),
             Box::new(auth_decisions.clone()),
             Box::new(active_requests.clone()),
             Box::new(rate_limit_denied.clone()),
@@ -298,9 +363,13 @@ impl Metrics {
                 fallback_total,
                 fallback_exhausted_total,
                 usage_push_dropped_total,
+                usage_pushed_total,
                 control_watch_error_total,
                 control_snapshot_store_total,
                 control_last_store_timestamp_seconds,
+                control_last_sync_timestamp_seconds,
+                control_reconcile_error_total,
+                policy_reload_total,
                 auth_decisions,
                 active_requests,
                 rate_limit_denied,
@@ -325,7 +394,7 @@ impl Metrics {
     /// the gateway writes before a complete upstream dispatch (rate-limit 429,
     /// auth 401 / fail-closed 403, quota 429, guardrail 403, no-route 404,
     /// registry 503, body 413 / read-abort 400) — under the fixed
-    /// [`KIND_SHORT_CIRCUIT`] kind. The `requests_total` count and the
+    /// `KIND_SHORT_CIRCUIT` kind. The `requests_total` count and the
     /// `request_duration` latency are recorded together so **every** written
     /// downstream terminal keeps the request-level totals complete (the
     /// dedicated counters — `auth_decisions` / `rate_limit_denied` /
@@ -380,10 +449,24 @@ impl Metrics {
         self.inner.usage_push_dropped_total.inc();
     }
 
+    /// G2: a usage row was handed to the sink for delivery. `completed` mirrors
+    /// the row's `completed` flag — `true` = the upstream reported a canonical
+    /// usage object (exact metering), `false` = the row carries zero tokens and
+    /// the GPUStack server applies its byte/chunk estimation fallback. Rows
+    /// that never reach GPUStack are subtracted by
+    /// [`Metrics::record_usage_push_dropped`].
+    pub fn record_usage_pushed(&self, completed: bool) {
+        self.inner
+            .usage_pushed_total
+            .with_label_values(&[if completed { "true" } else { "false" }])
+            .inc();
+    }
+
     /// ORA3-MAJ-1: a control-plane watcher error was classified. `kind` is the
     /// watched resource kind (configmap / ingress / secret / …); `class` is
     /// `permanent` (watch unsupported by the apiserver → convergence degraded
-    /// to the 30s safety-net tick) or `transient` (recoverable watch failure).
+    /// to the poll tick / POLL_INTERVAL) or `transient` (recoverable watch
+    /// failure).
     pub fn record_control_watch_error(&self, kind: &str, class: &str) {
         self.inner
             .control_watch_error_total
@@ -405,6 +488,37 @@ impl Metrics {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.inner.control_last_store_timestamp_seconds.set(secs);
+    }
+
+    /// O3: stamp the control-plane liveness heartbeat (unix seconds). Wired to
+    /// the adapter `on_sync_ok` hook — fired after EVERY successful reconcile
+    /// pass, including fingerprint no-op rounds — so a quiet healthy cluster
+    /// keeps this gauge fresh (unlike the content-change store gauge above).
+    pub fn record_control_sync(&self) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner.control_last_sync_timestamp_seconds.set(secs);
+    }
+
+    /// O4: a control-plane reconcile failure episode. `class` is `list`
+    /// (snapshot LIST/transport failure) or `rejected` (structurally rejected
+    /// snapshot); the adapter fires once per outage episode (warn-once latch).
+    pub fn record_control_reconcile_error(&self, class: &str) {
+        self.inner
+            .control_reconcile_error_total
+            .with_label_values(&[class])
+            .inc();
+    }
+
+    /// O5: a policy reload attempt finished. `ok` = the swap happened (new
+    /// policy live) vs `false` = last-known-good kept (missing/malformed file).
+    pub fn record_policy_reload(&self, ok: bool) {
+        self.inner
+            .policy_reload_total
+            .with_label_values(&[if ok { "success" } else { "failure" }])
+            .inc();
     }
 
     pub fn record_auth(&self, result: &str) {
@@ -650,6 +764,78 @@ mod tests {
                         .unwrap_or(false)
             }),
             "last-store timestamp gauge must be set to a positive unix time:\n{out}"
+        );
+    }
+
+    /// G2/O3/O4/O9: the metering-quality split, the control-plane liveness
+    /// heartbeat + reconcile-failure counters and the build-info gauge all
+    /// render on `/metrics`.
+    #[test]
+    fn usage_pushed_and_control_liveness_families_render() {
+        let m = Metrics::new();
+        m.record_usage_pushed(true);
+        m.record_usage_pushed(false);
+        m.record_usage_pushed(true);
+        m.record_control_reconcile_error("list");
+        m.record_control_sync();
+        m.record_policy_reload(true);
+        m.record_policy_reload(false);
+        let out = m.encode();
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_usage_pushed_total{")
+                    && l.contains("completed=\"true\"")
+                    && l.ends_with(" 2")
+            }),
+            "completed=true pushed rows (x2) missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_usage_pushed_total{")
+                    && l.contains("completed=\"false\"")
+                    && l.ends_with(" 1")
+            }),
+            "completed=false pushed row missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_control_reconcile_error_total{")
+                    && l.contains("class=\"list\"")
+                    && l.ends_with(" 1")
+            }),
+            "reconcile list-failure episode missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_control_last_sync_timestamp_seconds")
+                    && l.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|v| v > 0.0)
+                        .unwrap_or(false)
+            }),
+            "last-sync heartbeat must be set to a positive unix time:\n{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("hygress_build_info{") && l.ends_with(" 1")),
+            "build-info gauge missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_policy_reload_total{")
+                    && l.contains("result=\"success\"")
+                    && l.ends_with(" 1")
+            }),
+            "policy reload success missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_policy_reload_total{")
+                    && l.contains("result=\"failure\"")
+                    && l.ends_with(" 1")
+            }),
+            "policy reload failure missing:\n{out}"
         );
     }
 }

@@ -789,8 +789,8 @@ fn full_match_pattern(pattern: &str) -> String {
 /// vec, or the O(n²) map-back, and it keeps a request's whole decision path on
 /// one consistent snapshot (the registry index is read from this table, which
 /// came from the same atomic snapshot load as `data`):
-/// - [`RouteTable::by_main_key`] — Main routes only (initial requests);
-/// - [`RouteTable::by_fallback_key`] — Fallback routes only (fallback redirects).
+/// - `by_main_key` — Main routes only (initial requests);
+/// - `by_fallback_key` — Fallback routes only (fallback redirects).
 ///
 /// The two key spaces are physically separated so a Fallback rule can never
 /// be selected by an initial request (and vice versa).

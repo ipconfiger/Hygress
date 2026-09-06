@@ -8,7 +8,7 @@
 //! locator (the same one `hygress_core::model_mapping` uses), so the two
 //! crates cannot silently diverge on boundary semantics (ORA3-M10). The JSON
 //! top-level scans all run through ONE member-loop state machine
-//! ([`top_level_members`], ORA3-M11), with `serde`-rule handling in a single
+//! (`top_level_members`, ORA3-M11), with `serde`-rule handling in a single
 //! place.
 
 use bytes::Bytes;
@@ -400,8 +400,8 @@ pub struct JsonObjectProfile {
 /// and the closing-`}` offset in ONE validate-and-advance pass.
 ///
 /// `Ok(profile)` only for a well-formed JSON object; `Err(())` otherwise —
-/// exactly the verdicts of [`scan_top_level_value`] /
-/// [`scan_top_level_stream`] on the same bytes (see the agreement tests).
+/// exactly the verdicts of `scan_top_level_value` /
+/// `scan_top_level_stream` on the same bytes (see the agreement tests).
 ///
 /// Note the verdict is computed on the **original** body: a later model-value
 /// splice (byte-identical member content, only the string token changes)
@@ -446,7 +446,7 @@ pub fn scan_top_level_profile(
 }
 
 /// Splice the JSON string-value token at quote-inclusive `span` (from a
-/// [`JsonObjectProfile`] / [`TopLevelValue`]) with the JSON encoding of
+/// [`JsonObjectProfile`] / `TopLevelValue`) with the JSON encoding of
 /// `value` — the offset form of [`rewrite_json_model`] for callers that
 /// already hold the located token from the fused prepare-time scan
 /// (ORA3-M14: no re-scan, no DOM; every other byte is preserved).

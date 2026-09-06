@@ -26,7 +26,7 @@
 //! SSE `data:` markers are detected only at **line starts** (index 0 or
 //! immediately after `\n`) and each data line is counted **exactly once**,
 //! only when it is newline-terminated. An incomplete trailing line is
-//! buffered and reassembled across [`feed`] calls, so arbitrary packet
+//! buffered and reassembled across [`UsageSnapshot::feed`] calls, so arbitrary packet
 //! fragmentation never double-counts. A usage object is absorbed only when it
 //! is the **top-level** `"usage"` field of the SSE event's JSON payload.
 //!
@@ -37,13 +37,13 @@
 //! chunk:
 //! - while a response is still **unclassified** (no SSE `data:` seen, no
 //!   complete JSON object yet) the buffered tail is capped at
-//!   [`MAX_TAIL_BYTES`]; past it the response is marked [`Mode::Oversized`]
+//!   `MAX_TAIL_BYTES`; past it the response is marked `Mode::Oversized`
 //!   and the rest is ignored (flush still yields `completed = false`, the
 //!   server's byte/chunk-estimation fallback);
 //! - full-JSON parse attempts in that state are gated on a possible closing
-//!   `}` and limited to [`MAX_JSON_PARSE_ATTEMPTS`];
+//!   `}` and limited to `MAX_JSON_PARSE_ATTEMPTS`;
 //! - in the SSE state a **single data line** may only grow the persistent tail
-//!   up to [`MAX_TAIL_BYTES`]; an unterminated line beyond that is dropped and
+//!   up to `MAX_TAIL_BYTES`; an unterminated line beyond that is dropped and
 //!   skipped to its `\n` instead of being buffered forever.
 
 use serde::{Deserialize, Serialize};
@@ -74,9 +74,12 @@ const MAX_JSON_PARSE_ATTEMPTS: u32 = 128;
 /// (`model`, `input_token`, `output_token`, `total_token`, `input_cached_token`,
 /// `request_count`, `completed`, `output_chunk_count`, `request_content_bytes`)
 /// plus 8 `Option` fields that serialize absent when `None` (never `null`):
-/// `started_at`, `completed_at` (the server maps absent/0 → None per pin §2.8)
-/// and the 6 true attribution fields `user_id`, `model_id`, `model_route_id`,
-/// `provider_id`, `access_key`, `organization_id`.
+/// `started_at`, `completed_at` (always stamped by a real gateway flush — the
+/// server maps absent/0 → None per pin §2.8) and the 6 attribution fields
+/// `user_id`, `model_id`, `model_route_id`, `provider_id`, `access_key`,
+/// `organization_id`. A real flush therefore carries 11 present fields plus the
+/// attribution subset — the "11 present + 6 omitempty" shorthand used in the
+/// tests below refers to that practical shape (G5-unified wording).
 ///
 /// The four server-side-only fields — `operation`, `cluster_id`,
 /// `provider_name`, `provider_type` — are deliberately **not** members here.
@@ -312,7 +315,7 @@ enum Mode {
     Sse,
     /// A single non-streaming JSON body (already consumed).
     Json,
-    /// The buffered tail exceeded [`MAX_TAIL_BYTES`] while still unclassified — this is not a
+    /// The buffered tail exceeded `MAX_TAIL_BYTES` while still unclassified — this is not a
     /// usage-bearing body. The rest of the response is ignored (boundedness, MINOR-6/F3); flush
     /// still works and reports `completed = false`.
     Oversized,
@@ -320,7 +323,7 @@ enum Mode {
 
 /// Pure per-response usage accumulator.
 ///
-/// Feed response chunks in order via [`feed`]; when a usage object is seen
+/// Feed response chunks in order via [`UsageSnapshot::feed`]; when a usage object is seen
 /// the fields are adopted **last-wins** (OpenAI's final chunk is
 /// authoritative; Anthropic `message_delta` overrides `message_start`).
 /// `completed` in the flushed record is `true` iff at least one usage object
@@ -346,9 +349,9 @@ pub struct UsageSnapshot {
     /// Tail length already scanned for an anchored `data:` marker while `mode == Unknown`
     /// (incremental probe so a fragmented response is not re-scanned from index 0 per feed).
     data_probe: usize,
-    /// Full-JSON parse attempts made while still `Unknown` (bounded by [`MAX_JSON_PARSE_ATTEMPTS`]).
+    /// Full-JSON parse attempts made while still `Unknown` (bounded by `MAX_JSON_PARSE_ATTEMPTS`).
     json_parse_attempts: u32,
-    /// `true` while an oversized SSE line (past [`MAX_TAIL_BYTES`], unterminated) is being
+    /// `true` while an oversized SSE line (past `MAX_TAIL_BYTES`, unterminated) is being
     /// skipped up to its `\n` (single-line unbounded-buffer guard, MINOR-6/F3).
     skip_until_newline: bool,
 }
@@ -553,7 +556,7 @@ impl UsageSnapshot {
     /// The incomplete trailing sliver of the chunk becomes the new tail.
     ///
     /// A single SSE data line may only grow the persistent tail up to
-    /// [`MAX_TAIL_BYTES`] (MINOR-6/F3): an unterminated line past the cap is
+    /// `MAX_TAIL_BYTES` (MINOR-6/F3): an unterminated line past the cap is
     /// dropped (it can never be counted/parsed as a whole) and the stream
     /// skips to the line's `\n` before resuming — an adversarial never-ending
     /// line cannot grow the buffer without bound.
@@ -790,9 +793,12 @@ mod tests {
 
     // ----- wire format (17-field pin, plugin-contract-pin.md §2.8/§5.1) -----
 
-    /// The exact 17 wire field names (11 required + 6 omitempty).
+    /// The exact 17 wire field names — 9 non-`Option` scalars + 8 `Option`
+    /// fields; a real flush always stamps `started_at`/`completed_at`, hence
+    /// the practical "11 present + up to 6 attribution" wire shape (G5-unified
+    /// wording with the struct docs above).
     const PINNED_WIRE_FIELDS: [&str; 17] = [
-        // 11 always-present
+        // 9 always-present scalar members
         "model",
         "input_token",
         "output_token",
@@ -802,9 +808,10 @@ mod tests {
         "completed",
         "output_chunk_count",
         "request_content_bytes",
+        // started_at / completed_at — Option, always stamped by a real flush
         "started_at",
         "completed_at",
-        // 6 omitempty
+        // 6 attribution fields (omitempty)
         "user_id",
         "model_id",
         "model_route_id",

@@ -12,7 +12,9 @@ use hygress_core::usage::ModelUsageMetrics;
 use hygress_egress::usage_sink::GpustackSink;
 use serde_json::Value;
 
-/// The 17-field `ModelUsageMetrics` wire form (11 always-present + 6 omitempty).
+/// The 17-field `ModelUsageMetrics` wire form: 9 always-present scalars + 8
+/// `Option` fields; a real flush always stamps started_at/completed_at, so 11
+/// fields are present in practice plus the 6 attribution fields (G5-unified).
 fn sample_metric() -> ModelUsageMetrics {
     ModelUsageMetrics {
         model: "org1/llama-3-8b".into(),

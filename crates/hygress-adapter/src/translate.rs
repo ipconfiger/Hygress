@@ -13,7 +13,7 @@
 //!   (legacy `ai-route-model-*` are ignore/cleanup-only)
 //! - `McpBridge default` `spec.registries[]`      → [`Registry`] (static/dns/proxy/tunnel)
 //! - `McpBridge default` `spec.proxies[]`         → [`OutboundProxy`]
-//! - `WasmPlugin gpustack-model-mapper` per-rule `matchRules` → [`ModelMapping`] (keyed by
+//! - `WasmPlugin gpustack-model-mapper` per-rule `matchRules` → [`hygress_core::model_mapping::ModelMapping`] (keyed by
 //!   `name.type`, merged into the route whose ingress scope matches)
 //! - `EnvoyFilter ai-route-route-<id>`            → [`FallbackLink`] (4xx/5xx redirect)
 //! - `Secret gpustack-tls-*`                       → [`TlsHost`] (`tls.crt`/`tls.key`, base64)
@@ -917,7 +917,7 @@ pub fn secret_to_tls_host(obj: &Object) -> Option<TlsHost> {
 /// Translate the `higress-config` `ConfigMap` into a [`TimingConfig`] (fix D5).
 ///
 /// GPUStack stores the gateway's Higress/Envoy settings as a **single YAML document** under
-/// `data["higress"]` (NOT as flat ConfigMap keys). [`ensure_gateway_timeout`] reads that blob,
+/// `data["higress"]` (NOT as flat ConfigMap keys). `ensure_gateway_timeout` reads that blob,
 /// rewrites `downstream.idleTimeout` (env `GPUSTACK_PROXY_TIMEOUT_SECONDS`, default 1800) and
 /// `upstream.idleTimeout` (env `GPUSTACK_PROXY_UPSTREAM_IDLE_TIMEOUT_SECONDS`, **default 3**)
 /// in place while preserving the rest — so `maxRequestHeadersKb` lives at

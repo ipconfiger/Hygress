@@ -1,5 +1,5 @@
 //! ⑤ ext-auth (`gpustack-llm-ext-auth`) equivalent — **scope is pure**; the
-//! forward-auth callsite is P5-pending (`integrations`).
+//! forward-auth callsite lives under the `integrations` feature (default).
 //!
 //! The **frozen security invariant** (design §9 / pin §2.3): ext-auth scope is
 //! the **origin ingress name prefix** `ai-route-route-` — *never* a path prefix
@@ -53,7 +53,8 @@ pub enum AuthOutcome {
 
 /// Build the outbound write-back header set from a forward-auth verdict.
 ///
-/// P5-pending: depends on the frozen `hygress_egress::forward_auth::ForwardAuthVerdict`.
+/// `integrations`-gated: consumes the frozen
+/// `hygress_egress::forward_auth::ForwardAuthVerdict`.
 #[cfg(feature = "integrations")]
 pub fn write_back(v: &hygress_egress::forward_auth::ForwardAuthVerdict) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -74,13 +75,20 @@ pub fn write_back(v: &hygress_egress::forward_auth::ForwardAuthVerdict) -> Heade
     h
 }
 
-/// The forward-auth exchange (stage ⑤). P5-pending: consumes the frozen egress
-/// contract `hygress_egress::forward_auth::{Client, ForwardAuthRequest}`.
+/// The forward-auth exchange (stage ⑤). `integrations`-gated: consumes the
+/// frozen egress contract
+/// `hygress_egress::forward_auth::{Client, ForwardAuthRequest}`.
 ///
 /// - `Ok(Some(v))` with `v.authenticated` → `Allowed { write_back }`.
 /// - `Ok(Some(v))` with `!v.authenticated` → `Denied` (real 401).
-/// - `Ok(None)` → fail-open (transport failure) → `Allowed { empty }`.
-/// - `Err(..)` → FAIL_OPEN (do not 401 on an auth-side error) → `Allowed { empty }`.
+/// - `Ok(None)` (the auth service was unreachable / answered 5xx — no verdict)
+///   → `AuthServiceUnavailable`.
+/// - `Err(..)` (transport/parse failure) → `AuthServiceUnavailable`.
+///
+/// How `AuthServiceUnavailable` is resolved is the **pipe's** configured
+/// `auth_fail_closed` mode (R-12): default fail-closed → 403; explicit
+/// `HYGRESS_EXT_AUTH_FAIL_MODE=open` → legacy fail-open (proceed without
+/// write-back). Neither arm of this function ever fail-opens by itself.
 #[cfg(feature = "integrations")]
 pub async fn authenticate(
     client: &hygress_egress::forward_auth::Client,

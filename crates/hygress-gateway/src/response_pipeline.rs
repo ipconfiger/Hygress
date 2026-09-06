@@ -1,6 +1,6 @@
 //! The response-side skeleton (design §2.2 / D-1): the per-chunk hook that sits
 //! between `usage.feed(chunk)` and `write_response_body(chunk)` in
-//! [`crate::pipe::HygressProxy::stream_back`].
+//! `crate::pipe::HygressProxy::stream_back`.
 //!
 //! # Three states (design §2.2)
 //!

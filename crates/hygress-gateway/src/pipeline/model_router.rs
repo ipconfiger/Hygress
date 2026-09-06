@@ -97,7 +97,7 @@ fn from_mode(mode: PathMode, body_model: Option<String>) -> ModelResolve {
 ///
 /// `prefix_hit` + alias-miss, or an `enableOnPathSuffix` match, arm BODY-DRIVEN
 /// (the body is read from the already-buffered `body`). The body is scanned
-/// only when body-driven mode is actually engaged; [`resolve_fused`] is the
+/// only when body-driven mode is actually engaged; `resolve_fused` is the
 /// entry the pipe's prepare uses to avoid even that scan (ORA3-M14).
 pub fn resolve(
     path: &str,

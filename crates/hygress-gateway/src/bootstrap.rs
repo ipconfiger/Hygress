@@ -11,18 +11,19 @@
 //!
 //! ## `integrations`-gated data plane (design §11.2 — this replaces the old stub)
 //!
-//! Under `integrations` ([`run`]) performs the **real container launch sequence**:
+//! Under `integrations` (`run`) performs the **real container launch sequence**:
 //! 1. `GPUSTACK_API_PORT` **readiness probe** (500 ms poll, ~30 s bounded) — fail-fast on timeout.
 //! 2. `jwt_secret_key` resolution (env → `{data_dir}/jwt_secret_key` → **fail-fast**), derive the
-//!    gateway token (design §9), build the [`forward_auth::Client`] + [`GpustackSink`] (loopback;
+//!    gateway token (design §9), build the [`hygress_egress::forward_auth::Client`] +
+//!    [`hygress_egress::usage_sink::GpustackSink`] (loopback;
 //!    the sink's `on_drop` counts usage drops on `/metrics` — ORA3-M4).
 //! 3. Control-plane [`hygress_adapter::Controller`]: build (with the ORA3-MAJ-1 metrics hooks),
 //!    optional topology-B IngressClass seed, spawn the controller loop (watch-driven, ~1s
 //!    poll-based convergence backstop), and **await `ready()`** (first snapshot — bind-ready).
-//! 4. Attach the terminate-mode [`HygressProxy`] data plane (+ TLS when the snapshot has material),
+//! 4. Attach the terminate-mode [`crate::pipe::HygressProxy`] data plane (+ TLS when the snapshot has material),
 //!    **only after** `ready()`. admin/stats listeners ride the same Pingora [`Server`].
 //!
-//! The Pingora [`Server`] is returned by [`run`] and driven by [`main`] on the main thread
+//! The Pingora [`Server`] is returned by `run` and driven by [`main`] on the main thread
 //! (`run_forever()`, which installs the SIGTERM/SIGINT handler and exits 0 on a graceful stop).
 //! The read-only `Controller` keeps watching on the process runtime until the process stops.
 //! [`main`] also installs a panic hook that logs + exits(1) (ORA3-MAJ-1: a dead control plane
@@ -56,9 +57,16 @@ use crate::metrics::Metrics;
 use crate::stats::{StatsService, StatsState};
 use crate::tls_store::SniStore;
 
+/// G6: the GPUStack wire-contract version this build assumes (source of truth:
+/// `docs/research/plugin-contract-pin.md`). Printed once in the boot summary so
+/// a deployed binary carries provenance + a pointer to the §7 re-verify
+/// checklist that must be re-run on any GPUStack upgrade (drift canary).
+const GPUSTACK_CONTRACT_PIN: &str =
+    "plugin-contract-pin.md (gpustack-higress-plugins v0.2.3.post5 / GPUStack v2.2.3) — re-run pin §7 on upgrade";
+
 /// The always-available runtime state (control-plane holder + metrics + TLS +
 /// policy). The egress/adapter-wired [`crate::context::GatewayState`] is layered on top of
-/// this at P5 under `integrations`.
+/// this under the `integrations` feature (default).
 pub struct DataState {
     pub config: GatewayConfig,
     pub shared: SharedConfigHandle,
@@ -86,9 +94,14 @@ impl DataState {
         metrics.add_collector(Box::new(crate::metrics::ConfigSnapshotCollector::new(
             shared_handle.inner.clone(),
         )));
-        let policy = Arc::new(crate::policy_loader::PolicyHandle::new(
-            config.policy_path.clone(),
-        ));
+        let mut policy = crate::policy_loader::PolicyHandle::new(config.policy_path.clone());
+        // O5: one measured choke point — every reload attempt (admin `/reload`
+        // and the 30s mtime-poll reload) lands on hygress_policy_reload_total.
+        let reload_observer_metrics = metrics.clone();
+        policy.set_reload_observer(Some(Arc::new(move |ok| {
+            reload_observer_metrics.record_policy_reload(ok);
+        })));
+        let policy = Arc::new(policy);
         Ok(Self {
             config,
             shared: shared_handle,
@@ -101,7 +114,7 @@ impl DataState {
     /// Real admin service state (`/metrics` `/healthz` `/reload` `/stats/usage`).
     ///
     /// The reload hook is wired to the **policy** reload (design §2.1 / D-7):
-    /// the closure captures the [`PolicyHandle`] and forces a reload from the
+    /// the closure captures the [`crate::policy_loader::PolicyHandle`] and forces a reload from the
     /// configured path. Returns `true` on success (new policy swapped),
     /// `false` on failure (last-known-good retained; the admin endpoint
     /// reports 500 so operators can distinguish).
@@ -415,7 +428,7 @@ fn ext_auth_timeout_ms() -> u64 {
 // Process entry
 // ---------------------------------------------------------------------------
 
-/// Process entry: parse config, drive [`run`], then block the main thread on the Pingora server
+/// Process entry: parse config, drive `run`, then block the main thread on the Pingora server
 /// (which handles SIGTERM/SIGINT and exits 0 on a graceful stop). A startup failure (readiness
 /// timeout, jwt fail-fast, control-plane init) is a logged **non-zero** exit.
 pub fn main() {
@@ -495,6 +508,8 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
     // value. A malformed env that fell back to a default was already warned
     // about per-key by `GatewayConfig::parse`.
     info!(
+        version = env!("CARGO_PKG_VERSION"),
+        contract_pin = crate::bootstrap::GPUSTACK_CONTRACT_PIN,
         http_port = config.http_port,
         tls_port = config.tls_port,
         admin = config.admin_addr.as_str(),
@@ -664,6 +679,8 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
         //    gauge.
         let watch_metrics = ds.metrics.clone();
         let store_metrics = ds.metrics.clone();
+        let sync_metrics = ds.metrics.clone();
+        let failure_metrics = ds.metrics.clone();
         let hooks = ControllerHooks {
             on_watch_error: Some(Arc::new(move |kind: &'static str, class: &'static str| {
                 watch_metrics.record_control_watch_error(kind, class);
@@ -671,6 +688,18 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             on_snapshot_store: Some(Arc::new(move || {
                 store_metrics.record_control_snapshot_store();
                 store_metrics.record_control_last_store_timestamp();
+            })),
+            // O3: the heartbeat is stamped on EVERY successful reconcile pass
+            // (including fingerprint no-op rounds) — a quiet healthy cluster
+            // keeps hygress_control_last_sync_timestamp_seconds fresh.
+            on_sync_ok: Some(Arc::new(move || {
+                sync_metrics.record_control_sync();
+            })),
+            // O4: reconcile failure episodes (list / rejected) land on
+            // hygress_control_reconcile_error_total — once per outage, not per
+            // ~1s tick (the adapter's warn-once latch).
+            on_sync_failure: Some(Arc::new(move |class: &'static str| {
+                failure_metrics.record_control_reconcile_error(class);
             })),
         };
         let controller = Controller::new(

@@ -5,11 +5,11 @@
 //!
 //! # Two-phase reservation (D-11 / D-13)
 //!
-//! A request first [`reserve`]s an **estimate** (`est = ceil(body_bytes / K)`,
+//! A request first `reserve`s an **estimate** (`est = ceil(body_bytes / K)`,
 //! D-13), then settles it:
-//! - on success: [`commit`] replaces the estimate with the **actual** tokens;
+//! - on success: `commit` replaces the estimate with the **actual** tokens;
 //! - on abort (terminal non-2xx / transport / guardrail / write-fail):
-//!   [`release`] returns the unused portion.
+//!   `release` returns the unused portion.
 //!
 //! # Counters
 //!
@@ -32,7 +32,7 @@
 //!
 //! # In-flight settle (per-reservation)
 //!
-//! Both [`commit`] and [`release`] take the specific reservation's
+//! Both `commit` and `release` take the specific reservation's
 //! **estimate**, so concurrent in-flight requests on the same
 //! `(consumer, model)` settle independently (the unit is the reserved
 //! `est_tokens`, not "settle the whole key"). The v1 RAII guard creates at
@@ -92,7 +92,7 @@ impl QuotaEngine {
     /// The decision compares the projected total (`used + est_tokens`) against
     /// the soft/hard limits. A [`QuotaDecision::HardDeny`] records nothing;
     /// [`QuotaDecision::Allowed`] / [`QuotaDecision::SoftExceed`] add the
-    /// estimate to the window (in-flight until [`commit`] / [`release`]).
+    /// estimate to the window (in-flight until `commit` / `release`).
     pub fn reserve(
         &self,
         now_ms: u64,
@@ -242,7 +242,7 @@ impl QuotaEngine {
 
     /// Evict entries whose `last_used_ms` is older than `now_ms - idle_ms`
     /// (idle-based leak prevention, complementing the window-based
-    /// [`gc_stale`]). Returns the number of entries removed.
+    /// [`QuotaEngine::gc_stale`]). Returns the number of entries removed.
     ///
     /// This is the gateway's periodic cleanup: each key's window is
     /// spec-relative, so a single global window index does not adapt; idle

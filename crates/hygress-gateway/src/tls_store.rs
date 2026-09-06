@@ -22,7 +22,7 @@
 //!
 //! ## SNI selection (exact → first-level wildcard → default)
 //!
-//! [`SniResolver`] implements rustls's [`ResolvesServerCert`]: it reads the
+//! `SniResolver` implements rustls's [`ResolvesServerCert`]: it reads the
 //! client SNI (`ClientHello::server_name`) and resolves the cert by **exact
 //! lowercase host → first-level wildcard (`a.b.c` → `*.b.c`) → the
 //! `gpustack-tls-default` fallback**. The pure selection policy
@@ -33,7 +33,7 @@
 //! rustls 0.23 has no default crypto provider; building a [`CertifiedKey`]
 //! (and a [`ServerConfig`]) requires one. Rather than pin `ring`/`aws-lc-rs`
 //! here, every entry point that needs the crypto takes `provider: &Arc<CryptoProvider>`
-//! and the P5 data plane supplies it. That keeps this module free of a specific
+//! and the data plane supplies it. That keeps this module free of a specific
 //! provider dependency while still producing a real, attachable [`ServerConfig`].
 
 use std::collections::BTreeMap;
@@ -283,8 +283,8 @@ impl ResolvesServerCert for SniResolver {
 
 // ---------------------------------------------------------------------------
 // Tests — pure parts only (PEM parse + SNI policy). The provider-dependent
-// `CertifiedKey` build + real handshake are exercised by the P5 integration
-// suite (a crypto provider is supplied there).
+// `CertifiedKey` build + real handshake are exercised by the `integrations`
+// e2e suite (a crypto provider is supplied there).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

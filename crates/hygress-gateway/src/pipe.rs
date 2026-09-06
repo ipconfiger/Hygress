@@ -6,7 +6,7 @@
 //!
 //! The entire request lifecycle runs inside [`ProxyHttp::request_filter`] and
 //! returns `Ok(true)`, so Pingora never dials an upstream itself
-//! ([`upstream_peer`] is a trait-required sentinel that is never contacted).
+//! (`upstream_peer` is a trait-required sentinel that is never contacted).
 //! This mirrors the validated `dogress2` terminate-mode mechanism:
 //!
 //! 1. Read the **full** downstream body (terminate-mode: model-router, failover
@@ -26,7 +26,8 @@
 //! 5. **Stream the response back** (⑪) chunk-by-chunk, feeding the usage
 //!    accumulator (SSE / non-streaming JSON), capturing TTFT, and stripping
 //!    hop-by-hop / encoding headers.
-//! 6. **Usage push** (⑫, model-route only) via the egress [`GpustackSink`].
+//! 6. **Usage push** (⑫, model-route only) via the egress
+//!    [`hygress_egress::usage_sink::GpustackSink`].
 //! 7. **Stats/logging** (⑬) via [`crate::metrics::Metrics`].
 //! 8. **4xx/5xx fallback** (⑭): on a final 4xx/5xx (or a total transport
 //!    failure) with a fallback link, arm `x-higress-fallback-from` +
@@ -936,6 +937,13 @@ impl HygressProxy {
     /// early 429 does not drain a potentially large request body.
     fn read_headers(session: &Session) -> InboundHead {
         let req = session.req_header();
+        // Q4: the derived `InboundHead` fields below (`host` / `content-type` /
+        // `client_ip` / `content-length`) are read via `to_str().ok()` → `""`
+        // on a non-UTF-8 value, silently. Intentional: they only feed local
+        // logic (routing, content-type gates, rate-limit keys), and the same
+        // headers are ALSO copied verbatim through `utf8_header_value` further
+        // down, which owns the drop-with-warn for anything forwarded. Nothing
+        // is silently lossy on the wire.
         let host = req
             .headers
             .get("host")
@@ -1369,10 +1377,10 @@ const DIAL_SKIP: &[&str] = &["content-type"];
 /// Response-direction hop-by-hop / connection headers never forwarded
 /// downstream (ORA3-M12 — the one response strip list; see the module comment
 /// above for how it relates to [`crate::pipeline::HOP_BY_HOP`]). Framing
-/// (`content-length`) is handled by `response_framing` (P1), and
-/// `content-encoding` IS forwarded verbatim (P5): the body is forwarded
-/// byte-for-byte and reqwest has no gzip feature, so stripping it would hand
-/// the client a mislabeled encoded body.
+/// (`content-length`) is handled by `response_framing`, and
+/// `content-encoding` IS forwarded verbatim (integrations forward path): the
+/// body is forwarded byte-for-byte and reqwest has no gzip feature, so
+/// stripping it would hand the client a mislabeled encoded body.
 const RESPONSE_STRIP: &[&str] = &[
     "server",
     "via",
@@ -1737,10 +1745,11 @@ impl HygressProxy {
         // Hop-by-hop / connection-negotiated headers are not forwarded: the
         // response strip list is [`RESPONSE_STRIP`] (ORA3-M12 — one list, the
         // response counterpart of the request `crate::pipeline::HOP_BY_HOP`).
-        // Framing (`content-length`) is handled by `response_framing` below
-        // (P1), and `content-encoding` IS forwarded verbatim (P5): the body is
-        // forwarded byte-for-byte and reqwest has no gzip feature, so
-        // stripping it would hand the client a mislabeled encoded body.
+        // Framing (`content-length`) is handled by `response_framing` below,
+        // and `content-encoding` IS forwarded verbatim (integrations forward
+        // path): the body is forwarded byte-for-byte and reqwest has no gzip
+        // feature, so stripping it would hand the client a mislabeled encoded
+        // body.
         let status = resp.status().as_u16();
         // The upstream `content-length` is trusted for keep-alive framing when
         // the body passes through unmodified. A streamed upstream (SSE) has no
@@ -1904,6 +1913,10 @@ impl HygressProxy {
             if let Some(g) = quota {
                 g.settle(Some(metrics.total_token));
             }
+            // G2: count the row handed to the sink by metering quality
+            // (completed=true = exact upstream usage vs completed=false =
+            // server-side estimation fallback).
+            m.record_usage_pushed(metrics.completed);
             let _ = sink.push(&metrics).await;
         } else if let Some(g) = quota {
             // Defensive: a reservation without a usage row (mirror traffic
@@ -1956,6 +1969,8 @@ impl HygressProxy {
                 },
                 |s| s.flush(&fields),
             );
+            // G2: same metering-quality split as the 2xx success push.
+            self.state.metrics.record_usage_pushed(metrics.completed);
             let _ = sink.push(&metrics).await;
         }
     }

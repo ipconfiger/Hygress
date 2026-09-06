@@ -125,7 +125,7 @@ usage sink（`ModelUsageMetrics` 17 字段防丢行）→ 写回头（X-Mse-Cons
 | 可观测性 | 指标散在 Envoy/Istio/Wasm 各通道 | Rust tracing + Prometheus（:15020）+ admin 集中输出 |
 | 多租户 | 依赖路由命名约定 | 类型安全的路由/注册表隔离 + 原生命中/映射 |
 | 可控性 | 扩展需 Go + Wasm 桥接 | 全 Rust，`async`/无锁 ARC-swap 热重载：CRD 变更收敛 **≤1 事件周期**（拓扑 B/external，WATCH 事件驱动）或 **~1s 轮询**（拓扑 A：GPUStack 内嵌 apiserver 不支持 WATCH → poll 收敛，`POLL_INTERVAL` 默认 1000ms，与真实 Higress pilot 1s 轮询平价）；policy 文件 mtime 检查同为 30s dutycycle + `/reload` 即时 |
-| 测试 | — | **368 测试、零 mock/stub、Gate-1/2 oracle 9/10** |
+| 测试 | — | **661 测试全绿（含 39 真实 e2e、12 alloc_guard 预算）、零 mock/stub、多轮 oracle 收敛：ora-6 五维 9.5-9.6（v0.1.0）** |
 | **兼容性** | 自身即基线 | **端口契约 / CRD schema / usage 落库逐字节一致**，只读控制面，零 Python 改动 |
 | 回滚 | — | s6 层保留 `.dist` 原脚本快照，一条命令回退基线镜像 |
 

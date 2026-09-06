@@ -74,6 +74,7 @@ scrape_configs:
 | `quota_denied_total` | — | token 配额 hard 超限 429 | 某 consumer×model 触顶 |
 | `quota_soft_exceed_total` | — | soft 超限（放行 + 警告位） | 配额估算是否过紧的前兆 |
 | `guardrail_blocked_total` | `side=in\|out` | 护栏拦截（入向 403；出向跨块断流） | 提示注入/敏感词命中率；`side=out` 断流同时产生 `completed=false` usage |
+| `guardrail_error_total` | — | **LLM 护栏服务调用失败**（verdict 不可得：传输/非 2xx/畸形体）——按 fail mode 裁决，**不**计入内容拦截 | `increase(...[5m])>0` 告警；fail-closed 形态下 403 流量即此计数（与 `guardrail_blocked_total{side=in}` 区分内容命中） |
 | `policy_applied_total` | `applied=true\|false` | 路由策略覆盖应用结果 | `override_route` 目标运行时 miss ⇒ 回退原路由 + `applied=false` |
 | `usage_pushed_total` | `completed=true\|false` | 交给 usage sink 的行数。`true` = 上游给了规范 usage；`false` = 依赖 GPUStack 服务端字节/分块估算（CPU `serve.py` 等后端属正常） | “缺 usage 行”时的第一对照指标（见 §4） |
 | `usage_push_dropped_total` | — | 到不了 sink 的行（队列满 / flusher 消失 / 最终推送失败） | **>0 即告警**：sink 侧（GPUStack API）不可达或过载 |

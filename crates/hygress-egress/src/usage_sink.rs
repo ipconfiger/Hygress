@@ -162,12 +162,15 @@ impl GpustackSink {
         match self.tx.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("usage push queue full; dropping metric (fire-and-forget)");
+                // O6: DEBUG — drop-path logs recur at row rate during an outage /
+                // saturation; every drop also fires `on_drop`, which the gateway
+                // counts on hygress_usage_push_dropped_total (the operator signal).
+                tracing::debug!("usage push queue full; dropping metric (fire-and-forget)");
                 Self::notify_drop(&self.on_drop);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("usage flusher gone; dropping metric");
+                tracing::debug!("usage flusher gone; dropping metric");
                 Self::notify_drop(&self.on_drop);
                 Ok(())
             }
@@ -206,19 +209,19 @@ impl GpustackSink {
                 Ok(()) => return,
                 Err(e) => {
                     if !Self::retryable(&e) {
-                        tracing::warn!(
+                        tracing::debug!(
                             "usage push to {endpoint} failed with non-retryable {e} on attempt {attempt}; dropping metric"
                         );
                         Self::notify_drop(on_drop);
                         return;
                     }
-                    tracing::warn!(
+                    tracing::debug!(
                         "usage push to {endpoint} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}"
                     );
                 }
             }
         }
-        tracing::warn!(
+        tracing::debug!(
             "usage push to {endpoint} failed after {MAX_ATTEMPTS} attempts; dropping metric"
         );
         Self::notify_drop(on_drop);

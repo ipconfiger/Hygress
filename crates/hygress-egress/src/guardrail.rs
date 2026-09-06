@@ -180,7 +180,10 @@ impl GuardrailClient {
             .send()
             .await
             .map_err(|e| {
-                tracing::warn!("guardrail transport error to {url}: {e}");
+                // O6: DEBUG — a sustained guardrail outage recurs at request rate; the
+                // gateway records each failure on hygress_guardrail_error_total and
+                // resolves the request by the configured fail mode.
+                tracing::debug!("guardrail transport error to {url}: {e}");
                 Error::GuardrailCall(format!("transport: {e}"))
             })?;
 
@@ -188,7 +191,7 @@ impl GuardrailClient {
         if !status.is_success() {
             // Drain the (small) body so the connection is released cleanly, then report the status.
             let _ = response.bytes().await;
-            tracing::warn!("guardrail {status} from {url}");
+            tracing::debug!("guardrail {status} from {url}");
             return Err(Error::GuardrailCall(format!("HTTP {status} from guardrail endpoint")));
         }
 
@@ -207,7 +210,7 @@ impl GuardrailClient {
         match serde_json::from_slice::<GuardVerdict>(&bytes) {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                tracing::warn!("guardrail malformed 2xx body from {url}: {e}");
+                tracing::debug!("guardrail malformed 2xx body from {url}: {e}");
                 Err(Error::GuardrailCall(format!("malformed verdict body: {e}")))
             }
         }

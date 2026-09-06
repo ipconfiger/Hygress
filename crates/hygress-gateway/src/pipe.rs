@@ -189,6 +189,15 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// Outcome of the request-side guardrail (O6): a real content **Block**
+/// (static rule or LLM verdict "blocked") vs a **service failure** the
+/// gateway resolves via the configured fail mode (`Unavailable`, recorded
+/// on `hygress_guardrail_error_total`, never on the content-block counter).
+enum GuardrailHit {
+    Block(String),
+    Unavailable(String),
+}
+
 #[async_trait::async_trait]
 impl ProxyHttp for HygressProxy {
     type CTX = ReqCtx;
@@ -560,7 +569,7 @@ impl ProxyHttp for HygressProxy {
             // (H3) — no per-request regex compilation.
             if redirect_count == 0 {
                 if let Some(entry) = merged.as_ref() {
-                    if let Some(reason) = self
+                    if let Some(hit) = self
                         .guardrail_in(
                             &state,
                             entry.policy.guardrail.as_ref(),
@@ -569,7 +578,20 @@ impl ProxyHttp for HygressProxy {
                         )
                         .await
                     {
-                        state.metrics.record_guardrail_blocked("in");
+                        // O6: a real content block and a guardrail-service
+                        // failure (resolved by the fail mode) are recorded on
+                        // DISTINCT metrics — the client-facing 403 slug stays
+                        // `guardrail_blocked` in both cases.
+                        let reason = match &hit {
+                            GuardrailHit::Block(r) => {
+                                state.metrics.record_guardrail_blocked("in");
+                                r.clone()
+                            }
+                            GuardrailHit::Unavailable(r) => {
+                                state.metrics.record_guardrail_error();
+                                r.clone()
+                            }
+                        };
                         self.report_incomplete_usage(&prepared, &prepared.selected_service, None)
                             .await;
                         // AM-5: terminal 403 → request-level total.
@@ -1262,6 +1284,9 @@ impl HygressProxy {
         }
     }
 
+    /// Outcome of the request-side guardrail (O6) — see the module-level
+    /// [`GuardrailHit`].
+    ///
     /// B4a/B4b (design §4.4 / D-14): the **request-side** guardrail, run once
     /// before the candidate loop (initial dispatch only). The guarded body is
     /// then carried by the loop — a fallback hop inherits it (D-3); v1 actions
@@ -1269,21 +1294,25 @@ impl HygressProxy {
     ///
     /// - **not configured** (no `guardrail` section) → pass-through (D-14);
     /// - **B4a static rules** (the effective `global ++ route` set): a `Block`
-    ///   hit → the block reason (the caller 403s `guardrail_blocked`);
+    ///   hit → [`GuardrailHit::Block`] (the caller 403s `guardrail_blocked`);
     /// - **B4b LLM verdict** (a `HYGRESS_GUARDRAIL_URL` is required — without
     ///   it the LLM stage is *not configured* → pass-through, D-14):
     ///   - `sync`: `Ok(None)` (no verdict) → pass; `Ok(Some(blocked))` → block;
     ///     `Err` → reject only when **both** knobs agree (`fail_mode` `closed`
-    ///     + `on_error` `reject`) — fail-closed (D-14), else fail-open;
+    ///     + `on_error` `reject`) — fail-closed (D-14), else fail-open. A
+    ///     service failure is [`GuardrailHit::Unavailable`] (fail-closed) or a
+    ///     pass-through with `hygress_guardrail_error_total` incremented
+    ///     (fail-open) — never counted as a content block (O6);
     ///   - `async`: the verdict is collected in a spawned task (recorded via
-    ///     tracing) and the request proceeds (not on the path).
+    ///     tracing + the error counter) and the request proceeds (not on the
+    ///     path).
     async fn guardrail_in(
         &self,
         state: &GatewayState,
         guardrail: Option<&GuardrailSpec>,
         static_set: Option<&StaticRuleSet>,
         body: &[u8],
-    ) -> Option<String> {
+    ) -> Option<GuardrailHit> {
         let Some(g) = guardrail else {
             return None; // not configured → pass-through (D-14)
         };
@@ -1296,7 +1325,7 @@ impl HygressProxy {
         if let Some(set) = static_set {
             if let Some(hit) = set.evaluate(&text) {
                 if hit.action == GuardAction::Block {
-                    return Some(format!("static rule '{}'", hit.hit_name));
+                    return Some(GuardrailHit::Block(format!("static rule '{}'", hit.hit_name)));
                 }
             }
         }
@@ -1314,11 +1343,11 @@ impl HygressProxy {
                 Ok(None) => None, // no verdict → pass
                 Ok(Some(v)) => {
                     if v.blocked {
-                        Some(if v.reason.is_empty() {
+                        Some(GuardrailHit::Block(if v.reason.is_empty() {
                             "llm verdict: blocked".to_string()
                         } else {
                             v.reason.clone()
-                        })
+                        }))
                     } else {
                         None
                     }
@@ -1328,14 +1357,21 @@ impl HygressProxy {
                     // the call failed, and both knobs agree on reject.
                     let reject = matches!(g.fail_mode, GuardrailFailMode::Closed)
                         && matches!(llm.on_error, LlmOnError::Reject);
+                    state.metrics.record_guardrail_error();
+                    // O6: verdict failures are DEBUG-level here — they recur at
+                    // request rate during a sustained guardrail outage and
+                    // would flood the log; the rate signal is
+                    // hygress_guardrail_error_total (+ the 403 for reject).
                     if reject {
-                        warn!(
+                        debug!(
                             error = %e,
                             "llm guardrail verdict failed; rejecting (fail-closed, D-14)"
                         );
-                        Some("llm guardrail verdict failed (fail-closed)".to_string())
+                        Some(GuardrailHit::Unavailable(
+                            "llm guardrail verdict failed (fail-closed)".to_string(),
+                        ))
                     } else {
-                        warn!(error = %e, "llm guardrail verdict failed; allowing (fail-open)");
+                        debug!(error = %e, "llm guardrail verdict failed; allowing (fail-open)");
                         None
                     }
                 }
@@ -1344,6 +1380,7 @@ impl HygressProxy {
                 // Collect the verdict without blocking the request path
                 // (record only — the request proceeds regardless).
                 let client = client.clone();
+                let metrics = state.metrics.clone();
                 let text = text.into_owned();
                 tokio::spawn(async move {
                     match client.classify(&text).await {
@@ -1357,7 +1394,8 @@ impl HygressProxy {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            warn!(error = %e, "async guardrail verdict failed (recorded only)");
+                            metrics.record_guardrail_error();
+                            debug!(error = %e, "async guardrail verdict failed (recorded only)");
                         }
                     }
                 });

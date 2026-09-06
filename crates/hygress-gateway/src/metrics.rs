@@ -142,6 +142,9 @@ struct Inner {
     quota_soft_exceed: IntCounter,
     policy_applied: IntCounterVec,
     guardrail_blocked: IntCounterVec,
+    /// O6: LLM-guardrail service failures (verdict unavailable) — distinct from
+    /// content blocks; the operator alert is `increase(...[5m]) > 0`.
+    guardrail_error_total: IntCounter,
     // R-11 (C3): TLS rotation detection (0.8 = no hot reload → restart needed).
     tls_cert_change_detected: IntCounter,
     tls_cert_requires_restart: IntCounter,
@@ -320,6 +323,13 @@ impl Metrics {
             &["side"],
         )
         .expect("guardrail_blocked");
+        // O6: LLM-guardrail SERVICE failures (the verdict call itself failed
+        // — transport / non-2xx / malformed) are distinct from content blocks:
+        // the request is rejected by the configured fail mode, not because the
+        // content tripped a rule. Rate signal for the log-flood-free path.
+        let guardrail_error_total =
+            IntCounter::new("hygress_guardrail_error_total", "LLM-guardrail service call failures (verdict unavailable).")
+                .expect("guardrail_error_total");
         // R-11 (C3): TLS rotation detection counters.
         let tls_cert_change_detected = IntCounter::new(
             "hygress_tls_cert_change_detected_total",
@@ -357,6 +367,7 @@ impl Metrics {
             Box::new(quota_soft_exceed.clone()),
             Box::new(policy_applied.clone()),
             Box::new(guardrail_blocked.clone()),
+            Box::new(guardrail_error_total.clone()),
             Box::new(tls_cert_change_detected.clone()),
             Box::new(tls_cert_requires_restart.clone()),
         ];
@@ -390,6 +401,7 @@ impl Metrics {
                 quota_soft_exceed,
                 policy_applied,
                 guardrail_blocked,
+                guardrail_error_total,
                 tls_cert_change_detected,
                 tls_cert_requires_restart,
                 requests_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -631,6 +643,14 @@ impl Metrics {
             .inc();
     }
 
+    /// O6: an LLM-guardrail SERVICE failure — the verdict call itself failed
+    /// (transport / non-2xx / malformed body), so no verdict exists and the
+    /// request is resolved by the configured fail mode. Distinct from
+    /// [`Metrics::record_guardrail_blocked`] (a real content hit).
+    pub fn record_guardrail_error(&self) {
+        self.inner.guardrail_error_total.inc();
+    }
+
     /// R-11 (C3): a TLS content fingerprint change was detected at runtime.
     pub fn record_tls_cert_change_detected(&self) {
         self.inner.tls_cert_change_detected.inc();
@@ -840,6 +860,7 @@ mod tests {
         m.record_control_sync();
         m.record_policy_reload(true);
         m.record_policy_reload(false);
+        m.record_guardrail_error();
         let out = m.encode();
         assert!(
             out.lines().any(|l| {
@@ -896,6 +917,12 @@ mod tests {
                     && l.ends_with(" 1")
             }),
             "policy reload failure missing:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| {
+                l.starts_with("hygress_guardrail_error_total") && l.ends_with(" 1")
+            }),
+            "guardrail error counter missing:\n{out}"
         );
     }
 }

@@ -226,10 +226,13 @@ impl Client {
 
         // Transport error (connect refused, DNS, timeout, ...): no verdict — the auth service is
         // unavailable. The gateway decides what the missing verdict means (default: deny, 403).
+        // O6: DEBUG, not warn — this recurs at request rate while the auth service is down and
+        // would flood the log; the outcome is counted by the gateway on
+        // `hygress_auth_decisions_total{result="auth_service_unavailable_*"}`.
         let response = match builder.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     "forward-auth transport error to {url}: {e}; auth service unavailable — \
                      returning no verdict (the gateway applies its configured fail mode)"
                 );
@@ -241,7 +244,8 @@ impl Client {
         if status.is_server_error() {
             // 5xx: the auth service answered but is unhealthy — same no-verdict contract as a
             // transport error; the gateway applies its configured fail mode to the gap.
-            tracing::warn!(
+            // O6: DEBUG at request rate (see the transport branch above); the metric carries it.
+            tracing::debug!(
                 "forward-auth {status} from {url}: auth service unavailable — returning no \
                  verdict (the gateway applies its configured fail mode)"
             );

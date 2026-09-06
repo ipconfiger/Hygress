@@ -5,7 +5,9 @@
 
 ## [Unreleased]
 
-- （无待发布项；残余记录在案：P4 入站头借用式物化属数据流重构延后项，见 `docs/research/audit-oracle-review-ora5.md` §7）
+- 文档：README 整体重写精简（结构化 + 指向深层文档）；新增真机基准图表
+  `docs/img/bench-{kernel,vs-envoy,alloc,convergence}.svg` 与 §3 Benchmark 段。
+- （残余记录在案：P4 入站头借用式物化属数据流重构延后项，见 `docs/research/audit-oracle-review-ora5.md` §7）
 
 ## [v0.1.0] - 2026-09-06（冻结版；tag `v0.1.0`）
 

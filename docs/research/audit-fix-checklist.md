@@ -175,3 +175,15 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
 | 收敛节奏 30s tick → ~1s poll | adapter `CONVERGE_MIN_TICK`=1s，tick=`max(poll_interval,1s)`（POLL_INTERVAL env 默认 1000ms 可调）；指纹短路保稳态零 store；watch 事件仍为健康态快路径；策略 mtime 30s dutycycle 独立保留（非热路径） | **P1 建路由→生效 17s → 2s**（对齐真实 Higress pilot 1s LIST 轮询平价） |
 | 文案同步 | 启动收敛模式日志/注释/README/design/equivalence 拓扑 A 表述改 ~1s poll（audit/checklist 历史记录保留原样） | 60s 日志增量 +1690B（仅 watch 限速行；1s 轮询静默） |
 | 门禁 | 640 tests / clippy 双模式 0 | chat 基线 200 HYGRESS_B99_OK；store_total 按变更推进 |
+
+### B10 — ora-5 修复批（≥9.5 收口轮，79a3d5e→5de0cd4→80db787；详见 docs/research/audit-oracle-review-ora5.md）
+| 组 | 落地 |
+|---|---|
+| 观测/控制面（O3/O4/O5/O9/G1/G2/G6 + P1） | last_sync 心跳、reconcile_error{list/rejected} episode 计数、policy_reload observer、usage_pushed{completed}、build_info + 启动 version/contract_pin、指标 handle 缓存、LIST 失败 warn-once |
+| 性能（R3/P2/P5/P7） | AM-2 memo（per-candidate 体扫消除，字节等价）、错误体 256KiB 封顶、限流 borrowed-key |
+| 质量（Q1-Q4, T1-T5, G3） | OutboundHeaders names/append 契约修复、auth 文档、guardrail 活 accumulator、12 单元 + 4 e2e 边界测试 |
+| 日志/可观测 O6/O11/O12/O13 | guardrail_error_total（服务失败与内容拦截分离）、逐请求 warn 降 debug、Debug 脱敏、upstream_errors{destination}、controller 任务观察 |
+| 依赖/文档（M4/M5/M6/M3、O1/O2/O7/O8/O10） | ring-only TLS（aws-lc 出锁）、rand 清理、missing_docs 121 项 + 四 crate 强制、serde_yaml 离线决策、README/compose/operations.md |
+| 门禁/真机 | **659 tests** / clippy 双模式 0 / alloc_guard 11/11 / cargo doc -D warnings 0；真机 b101（镜像 bfcf515）：新族活体 + 心跳前移 + 0 丢行 + 0 LIST 刷屏 + 401 fail-closed；回滚 gpustack:hygress-b100 |
+
+状态：ora-6 收敛复核（五维 ≥9.5 判定）进行中。

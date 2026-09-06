@@ -162,6 +162,7 @@ mod tests {
             usage: None,
             selected_service: first.service_name.clone(),
             started_at_ms: 0,
+            am2_memo: None,
             override_timeout_ms: None,
             override_retries: None,
         }

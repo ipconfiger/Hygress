@@ -1,0 +1,171 @@
+# =============================================================================
+# compose-hygress.template.yaml —— 用 Hygress 网关镜像运行 gpustack-server 的通用模板
+# （Hygress = 以 Rust/Pingora 原位替换 GPUStack 内嵌 Higress 数据面；本模板参考
+#   docs/research/gpustack-validation/scripts/compose-hygress.yaml 泛化而来）
+#
+# 用法（三步）：
+#   1) 复制模板并编辑变量（推荐把 secret 放进同目录 .env，docker compose 自动读取；
+#      也可直接 export 后由 ${VAR} / ${VAR:-default} 插值）：
+#        cp pack/compose-hygress.template.yaml compose-hygress.yaml
+#        # 编辑 compose-hygress.yaml 顶部的 IMAGE_TAG / DATA_DIR_HOST_PATH 等，
+#        # 或新建同目录 .env：
+#        #   GPUSTACK_BOOTSTRAP_PASSWORD=...
+#        #   GPUSTACK_TOKEN=...
+#        #   HYGRESS_ADMIN_TOKEN=<随机值>
+#        #   IMAGE_TAG=gpustack:hygress
+#   2) 启动（默认只起 server；含 GPU 的 worker 见下方 worker 服务注释）：
+#        docker compose -f compose-hygress.yaml up -d
+#   3) 验证：
+#        curl http://127.0.0.1:${API_PORT_MAP:-30080}/healthz     # GPUStack API
+#        curl http://127.0.0.1:${GATEWAY_HTTP_PORT_MAP:-80}/readyz # Hygress 数据面镜像通道
+#
+# 回滚（一条命令级切换）：
+#   把 IMAGE_TAG 换回上一个可用标签（或官方镜像 GPU_STACK_IMAGE，如
+#   quay.io/gpustack/gpustack:latest），然后：
+#        docker compose -f compose-hygress.yaml up -d
+#   server 数据卷（DATA_DIR_HOST_PATH）与 worker 不动；原内嵌 Higress 脚本仍在镜像
+#   /etc/s6-overlay/s6-rc.d.dist/（见 pack/hygress-s6/ROLLBACK.md）。
+#
+# 变量表（全部可用 ${VAR} 或 .env 覆盖；括号内为默认值）：
+#   IMAGE_TAG                         (gpustack:hygress)
+#        Hygress 定制 server 镜像（由 pack/Dockerfile.hygress 基于官方镜像构建：
+#        cargo build --release -p hygress-gateway --features integrations &&
+#        docker build -f pack/Dockerfile.hygress -t gpustack:hygress .）。
+#   GPU_STACK_IMAGE                   (quay.io/gpustack/gpustack:latest)
+#        官方 GPUStack 镜像：worker 服务使用；也是回滚时 server 可切回的目标。
+#   DATA_DIR_HOST_PATH                (./server-data)
+#        server 数据卷宿主机路径 → 容器 /var/lib/gpustack（内嵌 Postgres /
+#        kube-apiserver / CRD 状态 / jwt_secret_key / log/hygress.log 都在此；
+#        换机/升级必须带原卷，Hygress 只读同批 CRD）。
+#   API_PORT_MAP                      (30080)  宿主端口 → 容器 30080（GPUStack API）
+#   GATEWAY_HTTP_PORT_MAP             (80)     宿主端口 → 容器 80（Hygress 数据面 http）
+#   TLS_PORT_MAP                      (443)    宿主端口 → 容器 443
+#   GATEWAY_STATS_PORT_MAP            (空/注释)
+#        如需要从宿主机抓 Prometheus，可放开 "15020:15020"（15020 绑 0.0.0.0 且
+#        无鉴权——Istio sidecar 契约，仅限内网/本机，勿暴露公网）。
+#   POLICY_HOST_DIR                   (./policy)
+#        策略文件宿主机目录 → 容器 /etc/hygress（只读）。目录须含 policy.yaml
+#        （缺文件 = 内置全放行默认 + fail-safe；文件随后出现会在 ≤30s 内被 mtime
+#        轮询热加载，或 POST /reload 即时，见 docs/operations.md）。
+#   HYGRESS_ADMIN_TOKEN               (空)
+#        admin token（:8081 的 POST /reload、GET /config、GET /stats/usage）。
+#        生产必须注入随机值；为空 = 出厂 fail-closed（401），/reload 不可用。
+#   HYGRESS_TOPOLOGY_B                (false)
+#        仅外部集群拓扑需要 true（external 模式启动即探测 higress IngressClass）。
+#        默认 embedded（GPUStack 内嵌 apiserver）必须保持 false（零 apiserver 写入）。
+#   GPUSTACK_BOOTSTRAP_PASSWORD       (必填 secret)
+#        首次启动默认 admin 用户密码（.env 提供；仅首次 bootstrap 生效）。
+#   GPUSTACK_TOKEN                    (必填 secret)
+#        server/worker 共享注册令牌（.env 提供）。
+#   DOCKER_SOCK_PATH                  (/var/run/docker.sock)
+#   WORKER_DATA_HOST_PATH             (/var/lib/gpustack)
+#        worker 模型目录身份绑定（模型 GGUF 需宿主机 docker daemon 可 bind）。
+#   GPUSTACK_WORKER_SERVER_URL        (http://gpustack-server:30080)
+#        worker 连 server 的地址：同 compose 桥接网络内用服务名；
+#        若 server 走 host 网络 / 跨机部署则改 http://<host>:${API_PORT_MAP}。
+#   WORKER_NAME                       (worker1)
+#
+# 端口与网络说明：
+#   模板默认用「桥接网络 + ports 发布」（上述 *_PORT_MAP 生效）。
+#   官方/基线部署是 host 网络（见 fixtures-baseline/compose.yaml）：如需沿用 host
+#   网络，删除两个服务的 network 默认设置并加 network_mode: host（同时删除 ports
+#   段——host 模式下 *_PORT_MAP 退化为 1:1，admin 127.0.0.1:8081 直接在宿主机可达）。
+#
+# TLS 注意（ORA3-M19 默认安装差异）：
+#   Hygress 仅当控制面快照含 managed gpustack-tls-* Secret 才绑 :443；GPUStack 只有
+#   带 --ssl-keyfile/--ssl-certfile 启动才写该类 Secret ⇒ 默认安装下 https://host:443
+#   是 connection refused（真实内嵌 Higress 会呈现自签证书页）。需要 :443 时给
+#   gpustack-server 的 command 加 --ssl-certfile/--ssl-keyfile（指向卷内证书路径）。
+#   证书轮换：运行时检出（计数 + ERROR 日志），但需重启容器生效——runbook 见
+#   pack/hygress-s6/README.md 与 docs/operations.md。
+#
+# 非默认环境变量（fixture 继承，按部署环境调整）：
+#   HF_ENDPOINT=https://hf-mirror.com、GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY=quay.io
+#   是验证环境（hf/docker.io 不可达）的镜像源兜底；官方默认分别可改回
+#   https://huggingface.co 与 docker.io（删除或改值即可）。
+# =============================================================================
+name: hygress-gpustack
+
+services:
+  gpustack-server:
+    # 唯一与官方镜像不同的行：内嵌 Higress(pilot/controller/envoy) → 单 Hygress 进程
+    image: ${IMAGE_TAG:-gpustack:hygress}
+    container_name: gpustack-server
+    privileged: true
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    ports:
+      # 数据面 http（Hygress；GPUStack 内嵌 Higress 原槽位）
+      - "${GATEWAY_HTTP_PORT_MAP:-80}:80"
+      # 数据面 tls（默认无监听，见上 TLS 注意；配置 --ssl-* 后生效）
+      - "${TLS_PORT_MAP:-443}:443"
+      # GPUStack API（worker / CLI 入口）
+      - "${API_PORT_MAP:-30080}:30080"
+      # admin/metrics 127.0.0.1:8081 为容器内 loopback，无法发布；
+      # 需要从宿主机看指标：放开下行（15020 无鉴权，仅内网）或 docker exec：
+      #   docker exec gpustack-server curl -s 127.0.0.1:8081/metrics
+      # - "${GATEWAY_STATS_PORT_MAP:-15020}:15020"
+    environment:
+      # --- GPUStack server ---
+      GPUSTACK_BOOTSTRAP_PASSWORD: ${GPUSTACK_BOOTSTRAP_PASSWORD}
+      GPUSTACK_TOKEN: ${GPUSTACK_TOKEN}
+      GPUSTACK_LOG_LEVEL: info
+      # 镜像源兜底（验证环境 hf/docker.io 不可达），无镜像需求可删除或改官方默认
+      HF_ENDPOINT: https://hf-mirror.com
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+      # --- Hygress 延伸能力（可选覆盖；其余默认由 s6 launcher 注入，见 README §4.3）---
+      # admin token：缺失 ⇒ /reload、GET /config、GET /stats/usage 一律 401 fail-closed
+      HYGRESS_ADMIN_TOKEN: ${HYGRESS_ADMIN_TOKEN:-}
+      # 策略文件路径（默认 /etc/hygress/policy.yaml，与下方卷挂载一致）
+      HYGRESS_POLICY_PATH: /etc/hygress/policy.yaml
+      # 仅外部集群置 true；embedded（默认）必须 false
+      HYGRESS_TOPOLOGY_B: "${HYGRESS_TOPOLOGY_B:-false}"
+      # ext-auth 失败模式：closed(默认,403 ext_auth_unavailable) / open(fail-open)
+      HYGRESS_EXT_AUTH_FAIL_MODE: "${HYGRESS_EXT_AUTH_FAIL_MODE:-closed}"
+    volumes:
+      # server 数据卷（DB/CRD/jwt/密钥/hygress.log，保留原样）
+      - "${DATA_DIR_HOST_PATH:-./server-data}:/var/lib/gpustack"
+      # 策略文件目录（只读；policy.yaml 缺失=内置全放行，见上变量表）
+      - "${POLICY_HOST_DIR:-./policy}:/etc/hygress:ro"
+      - "${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
+    command:
+      # 独立 worker 模式（fresh install 无内嵌 worker；GPU 由 worker 服务独占）
+      # 需要 :443 时在此追加：--ssl-certfile=/var/lib/gpustack/tls/server.crt
+      #                            --ssl-keyfile=/var/lib/gpustack/tls/server.key
+      - --disable-worker
+
+  # 可选 GPU worker（对应官方部署的独立 worker 容器；无 GPU / worker 独立部署时删除本服务）。
+  # 注意：镜像 GPUStack 官方镜像 GPU_STACK_IMAGE（Hygress 只换 server 的网关）。
+  gpustack-worker:
+    image: ${GPU_STACK_IMAGE:-quay.io/gpustack/gpustack:latest}
+    container_name: gpustack-worker
+    privileged: true
+    restart: unless-stopped
+    depends_on:
+      - gpustack-server
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      HF_ENDPOINT: https://hf-mirror.com
+      GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY: quay.io
+      # 身份绑定模型目录（禁用 mirrored deployment，使实例容器走宿主 bind）
+      GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT: "false"
+    volumes:
+      - "${WORKER_DATA_HOST_PATH:-/var/lib/gpustack}:/var/lib/gpustack"
+      - "${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - "--server-url=${GPUSTACK_WORKER_SERVER_URL:-http://gpustack-server:30080}"
+      - "--token=${GPUSTACK_TOKEN}"
+      - "--worker-name=${WORKER_NAME:-worker1}"

@@ -283,6 +283,14 @@ pub struct PreparedRequest {
     /// `RoutePolicyActions::retries`). Replaces the route's retry `tries`;
     /// the route's retry **conditions** are kept.
     pub override_retries: Option<u32>,
+    /// R3/M14: the AM-2 verdict memo from the prepare-time fused scan —
+    /// `Some` exactly when prepare scanned a well-formed JSON body. The
+    /// `closing_brace` is valid for [`Self::body`] (prepare shifts it when it
+    /// splices the model value itself). `build_outbound` uses it to skip the
+    /// per-candidate AM-2 re-scan whenever candidate mapping leaves the body
+    /// bytes untouched (buffer identity); a rewritten candidate body falls
+    /// back to the byte-exact re-scan.
+    pub am2_memo: Option<crate::body::Am2Memo>,
 }
 
 /// Shared, long-lived gateway state threaded through every request. Cheap to

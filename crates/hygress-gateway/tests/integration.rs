@@ -2903,3 +2903,260 @@ async fn upstream_429_not_in_retry_set_no_candidate_swap_but_fallback() {
     assert_eq!(b.count(), 0, "429 is outside the retry set: B must never be swapped in");
     assert_eq!(fb.count(), 1, "the fallback upstream served the replayed request");
 }
+
+// ---------------------------------------------------------------------------
+// Oracle-audit integration-gap G3 (e2e): AM-2 explicit-false passthrough, the
+// usage-less 2xx server-estimation fallback row, mirror-never-metered, and the
+// fail-closed ext-auth transport failure. All real servers, no mocks.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn explicit_false_include_usage_is_never_overridden_e2e() {
+    // G3a (AM-2 residual, `include_usage: false` leg): a streaming client that
+    // EXPLICITLY asks for a usage-less stream (`stream_options.include_usage =
+    // false`) must keep its own preference — the gateway must NOT flip it to
+    // `true` (or inject a second `stream_options`). The upstream body must be
+    // byte-identical to what the client sent. Metering is still driven by what
+    // the upstream actually EMITS: the fake upstream here ignores the flag and
+    // still returns the canonical SSE usage chunk, so a `completed=true` row
+    // with the exact tokens must still land.
+    let model_upstream = TestServer::spawn().await;
+    let mirror = TestServer::spawn().await;
+    let fallback = TestServer::spawn().await;
+    let auth = TestServer::spawn().await;
+    let usage = TestServer::spawn().await;
+
+    auth.set_response(
+        200,
+        vec![("X-Mse-Consumer".into(), "ak1.gpustack-7".into())],
+        b"ok".to_vec(),
+    );
+    // The forced-on fixture (the upstream ignores the request's include_usage
+    // flag and emits the canonical usage chunk regardless).
+    let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"H\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+    model_upstream.set_response(
+        200,
+        vec![("content-type".into(), "text/event-stream".into())],
+        sse.to_vec(),
+    );
+
+    let data = build_data(&model_upstream.addr_str(), &mirror.addr_str(), &fallback.addr_str());
+    let http = reqwest::Client::new();
+    let token = derive_gateway_token(b"test-secret");
+    let state = build_state(
+        data,
+        &auth.base_url(),
+        &format!("{}/v2/usage/gateway-metrics", usage.base_url()),
+        http,
+        token,
+    );
+    let gw = spawn_gateway(state).await;
+
+    let sent =
+        r#"{"model":"org1/llama-3-8b","stream":true,"stream_options":{"include_usage":false}}"#;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .header("x-higress-llm-model", "org1/llama-3-8b")
+        .header("content-type", "application/json")
+        .body(sent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The explicit `false` is NEVER overridden: the upstream body is the
+    // client's body byte-for-byte — one `stream_options` with
+    // `include_usage:false`, ZERO `include_usage:true` occurrences.
+    let reqs = model_upstream.wait_for(1).await;
+    let ub = String::from_utf8_lossy(&reqs[0].body).to_string();
+    assert_eq!(ub, sent, "explicit include_usage=false must pass through untouched");
+    assert_eq!(ub.matches("\"stream_options\"").count(), 1, "body: {ub}");
+    assert_eq!(ub.matches("\"include_usage\":true").count(), 0, "body: {ub}");
+    assert_eq!(ub.matches("\"include_usage\":false").count(), 1, "body: {ub}");
+
+    // Because the upstream STILL emitted the usage chunk per the SSE, a
+    // `completed=true` row with the exact tokens still lands (metering follows
+    // the observed response, not the client's request flag).
+    let rows = usage.wait_for(1).await;
+    let body = String::from_utf8_lossy(&rows[0].body).to_string();
+    assert!(body.contains("\"completed\":true"), "row: {body}");
+    assert!(body.contains("\"input_token\":10"), "row: {body}");
+    assert!(body.contains("\"output_token\":5"), "row: {body}");
+    assert!(body.contains("\"total_token\":15"), "row: {body}");
+}
+
+#[tokio::test]
+async fn usage_less_upstream_200_produces_completed_false_row_e2e() {
+    // G3b: a CPU-serve.py-like backend answers a `stream:true` model-route
+    // chat request with a plain 200 `application/json` body carrying NO usage
+    // object (no canonical SSE usage chunk). The gateway still reports exactly
+    // ONE usage row, and it pins the GPUStack server-estimation fallback path:
+    // `completed=false`, zero tokens (the server derives the estimate from
+    // `request_content_bytes`), `request_count=1`. (AM-2 forcing
+    // `include_usage:true` upstream is harmless here — the backend ignores it.)
+    let model_upstream = TestServer::spawn().await;
+    let mirror = TestServer::spawn().await;
+    let fallback = TestServer::spawn().await;
+    let auth = TestServer::spawn().await;
+    let usage = TestServer::spawn().await;
+
+    auth.set_response(
+        200,
+        vec![("X-Mse-Consumer".into(), "ak1.gpustack-7".into())],
+        b"ok".to_vec(),
+    );
+    // 200 `application/json`, no `usage` object anywhere.
+    model_upstream.set_response(
+        200,
+        vec![("content-type".into(), "application/json".into())],
+        br#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#.to_vec(),
+    );
+
+    let data = build_data(&model_upstream.addr_str(), &mirror.addr_str(), &fallback.addr_str());
+    let http = reqwest::Client::new();
+    let token = derive_gateway_token(b"test-secret");
+    let state = build_state(
+        data,
+        &auth.base_url(),
+        &format!("{}/v2/usage/gateway-metrics", usage.base_url()),
+        http,
+        token,
+    );
+    let gw = spawn_gateway(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .header("x-higress-llm-model", "org1/llama-3-8b")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"org1/llama-3-8b","stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(model_upstream.count(), 1, "the model upstream served the request");
+
+    // Exactly ONE usage row, on the server-estimation fallback shape.
+    let rows = usage.wait_for(1).await;
+    let body = String::from_utf8_lossy(&rows[0].body).to_string();
+    assert_eq!(rows[0].target, "/v2/usage/gateway-metrics");
+    assert!(body.contains("\"completed\":false"), "row: {body}");
+    assert!(body.contains("\"total_token\":0"), "row: {body}");
+    assert!(body.contains("\"input_token\":0"), "row: {body}");
+    assert!(body.contains("\"output_token\":0"), "row: {body}");
+    assert!(body.contains("\"request_count\":1"), "row: {body}");
+    // A settle window proves the single request produced exactly one push.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(usage.count(), 1, "exactly one usage row expected");
+}
+
+#[tokio::test]
+async fn mirror_traffic_never_reports_usage_e2e() {
+    // G3c: mirror / GPUStack-self passthrough is never metered. The mirror
+    // (not the model route) serves the request — same shape as
+    // `mirror_passes_through` — but its response is the SAME usage-bearing SSE
+    // fixture a model route would meter from: if mirror traffic were ever
+    // pushed to the usage sink, this is exactly the body that would trigger it.
+    // Zero usage POSTs must still land.
+    let model_upstream = TestServer::spawn().await;
+    let mirror = TestServer::spawn().await;
+    let fallback = TestServer::spawn().await;
+    let auth = TestServer::spawn().await;
+    let usage = TestServer::spawn().await;
+
+    // The mirror answers with a usage-bearing SSE stream (content-type +
+    // payload identical in kind to the model-route fixtures above).
+    let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+    mirror.set_response(
+        200,
+        vec![("content-type".into(), "text/event-stream".into())],
+        sse.to_vec(),
+    );
+
+    let data = build_data(&model_upstream.addr_str(), &mirror.addr_str(), &fallback.addr_str());
+    let http = reqwest::Client::new();
+    let token = derive_gateway_token(b"test-secret");
+    let state = build_state(
+        data,
+        &auth.base_url(),
+        &format!("{}/v2/usage/gateway-metrics", usage.base_url()),
+        http,
+        token,
+    );
+    let gw = spawn_gateway(state).await;
+
+    // No `x-higress-llm-model` → the mirror route (not the model route).
+    let resp = reqwest::Client::new()
+        .get(format!("{gw}/some/other/path"))
+        .header("x-gpustack-model-instance", "forged")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let reqs = mirror.wait_for(1).await;
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].target, "/some/other/path");
+    // The model-route upstream is never contacted.
+    assert_eq!(model_upstream.count(), 0);
+
+    // Settle window: even though the mirror's response carried a usage object,
+    // mirror traffic is never metered — zero POSTs to the usage server.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(usage.count(), 0, "mirror / passthrough traffic must never report usage");
+}
+
+#[tokio::test]
+async fn token_auth_unreachable_fail_closed_403_e2e() {
+    // G3d (R-12): default fail-closed ext-auth. The `/token-auth` service is
+    // UNREACHABLE (transport failure — connection refused, no verdict). With
+    // `auth_fail_closed=true` (the build_state default) the gateway must
+    // short-circuit 403 `ext_auth_unavailable` BEFORE any upstream contact and
+    // record the availability class in the metrics. (`dead_port()` — bind +
+    // drop — is the deterministic "nothing listening" address used by the
+    // guardrail fail-closed test; a spawn-then-drop TestServer would race its
+    // accept-loop teardown.)
+    let model_upstream = TestServer::spawn().await;
+    let mirror = TestServer::spawn().await;
+    let fallback = TestServer::spawn().await;
+    let usage = TestServer::spawn().await;
+    let auth_dead = format!("http://{}", dead_port().await); // nothing listening
+
+    let data = build_data(&model_upstream.addr_str(), &mirror.addr_str(), &fallback.addr_str());
+    let http = reqwest::Client::new();
+    let token = derive_gateway_token(b"test-secret");
+    let state = build_state(
+        data,
+        &auth_dead,
+        &format!("{}/v2/usage/gateway-metrics", usage.base_url()),
+        http,
+        token,
+    );
+    let gw = spawn_gateway(state.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .header("x-higress-llm-model", "org1/llama-3-8b")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"org1/llama-3-8b"}"#)
+        .send()
+        .await
+        .unwrap();
+    // Unreachable auth service + fail-closed → 403, never a 502/200.
+    assert_eq!(resp.status(), 403, "an unreachable auth service must fail closed");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("ext_auth_unavailable"), "body was {body}");
+    assert!(body.contains("external auth service unavailable"), "body was {body}");
+    // The model upstream is NEVER dispatched (the pipeline stops at stage ⑤).
+    assert_eq!(model_upstream.count(), 0, "the model upstream must never be reached");
+    // No usage row either (no upstream was reached).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(usage.count(), 0, "a fail-closed auth denial must not report usage");
+    // R-12: the availability-failure class is observable in the metrics.
+    let out = state.metrics.encode();
+    assert!(
+        out.lines().any(|l| l.starts_with("hygress_auth_decisions_total")
+            && l.contains("auth_service_unavailable_denied")
+            && l.trim_end().ends_with(" 1")),
+        "expected auth_service_unavailable_denied=1 in:\n{out}"
+    );
+}

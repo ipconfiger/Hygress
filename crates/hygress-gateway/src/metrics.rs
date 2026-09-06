@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use prometheus::core::{Collector, Desc};
 use prometheus::proto;
-use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, TextEncoder};
+use prometheus::{
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
+    TextEncoder,
+};
 
 /// A custom prometheus [`Collector`] that publishes the two core control-plane
 /// snapshot counters ([`hygress_core::SharedConfig::snapshot_reject_total`] /
@@ -142,6 +145,16 @@ struct Inner {
     // R-11 (C3): TLS rotation detection (0.8 = no hot reload → restart needed).
     tls_cert_change_detected: IntCounter,
     tls_cert_requires_restart: IntCounter,
+    // P1: hot-path label-handle caches — a warm `record_request` /
+    // `record_request_duration` / `record_tokens` / `record_ttft` is one
+    // uncontended mutex lookup + a lock-free inc/observe on the cached handle,
+    // avoiding prometheus's global label-vec write lock (`children.write()`)
+    // and the per-call status `String`. Bounded by the small real label sets.
+    requests_cache:
+        std::sync::Mutex<std::collections::HashMap<u16, std::collections::HashMap<String, IntCounter>>>,
+    duration_cache: std::sync::Mutex<std::collections::HashMap<String, Histogram>>,
+    tokens_cache: std::sync::Mutex<std::collections::HashMap<String, IntCounter>>,
+    ttft_cache: std::sync::Mutex<std::collections::HashMap<String, Histogram>>,
 }
 
 impl Metrics {
@@ -379,15 +392,37 @@ impl Metrics {
                 guardrail_blocked,
                 tls_cert_change_detected,
                 tls_cert_requires_restart,
+                requests_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+                duration_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+                tokens_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ttft_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
 
     pub fn record_request(&self, status: u16, kind: &str) {
-        self.inner
+        self.cached_request_counter(status, kind).inc();
+    }
+
+    /// P1: return the cached `IntCounter` for `(status, kind)`, creating it on
+    /// first sight. Steady state avoids the label-vec write lock + the
+    /// per-call status `String` allocation.
+    fn cached_request_counter(&self, status: u16, kind: &str) -> IntCounter {
+        let mut cache = self
+            .inner
+            .requests_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let by_status = cache.entry(status).or_default();
+        if let Some(c) = by_status.get(kind) {
+            return c.clone();
+        }
+        let c = self
+            .inner
             .requests_total
-            .with_label_values(&[&status.to_string(), kind])
-            .inc();
+            .with_label_values(&[&status.to_string(), kind]);
+        by_status.insert(kind.to_string(), c.clone());
+        c
     }
 
     /// AM-5: account a **gateway-generated terminal short-circuit** — a 4xx/5xx
@@ -406,21 +441,46 @@ impl Metrics {
     }
 
     pub fn record_request_duration(&self, kind: &str, secs: f64) {
-        self.inner
-            .request_duration
-            .with_label_values(&[kind])
+        self.cached_histogram(&self.inner.duration_cache, &self.inner.request_duration, kind)
             .observe(secs);
     }
 
     pub fn record_tokens(&self, direction: &str, n: u64) {
-        self.inner
-            .tokens_total
-            .with_label_values(&[direction])
-            .inc_by(n);
+        let mut cache = self
+            .inner
+            .tokens_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let counter = match cache.get(direction) {
+            Some(c) => c.clone(),
+            None => {
+                let c = self.inner.tokens_total.with_label_values(&[direction]);
+                cache.insert(direction.to_string(), c.clone());
+                c
+            }
+        };
+        counter.inc_by(n);
     }
 
     pub fn record_ttft(&self, kind: &str, secs: f64) {
-        self.inner.ttft.with_label_values(&[kind]).observe(secs);
+        self.cached_histogram(&self.inner.ttft_cache, &self.inner.ttft, kind)
+            .observe(secs);
+    }
+
+    /// P1: return the cached label handle for a per-kind `HistogramVec`.
+    fn cached_histogram(
+        &self,
+        cache: &std::sync::Mutex<std::collections::HashMap<String, Histogram>>,
+        vec: &HistogramVec,
+        kind: &str,
+    ) -> Histogram {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = cache.get(kind) {
+            return h.clone();
+        }
+        let h = vec.with_label_values(&[kind]);
+        cache.insert(kind.to_string(), h.clone());
+        h
     }
 
     pub fn record_retry(&self) {

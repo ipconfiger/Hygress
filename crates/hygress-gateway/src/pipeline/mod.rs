@@ -154,6 +154,10 @@ fn prepare_inner(
     // the body, use the resolved value (no re-scan); otherwise reuse the
     // prepare-time scan, `None` covering missing / non-string / malformed
     // (each candidate then skips its body-mapper scan entirely).
+    // R3/M14: any prepare-time model splice shifts the AM-2 closing-brace
+    // offset (the brace always lies after the value token); the delta is
+    // applied to the memo below.
+    let mut model_splice_delta: isize = 0;
     let body_model = if let Some(model) = &mr.model {
         base_headers.insert(ctx.router.target_header.as_str(), model);
         // The route-match key is canonically `x-higress-llm-model` (the Ingress
@@ -172,7 +176,9 @@ fn prepare_inner(
                 Some((decoded, span)) if decoded == model => Some(model.clone()),
                 Some((_, span)) => {
                     // R-5 rewrite: splice the located value token in place.
+                    let old_len = body.len();
                     body = crate::body::splice_json_string_at(&body, *span, model);
+                    model_splice_delta = body.len() as isize - old_len as isize;
                     Some(model.clone()) // rewritten → the body now carries `mr.model`
                 }
                 // Absent / non-string model member: there is no string token to
@@ -302,6 +308,16 @@ fn prepare_inner(
         path_groups: groups,
     };
 
+    // R3/M14: the AM-2 verdict memo — the prepare-time fused scan shifted by
+    // the model-splice delta above. `Some` iff prepare scanned a well-formed
+    // JSON body; `build_outbound` uses it (guarded by buffer identity) to skip
+    // the per-candidate AM-2 re-scan.
+    let am2_memo = profile.as_ref().map(|p| {
+        let mut memo = p.am2_memo();
+        memo.closing_brace = (memo.closing_brace as isize + model_splice_delta).max(0) as usize;
+        memo
+    });
+
     Ok(PreparedRequest {
         candidates,
         route: route_info,
@@ -315,6 +331,7 @@ fn prepare_inner(
         usage,
         selected_service,
         started_at_ms,
+        am2_memo,
         // Routing-policy overrides (design §4.3) are applied by the pipe after
         // `route_match` (the pure pipeline cannot know the matched route's
         // policy); they start absent.
@@ -396,21 +413,28 @@ pub fn build_outbound(
     // agent). Revisit if generic or non-OpenAI destinations are ever routed
     // through model routes. Deliberately no behavior change.
     //
-    // ORA3-M14 (PX-1): prepare's fused scan already validated this JSON top
-    // level once per request and produced the stream flags + closing brace
-    // (see `crate::body::scan_top_level_profile`); carrying that memo into
-    // this per-candidate step needs a memo field on `PreparedRequest`
-    // (context lane) — until then this gate re-derives the flags from the
-    // candidate's FINAL bytes (post-⑧), which is the byte-exact single point
-    // of injection. The profile verdicts are proven equal to this scan
-    // (`profile_and_specialized_scanners_agree_*` in body.rs), so adopting the
-    // memo later cannot change the outbound bytes.
-    if let Some(nb) = crate::body::ensure_stream_include_usage(
-        &out_body,
-        Some(prepared.content_type.as_str()),
-        &prepared.upstream_path,
-        prepared.route.is_model_route,
-    ) {
+    // ORA3-M14 (R3): the AM-2 verdict is decided O(1) from the prepare-time
+    // memo whenever the candidate's FINAL bytes still share prepare's buffer
+    // (⑧ identity mapping — no splice) AND prepare scanned the body (memo
+    // `Some`). Anything else — a body the mapper actually rewrote (new
+    // buffer), or a body prepare did not scan (multipart / non-JSON / empty /
+    // malformed) — keeps the byte-exact re-scan below; both paths are proven
+    // byte-identical (`profile_and_specialized_scanners_agree_*` in body.rs).
+    let injected = match (&prepared.am2_memo, out_body.as_ptr() == prepared.body.as_ptr()) {
+        (Some(memo), true) => crate::body::ensure_stream_include_usage_from_memo(
+            &out_body,
+            &prepared.upstream_path,
+            prepared.route.is_model_route,
+            memo,
+        ),
+        _ => crate::body::ensure_stream_include_usage(
+            &out_body,
+            Some(prepared.content_type.as_str()),
+            &prepared.upstream_path,
+            prepared.route.is_model_route,
+        ),
+    };
+    if let Some(nb) = injected {
         out_body = nb;
     }
 
@@ -565,6 +589,7 @@ mod tests {
             usage: None,
             selected_service: "model-1-10.static".into(),
             started_at_ms: 0,
+            am2_memo: None,
             override_timeout_ms: None,
             override_retries: None,
         }

@@ -202,9 +202,80 @@ pub fn ensure_stream_include_usage(
     if !stream_true || has_stream_options {
         return None;
     }
-    // Splice before the closing `}`. The object is non-empty here (a top-level
-    // `stream` member exists), so the leading comma is always correct; all
-    // whitespace around `}` is preserved byte-for-byte.
+    splice_stream_options(body, closing_brace)
+}
+
+/// R3/M14: the AM-2 verdict memo captured by the prepare-time fused profile
+/// scan — `stream`/`stream_options` flags + the closing-`}` splice offset of
+/// the body those flags were scanned from. Byte-exact ONLY for a body whose
+/// bytes are unchanged since that scan (any intervening model-value splice
+/// must have shifted `closing_brace` — prepare does that itself and stores the
+/// shifted value here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Am2Memo {
+    /// The top-level `stream` field was the literal `true`.
+    pub stream_true: bool,
+    /// A top-level `stream_options` member exists (any value → client control).
+    pub has_stream_options: bool,
+    /// Byte offset of the top-level object's closing `}` (splice point), valid
+    /// for the body this memo was produced from.
+    pub closing_brace: usize,
+}
+
+impl JsonObjectProfile {
+    /// The AM-2 gates-(4)+(5) subset as a memo (ORA3-M14 / R3). `None` is not
+    /// produced: a well-formed scanned object always has a closing brace.
+    pub fn am2_memo(&self) -> Am2Memo {
+        Am2Memo {
+            stream_true: self.stream_true,
+            has_stream_options: self.has_stream_options,
+            closing_brace: self.closing_brace,
+        }
+    }
+}
+
+/// AM-2 splice from a prepare-time memo (R3) — the no-rescan fast path. Call
+/// ONLY when `body`'s bytes are exactly the bytes the memo was produced from
+/// (guarded at the call site by buffer identity); the same five gates apply,
+/// with the `(4)+(5)` verdicts and the splice point read from the memo instead
+/// of a fresh top-level scan.
+pub fn ensure_stream_include_usage_from_memo(
+    body: &Bytes,
+    upstream_path: &str,
+    is_model_route: bool,
+    memo: &Am2Memo,
+) -> Option<Bytes> {
+    // (1) Metered traffic only.
+    if !is_model_route {
+        return None;
+    }
+    // (2) A memo only exists for a JSON non-empty body — defensive re-check.
+    if body.is_empty() {
+        return None;
+    }
+    // (3) OpenAI completions shape only (see #2524's chat/completions scoping).
+    if !completions_upstream_path(upstream_path) {
+        return None;
+    }
+    // (4)+(5) From the memo (proven equal to the scan by the agreement tests).
+    if !memo.stream_true || memo.has_stream_options {
+        return None;
+    }
+    splice_stream_options(body, memo.closing_brace)
+}
+
+/// Whether `upstream_path` is an OpenAI completions shape (AM-2 gate 3).
+fn completions_upstream_path(upstream_path: &str) -> bool {
+    upstream_path.ends_with("/chat/completions") || upstream_path.ends_with("/completions")
+}
+
+/// Splice the AM-2 `stream_options` member before the top-level object's
+/// closing `}` at `closing_brace`. Defensive bounds check keeps a stale memo
+/// from panicking (the caller's byte-identity guard makes this unreachable).
+fn splice_stream_options(body: &Bytes, closing_brace: usize) -> Option<Bytes> {
+    if closing_brace > body.len() {
+        return None;
+    }
     let mut out = Vec::with_capacity(body.len() + STREAM_OPTIONS_INJECTION.len());
     out.extend_from_slice(&body[..closing_brace]);
     out.extend_from_slice(STREAM_OPTIONS_INJECTION);

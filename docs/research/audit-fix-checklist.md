@@ -187,3 +187,12 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
 | 门禁/真机 | **659 tests** / clippy 双模式 0 / alloc_guard 11/11 / cargo doc -D warnings 0；真机 b101（镜像 bfcf515）：新族活体 + 心跳前移 + 0 丢行 + 0 LIST 刷屏 + 401 fail-closed；回滚 gpustack:hygress-b100 |
 
 状态：ora-6 收敛复核（五维 ≥9.5 判定）进行中。
+
+### ora-6 收敛复核结果（docs/research/audit-oracle-review-ora6.md 备档点）
+| 维度 | ora-6 收敛分 | 判词 |
+|---|---|---|
+| 代码成熟度/架构 | **9.5** | M1-M7 全部关闭取证，无新发现；两处软注意（M3 决策注记位置、只读未重跑门禁）不构成阻塞 |
+| 代码质量/正确性 | 复核中 | （ora-5 9.2 → Q1-Q4/T1-T5 全关闭 + memo 字节等价；659 门禁绿） |
+| 性能/资源 | **9.6** | R3/P2 memo、P1、P5、P7 关闭；P4/P6 记录在案+量化证据；无新回归 |
+| 可运维/可观测 | **9.5** | 11/11 关闭；双计 MINOR 按处方修复（b384a85）后复查通过（closed/open/async 各计 1 次） |
+| GPUStack 集成 | **9.5** | G1-G7 + AM-2 关闭；无 wire 回归；外部引擎约束非代码缺口 |

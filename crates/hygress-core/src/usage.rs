@@ -1547,4 +1547,92 @@ mod tests {
         });
         assert!(!m.completed);
     }
+
+    // ----- Ora-5 T2: two DIFFERENT usage objects -> single-flush + last-wins -----
+
+    #[test]
+    fn usage_two_objects_in_one_data_line_absorbs_top_level_once() {
+        // Ora-5 quality gap T2: a single final SSE `data:` line whose JSON
+        // payload carries TWO different usage objects — a top-level `usage`
+        // field AND an Anthropic-style nested `message.usage` (the only
+        // physically realizable "two usage objects in one payload": JSON
+        // cannot hold two `"usage"` keys at the same location). A naive
+        // reading of the design ("absorb_value is last-wins per field") might
+        // expect the two objects to be merged with the later one winning;
+        // the REAL semantics pinned here are precedence + single absorption:
+        // `usage_from_payload` picks the top-level `usage` and never consults
+        // the `message.usage` fallback when a top-level `usage` exists, and a
+        // data line absorbs at most ONE usage object — so there is no "later"
+        // object inside a single line for per-field last-wins to span. The
+        // flushed record carries the TOP-LEVEL object's values, exactly one
+        // record, `completed = true`.
+        let mut s = UsageSnapshot::new(UsageSchema::Generic);
+        // Top-level usage uses OpenAI-family keys; the nested message.usage
+        // uses Anthropic-family keys with DIFFERENT values on every
+        // normalized field, so the winner is unambiguous.
+        let line = b"data: {\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":55,\
+                      \"total_tokens\":190,\"prompt_tokens_details\":{\"cached_tokens\":9}},\
+                      \"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\
+                      \"cache_read_input_tokens\":1}}}\n\n";
+        assert!(s.feed(line), "top-level usage object must be absorbed");
+        assert!(s.complete());
+        assert_eq!(s.output_chunks(), 1, "one data line -> counted exactly once");
+        // The nested message.usage (3 / 4 / 1) was NOT absorbed: top-level wins.
+        assert_eq!(s.tokens(), (120, 55, 9));
+
+        let m = s.flush(&FlushFields {
+            model: "gw-generic".into(),
+            request_content_bytes: 0,
+            ..Default::default()
+        });
+        assert!(m.completed);
+        assert_eq!((m.input_token, m.output_token), (120, 55));
+        assert_eq!(m.input_cached_token, 9);
+        assert_eq!(m.total_token, 190); // top-level object's upstream total
+        assert_eq!(m.output_chunk_count, 1);
+        assert_eq!(m.request_count, 1);
+    }
+
+    #[test]
+    fn usage_two_objects_across_final_two_chunks_last_wins_single_flush() {
+        // Ora-5 quality gap T2: two DIFFERENT usage objects arrive in the
+        // stream's final two chunks, each on its own `data:` line, under the
+        // Generic (gateway) schema. Per the design (`absorb_value` is
+        // last-wins per field), the LATER object must override the earlier
+        // one on every normalized field, each usage line counts as its own
+        // chunk, and one terminal `flush` yields exactly ONE record carrying
+        // the later object's values with `completed = true` — never a merge
+        // or a sum of the two objects.
+        let mut s = UsageSnapshot::new(UsageSchema::Generic);
+        // First usage object: Anthropic-family keys.
+        assert!(s.feed(
+            b"data: {\"usage\":{\"input_tokens\":100,\"output_tokens\":40,\
+              \"total_tokens\":150,\"cache_read_input_tokens\":12}}\n\n"
+        ));
+        assert!(s.complete());
+        assert_eq!(s.tokens(), (100, 40, 12), "first object absorbed");
+
+        // Second usage object: the SAME normalized fields via OpenAI-family
+        // keys, with DIFFERENT values on every field.
+        assert!(s.feed(
+            b"data: {\"usage\":{\"prompt_tokens\":130,\"completion_tokens\":60,\
+              \"total_tokens\":210,\"prompt_tokens_details\":{\"cached_tokens\":15}}}\n\n"
+        ));
+        // Last-wins already at absorption time: every field now reflects the
+        // LATER object.
+        assert_eq!(s.tokens(), (130, 60, 15));
+
+        let m = s.flush(&FlushFields {
+            model: "gw-generic".into(),
+            request_content_bytes: 0,
+            ..Default::default()
+        });
+        assert!(m.completed);
+        assert_eq!((m.input_token, m.output_token), (130, 60));
+        assert_eq!(m.input_cached_token, 15);
+        assert_eq!(m.total_token, 210); // later object's total (> 130 + 60) kept
+        assert_eq!(m.request_count, 1);
+        // Both usage lines were separate events, each counted exactly once.
+        assert_eq!(m.output_chunk_count, 2);
+    }
 }

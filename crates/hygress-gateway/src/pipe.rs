@@ -702,7 +702,12 @@ impl ProxyHttp for HygressProxy {
                             debug!(status, candidate = %candidate.service_name, "non-2xx; trying next candidate");
                             continue;
                         }
-                        let body = resp.bytes().await.unwrap_or_default();
+                        // P5: the terminal non-2xx body is read with a hard
+                        // cap — a misbehaving upstream must not balloon
+                        // memory on the error path. Truncation (chunk-level
+                        // or a declared content-length over the cap) is
+                        // warned once; the client still gets the error status.
+                        let body = Self::read_error_body_capped(resp).await;
                         last = Some(Final::Http { status, body });
                         last_service = Some(candidate.service_name.clone());
                         break;
@@ -1108,15 +1113,28 @@ impl HygressProxy {
         if key.is_empty() {
             return true;
         }
-        let mut entry =
-            buckets
-                .entry(key.to_string())
-                .or_insert_with(|| crate::context::RateLimitEntry {
-                    spec_rps: spec.rps,
-                    spec_burst: spec.burst,
-                    last_active_ms: now_ms,
-                    bucket: hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps),
-                });
+        // P7: borrowed-key fast path — DashMap keys are `String` but
+        // `get_mut` borrows by `&str` (`Borrow`), so a warm bucket is
+        // refilled/checked with ZERO per-request key allocations; the
+        // `entry()` path (which owns a cloned key) runs only on the seed miss.
+        if let Some(mut entry) = buckets.get_mut(key) {
+            // Hot-reload detection: spec changed since seeding → reset (BLOCK-2).
+            if entry.spec_rps != spec.rps || entry.spec_burst != spec.burst {
+                entry.spec_rps = spec.rps;
+                entry.spec_burst = spec.burst;
+                entry.bucket = hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps);
+            }
+            entry.last_active_ms = now_ms;
+            return entry.bucket.check(now_ms);
+        }
+        let mut entry = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| crate::context::RateLimitEntry {
+                spec_rps: spec.rps,
+                spec_burst: spec.burst,
+                last_active_ms: now_ms,
+                bucket: hygress_core::prelude::TokenBucket::new(spec.burst, spec.rps),
+            });
         // Hot-reload detection: if the spec changed since the bucket was
         // seeded (e.g. policy reload with new rps/burst), reset the bucket
         // with the new parameters (BLOCK-2: not retain the old spec).
@@ -1127,6 +1145,52 @@ impl HygressProxy {
         }
         entry.last_active_ms = now_ms;
         entry.bucket.check(now_ms)
+    }
+
+    /// P5: read a terminal non-2xx response body with a hard cap
+    /// ([`ERROR_BODY_READ_CAP`]). A DECLARED content-length over the cap is
+    /// not buffered at all; otherwise the body is read chunk-by-chunk and
+    /// truncated at the cap (warned once). A read error mid-way keeps the
+    /// partial body. Best-effort bound: an upstream that lies about
+    /// content-length still delivers at most the cap per request because the
+    /// read stops at the cap regardless of what it declares.
+    async fn read_error_body_capped(resp: reqwest::Response) -> bytes::Bytes {
+        let declared = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(d) = declared {
+            if d > ERROR_BODY_READ_CAP as u64 {
+                warn!(
+                    declared = d,
+                    "terminal error response body over the {ERROR_BODY_READ_CAP}-byte cap; not buffering it"
+                );
+                return bytes::Bytes::new();
+            }
+        }
+        let mut resp = resp;
+        let mut buf = Vec::with_capacity(declared.unwrap_or(0) as usize);
+        loop {
+            if buf.len() >= ERROR_BODY_READ_CAP {
+                warn!(
+                    "terminal error response body truncated at the {ERROR_BODY_READ_CAP}-byte cap"
+                );
+                break;
+            }
+            match resp.chunk().await {
+                Ok(Some(c)) => {
+                    let room = ERROR_BODY_READ_CAP - buf.len();
+                    buf.extend_from_slice(&c[..c.len().min(room)]);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(error = %e, "terminal error response body read failed; forwarding partial body");
+                    break;
+                }
+            }
+        }
+        buf.into()
     }
 
     /// The `Retry-After` value (seconds) for a token-bucket denial: the time
@@ -1372,6 +1436,11 @@ enum Final {
 /// Dial-time exclusion shared by the two outbound dial paths (ORA3-M12):
 /// `content-type` is copied only via the explicit set below (`DIAL_SKIP`), so
 /// the map's inbound copy never doubles it.
+/// P5: hard cap (bytes) for buffering a terminal non-2xx error body on the
+/// final-hop path — a misbehaving upstream must not balloon memory when the
+/// gateway forwards the error to the client.
+const ERROR_BODY_READ_CAP: usize = 256 * 1024;
+
 const DIAL_SKIP: &[&str] = &["content-type"];
 
 /// Response-direction hop-by-hop / connection headers never forwarded
@@ -1855,7 +1924,13 @@ impl HygressProxy {
                 if let Some(g) = quota {
                     g.settle(None);
                 }
-                self.report_incomplete_usage(prepared, &candidate.service_name, None)
+                // ORA3-M9/Q3: flush the LIVE accumulator, not a fresh empty
+                // one — bytes were already forwarded before the guardrail cut,
+                // so the row keeps the absorbed tokens (if a usage object was
+                // seen: completed=true) and the REAL output_chunk_count instead
+                // of under-reporting zero chunks (matches the mid-stream
+                // transport/write-fail retention above).
+                self.report_incomplete_usage(prepared, &candidate.service_name, Some(&usage))
                     .await;
                 // Cut the downstream connection (no further writes; the
                 // connection is not kept alive).
@@ -1938,14 +2013,15 @@ impl HygressProxy {
     /// upstream was reached). Model-route traffic only (`usage` is `None` for
     /// the mirror / passthrough).
     ///
-    /// ORA3-M9: when a **mid-stream** terminal (the downstream write / upstream
-    /// read failed after the 2xx header was sent) retains the live accumulator
-    /// via `observed`, the row flushes THAT state instead of a fresh empty
-    /// snapshot: the tokens absorbed before the break stay on the row and
+    /// ORA3-M9/Q3: when a **mid-stream** terminal (the downstream write / upstream
+    /// read failure after the 2xx header was sent, or an output-guardrail cut)
+    /// retains the live accumulator via `observed`, the row flushes THAT state
+    /// instead of a fresh empty snapshot: the tokens absorbed before the break
+    /// stay on the row, the real `output_chunk_count` is reported, and
     /// `completed` reflects that a usage object was observed (`seen_any`).
-    /// `None` (guardrail-in / guardrail-cut / forwarded-terminal-non-2xx) keeps
-    /// the historical empty row — `completed=false`, zero tokens — which stays
-    /// correct when nothing was observed.
+    /// `None` (guardrail-in / forwarded-terminal-non-2xx — nothing was streamed)
+    /// keeps the historical empty row — `completed=false`, zero tokens — which
+    /// stays correct when nothing was observed.
     async fn report_incomplete_usage(
         &self,
         prepared: &PreparedRequest,

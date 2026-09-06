@@ -1516,5 +1516,125 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // ORA-5 T1: JSON string-value splice round-trip (encode_json_string ⇄
+    // splice_json_string_at): the JSON-encoded token must splice in
+    // byte-exactly and the document must read the new value back as exactly
+    // that JSON-encoded form.
+    // -------------------------------------------------------------------
+
+    /// Strings covering every encoder class: quotes, backslashes, the short
+    /// escapes (\n \r \t \b \f), generic control chars < 0x20 (\u0000 /
+    /// \u0001 / \u001f), and raw multibyte / non-BMP text (é, 中文, 🚀😀).
+    const HOSTILE_SPLICE_VALUES: &[&str] = &[
+        "plain ascii",
+        "quote \"inside",
+        "back\\slash",
+        "quote \"and\\back\\\"slash",
+        "line\nfeed\ttab\rcr",
+        "control \u{0008}\u{000C}\u{0000}\u{0001}\u{001F} tail",
+        "café 中文",
+        "emoji 🚀😀",
+        "mixed a\"b\\c\nd\re\tf\u{0008}g\u{000C}h\u{0000}i\u{0001}j\u{001F}k — é 中文 🚀",
+    ];
+
+    /// Quote-inclusive byte span of the top-level string member `key` in
+    /// `body`, located exactly as production callers do (the fused profile
+    /// scan, ORA3-M14). Panics on a fixture that is not a valid object.
+    fn string_member_span(body: &str, key: &str) -> (usize, usize) {
+        let profile = scan_top_level_profile(body.as_bytes(), key)
+            .expect("fixture must be a well-formed top-level object");
+        profile
+            .model
+            .map(|(_, span)| span)
+            .expect("fixture must carry a string target member")
+    }
+
+    /// Splice `value` over `key`'s token in `body` and verify the whole
+    /// round-trip: the output is byte-exact (`prefix + encode + suffix`), it
+    /// still parses via serde, the field reads back as `value`, and reading
+    /// the field back yields exactly the JSON-encoded form that was spliced
+    /// (encode matches serde's own emission).
+    fn assert_json_string_splice_round_trip(body: &str, key: &str, value: &str) {
+        let span = string_member_span(body, key);
+        assert_eq!(body.as_bytes()[span.0], b'"', "span must open on the quote");
+        assert_eq!(body.as_bytes()[span.1 - 1], b'"', "span must close on the quote");
+        let encoded = encode_json_string(value);
+        let out = splice_json_string_at(body.as_bytes(), span, value);
+        // Byte-exact: the JSON encoding replaced exactly the quote-inclusive
+        // token; every byte outside `span` (other members, whitespace) is
+        // untouched.
+        let expected = format!("{}{}{}", &body[..span.0], encoded, &body[span.1..]);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            expected,
+            "byte-exact splice of {value:?} into {body:?}"
+        );
+        // The spliced body re-parses via the DOM and the field round-trips to
+        // the new value.
+        let v: Value = serde_json::from_slice(&out).expect("spliced body must stay valid JSON");
+        assert_eq!(
+            v[key].as_str(),
+            Some(value),
+            "field round-trip of {value:?} in {body:?}"
+        );
+        // The value read back serializes to exactly the JSON-encoded form the
+        // splice inserted.
+        assert_eq!(
+            serde_json::to_string(&v[key]).unwrap(),
+            encoded,
+            "read-back must equal the JSON-encoded form for {value:?} in {body:?}"
+        );
+    }
+
+    #[test]
+    fn splice_json_string_first_member_round_trips_byte_exact() {
+        // Target is the object's FIRST member — {"x": <old>, ...} — so the
+        // splice tail carries the comma and the remaining members (nested
+        // object included). Run with and without whitespace after the `}`.
+        for body in [
+            r#"{"x":"old","y":[1,2],"z":{"deep":"keep"}}"#,
+            "{\"x\":\"old\",\"y\":[1,2],\"z\":{\"deep\":\"keep\"}}\n\t ",
+        ] {
+            for &value in HOSTILE_SPLICE_VALUES {
+                assert_json_string_splice_round_trip(body, "x", value);
+            }
+        }
+    }
+
+    #[test]
+    fn splice_json_string_last_member_round_trips_byte_exact() {
+        // Target is the object's LAST member — {...,"x":"old"} — so the
+        // splice head carries the preceding members (nested object included).
+        // Run with and without whitespace after the `}`.
+        for body in [
+            r#"{"y":[1,2],"z":{"deep":"keep"},"x":"old"}"#,
+            "{\"y\":[1,2],\"z\":{\"deep\":\"keep\"},\"x\":\"old\"}\n ",
+        ] {
+            for &value in HOSTILE_SPLICE_VALUES {
+                assert_json_string_splice_round_trip(body, "x", value);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_json_string_matches_serde_emission() {
+        // The encoder output is a complete token that serde parses back to the
+        // original string, and it matches serde's own formatter byte for byte
+        // — which is exactly why the splice tests' "read back" assertion can
+        // compare against encode_json_string.
+        for &value in HOSTILE_SPLICE_VALUES {
+            let encoded = encode_json_string(value);
+            let parsed: Value = serde_json::from_str(&encoded)
+                .unwrap_or_else(|_| panic!("encoder output must parse for {value:?}"));
+            assert_eq!(parsed, Value::String(value.to_string()), "reparse of {value:?}");
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                encoded,
+                "encoder must match serde_json emission for {value:?}"
+            );
+        }
+    }
 }
 

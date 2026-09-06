@@ -2449,4 +2449,228 @@ mod tests {
             self
         }
     }
+
+    // ----- T3 (ORA-5): fallback-chain fixpoint termination + unwinding -----
+
+    #[test]
+    fn validation_mutual_fallback_cycle_is_healthy_and_terminates() {
+        // T3 regression: a mutually-referencing Fallback pair (fb-a -> fb-b,
+        // fb-b -> fb-a) with NO per-object issues is a healthy cycle. The AM-4
+        // cascade re-check must not mistake it for a dangling reference: every
+        // pass recomputes the accepted Fallback-key set, so both targets are
+        // present on every pass, the first pass drops nothing, and the
+        // fixpoint TERMINATES with both cycle members (and the Main pointing
+        // at the cycle) accepted. A regression that chased references without
+        // converging would hang here; one that unwound healthy cycles would
+        // drop both members.
+        let fb_a = RouteRule::new(
+            "fb-a",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb-b"));
+        let fb_b = RouteRule::new(
+            "fb-b",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb-a"));
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb-a"));
+        let data = ConfigData {
+            routes: vec![main, fb_a, fb_b],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        assert!(
+            sr.issues.is_empty(),
+            "healthy mutual cycle must pass the fixpoint with no issues: {:?}",
+            sr.issues
+        );
+        assert_eq!(sr.accepted.routes.len(), 3);
+        let accepted_keys: BTreeSet<&str> = sr
+            .accepted
+            .routes
+            .iter()
+            .map(|r| r.key.as_str())
+            .collect();
+        for wanted in ["fb-a", "fb-b", "m1"] {
+            assert!(
+                accepted_keys.contains(wanted),
+                "cycle member '{wanted}' must stay accepted: {accepted_keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_mutual_fallback_cycle_unwinds_when_member_dropped() {
+        // T3 regression: the SAME cycle shape as the healthy test above, but
+        // one member (fb-a) is ALSO dropped by the per-object pass (no
+        // destinations). Per-object validated the surviving references against
+        // the FULL route list, so fb-b (target fb-a) and m1 (target fb-b)
+        // both pass the first pass; the fixpoint must then unwind the whole
+        // reachable chain across successive passes — fb-b in pass 1 (fb-a is
+        // no longer accepted), then m1 in pass 2 (fb-b is no longer accepted)
+        // — leaving no dangling reference in the accepted set.
+        let fb_a = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(), // per-object issue: no destinations
+            fallback: Some(crate::route::FallbackLink::new("fb-b")),
+            ..main_route("fb-a")
+        };
+        let fb_b = RouteRule::new(
+            "fb-b",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb-a"));
+        // m1 points at the SURVIVING cycle member (fb-b), so it can only be
+        // judged dangling after fb-b itself is unwound — a second cascade hop.
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb-b"));
+        let good = main_route("m2");
+        let data = ConfigData {
+            routes: vec![main, fb_b, fb_a, good],
+            ..Default::default()
+        };
+        let sr = data.sanitize();
+        // The whole reachable chain (m1 -> fb-b -> fb-a) is unwound; only the
+        // unrelated good route survives.
+        assert_eq!(sr.accepted.routes.len(), 1, "accepted: {:?}", sr.accepted);
+        assert_eq!(sr.accepted.routes[0].key, "m2");
+        for dropped in ["fb-a", "fb-b", "m1"] {
+            assert!(
+                sr.accepted.routes.iter().all(|r| r.key != dropped),
+                "route '{dropped}' must be unwound: {:?}",
+                sr.accepted.routes
+            );
+        }
+        // Each unwound hop produced its own issue.
+        for (dropped, target) in [("fb-b", "fb-a"), ("m1", "fb-b")] {
+            let needle = format!("route '{dropped}': fallback target '{target}' not accepted");
+            assert!(
+                sr.issues.iter().any(|i| i.message.contains(&needle)),
+                "missing cascade issue for {dropped} -> {target}: {:?}",
+                sr.issues
+            );
+        }
+        assert!(sr
+            .issues
+            .iter()
+            .any(|i| i.message.contains("route 'fb-a': has no destinations")));
+        // Final-snapshot invariant: NO accepted route carries a fallback link
+        // whose target is not an accepted Fallback route (zero dangling
+        // references in the accepted set).
+        let accepted_fallback_keys: BTreeSet<String> = sr
+            .accepted
+            .routes
+            .iter()
+            .filter(|r| r.kind == RouteKind::Fallback)
+            .map(|r| r.key.clone())
+            .collect();
+        for route in &sr.accepted.routes {
+            if let Some(fl) = &route.fallback {
+                assert!(
+                    accepted_fallback_keys.contains(&fl.target_key),
+                    "route '{}' references dropped fallback '{}' — final snapshot is dangling",
+                    route.key,
+                    fl.target_key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_all_rejected_snapshot_terminates_empty() {
+        // T3 termination regression: when EVERY route is rejected the fixpoint
+        // must still terminate — no panic, no hang — with an empty accepted
+        // set. Two shapes pin the two exits of the pass loop:
+        // (1) every route fails the per-object pass, so the cascade starts on
+        //     an already-empty accepted set and the first pass must observe
+        //     "no change" and break immediately;
+        // (2) only the chain LEAF fails per-object and the otherwise-valid
+        //     referencing routes are unwound one per cascade pass until the
+        //     accepted set is empty again — the loop must keep running exactly
+        //     up to the pass that finds the now-empty set unchanged and breaks
+        //     (within the `initial_len + 1` bound).
+        //
+        // (1) all per-object issues, still linked in a mutual cycle:
+        let fb_a = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(),
+            fallback: Some(crate::route::FallbackLink::new("fb-b")),
+            ..main_route("fb-a")
+        };
+        let fb_b = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(),
+            fallback: Some(crate::route::FallbackLink::new("fb-a")),
+            ..main_route("fb-b")
+        };
+        let data1 = ConfigData {
+            routes: vec![fb_a, fb_b],
+            ..Default::default()
+        };
+        let sr1 = data1.sanitize();
+        assert!(
+            sr1.accepted.routes.is_empty(),
+            "all-rejected snapshot must sanitize to an empty accepted set: {:?}",
+            sr1.accepted.routes
+        );
+        assert_eq!(sr1.issues.len(), 2);
+        assert!(sr1
+            .issues
+            .iter()
+            .all(|i| i.message.contains("has no destinations")));
+        // (2) leaf-only per-object issue; the referencing chain unwinds to
+        // empty across successive passes.
+        let gb = RouteRule {
+            kind: RouteKind::Fallback,
+            destinations: Vec::new(), // per-object issue: no destinations
+            ..main_route("gb")
+        };
+        let fb2 = RouteRule::new(
+            "fb2",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("gb"));
+        let fb1 = RouteRule::new(
+            "fb1",
+            RouteKind::Fallback,
+            vec![PathPred::new("/(v1)()(/chat/completions)")],
+            vec![Destination::new("model-1-10.static:80")],
+        )
+        .unwrap()
+        .with_fallback(crate::route::FallbackLink::new("fb2"));
+        let main = main_route("m1").with_fallback(crate::route::FallbackLink::new("fb1"));
+        let data2 = ConfigData {
+            routes: vec![main, fb1, fb2, gb],
+            ..Default::default()
+        };
+        let sr2 = data2.sanitize();
+        assert!(
+            sr2.accepted.routes.is_empty(),
+            "chain with a broken leaf must unwind to an empty accepted set: {:?}",
+            sr2.accepted.routes
+        );
+        for (dropped, target) in [("fb2", "gb"), ("fb1", "fb2"), ("m1", "fb1")] {
+            let needle = format!("route '{dropped}': fallback target '{target}' not accepted");
+            assert!(
+                sr2.issues.iter().any(|i| i.message.contains(&needle)),
+                "missing cascade issue for {dropped} -> {target}: {:?}",
+                sr2.issues
+            );
+        }
+        assert!(sr2
+            .issues
+            .iter()
+            .any(|i| i.message.contains("route 'gb': has no destinations")));
+    }
 }

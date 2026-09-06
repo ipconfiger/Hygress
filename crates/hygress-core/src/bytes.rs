@@ -240,4 +240,93 @@ mod tests {
         let (start, end) = first_form_value_span(body, "B", "model").unwrap();
         assert_eq!(&body[start..end], b"val");
     }
+
+    // ----- T4 edge pins: needle == haystack / longer needle -----
+
+    #[test]
+    fn find_subseq_edge_pins_needle_equals_or_is_longer_than_haystack() {
+        // needle == haystack: the only valid window is the whole haystack, so the
+        // match is found at index 0 (for an in-range `from`).
+        assert_eq!(find_subseq(b"abc", b"abc", 0), Some(0));
+        assert_eq!(find_subseq(b"x", b"x", 0), Some(0));
+        assert_eq!(find_subseq(b"", b"", 0), Some(0));
+        // needle strictly longer than haystack: no window can ever fit -> None,
+        // even with `from == 0` (impl: `hay.len() < from + needle.len()` short-
+        // circuits before the scan loop).
+        assert_eq!(find_subseq(b"abc", b"abcd", 0), None);
+        assert_eq!(find_subseq(b"ab", b"abc", 0), None);
+        assert_eq!(find_subseq(b"", b"a", 0), None); // empty haystack
+        // Empty needle stays as currently documented: `Some(from)` iff
+        // `from <= hay.len()` (out-of-range -> None, pinned by
+        // find_subseq_empty_needle above).
+        assert_eq!(find_subseq(b"abc", b"", 0), Some(0));
+        assert_eq!(find_subseq(b"abc", b"", 3), Some(3));
+    }
+
+    // ----- T5 multipart locator edge pins -----
+
+    #[test]
+    fn first_form_value_span_present_but_empty_model_value_yields_empty_span() {
+        // mp_body("") puts the model part FIRST with an empty value: its value
+        // line is just the trailing "\r\n" (i.e. header separator directly
+        // followed by CRLF, then the next marker).
+        let body = mp_body("");
+        let (start, end) = first_form_value_span(&body, "B", "model").unwrap();
+        // Real behavior: a present-but-empty model part yields a ZERO-LENGTH span
+        // (start == end -> `Some("")`). `None` is reserved for an absent part /
+        // terminator-first body (see first_form_value_span_handles_...), not for
+        // an empty value.
+        assert_eq!(start, end);
+        assert_eq!(&body[start..end], b"");
+        // The zero-length span sits on the empty value line's lone CRLF.
+        assert!(body[start..].starts_with(b"\r\n--B\r\nContent-Disposition: form-data; name=\"file\""));
+        // Downstream routing consequence: callers that splice `body[start..end]`
+        // see `Some("")` — the request routes with an EMPTY model string rather
+        // than being treated as having no model part; only the `None` case means
+        // "no model".
+    }
+
+    #[test]
+    fn first_form_value_span_byte_search_hits_name_model_inside_other_param() {
+        // Crafted EARLIER part: its *filename* parameter value contains the
+        // literal bytes `name="model"` (here inside `filename="name="model".txt"`)
+        // while its real field is name="file". The locator is a documented byte
+        // search (contains_form_field -> find_subseq), NOT a header tokenizer:
+        // no Content-Disposition parameter grammar is parsed, so this earlier
+        // part's header is reported as carrying the model field and the genuine
+        // name="model" part below it is never reached.
+        let body = b"--B\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"name=\"model\".txt\"\r\n\
+             \r\n\
+             EARLY\r\n\
+             --B\r\n\
+             Content-Disposition: form-data; name=\"model\"\r\n\
+             \r\n\
+             REAL\r\n\
+             --B--\r\n";
+        let (start, end) = first_form_value_span(body, "B", "model").unwrap();
+        // Real result: the FIRST header whose bytes contain `name="model"` wins —
+        // the earlier part's value, not the later genuine model part's.
+        assert_eq!(&body[start..end], b"EARLY");
+    }
+
+    #[test]
+    fn first_form_value_span_quote_escaped_filename_is_not_a_false_positive() {
+        // Control for the byte-search caveat above: when the same idea is carried
+        // with RFC-style backslash-escaped quotes (wire bytes contain
+        // `name=\"model\"`), the contiguous literal bytes `name="model"` are NOT
+        // present, so the matcher does not fire on the earlier part and the
+        // genuine model part wins. The matcher never interprets quoting/escaping.
+        let body = b"--B\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"name=\\\"model\\\".txt\"\r\n\
+             \r\n\
+             EARLY\r\n\
+             --B\r\n\
+             Content-Disposition: form-data; name=\"model\"\r\n\
+             \r\n\
+             REAL\r\n\
+             --B--\r\n";
+        let (start, end) = first_form_value_span(body, "B", "model").unwrap();
+        assert_eq!(&body[start..end], b"REAL");
+    }
 }

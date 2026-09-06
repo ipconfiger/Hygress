@@ -197,14 +197,14 @@ gpustack-server:
 | `HYGRESS_ADMIN_ADDR` | 127.0.0.1:8081 | admin 监听地址（loopback；/healthz、/metrics 公开）。**地址不做解析期校验**（坏地址仅在绑定时报错）——请保持默认 loopback，勿暴露到非本机 |
 | `HYGRESS_ADMIN_TOKEN` | 无（**容器内默认不注入**） | admin token 门禁：缺省 ⇒ `/reload`、`GET /stats/usage`、`GET /config` 出厂即 **401 fail-closed**；生产需自行注入（随机值） |
 | `GATEWAY_PILOT_AGENT_METRICS_PORT` | 15020 | stats 浅兼容端口（/stats、/stats/prometheus；绑 **0.0.0.0**、无鉴权——Istio sidecar 契约，勿暴露到公网） |
-| `POLL_INTERVAL` | 1s | 控制面 CRD 轮询/兜底周期（`config.rs` 解析；Phase 1.1 后稳态由 kube WATCH 事件驱动，轮询仅作安全网） |
+| `POLL_INTERVAL` | 1s | 控制面收敛轮询周期（`config.rs` 解析，下限 `CONVERGE_MIN_TICK`=1s）：拓扑 B = WATCH 事件快路径 + 轮询兜底；拓扑 A（embedded，apiserver 无 watch resourceVersion）= **轮询即传播主路径**（B9.9，建路由→生效 ~2s） |
 | `HYGRESS_API_READY_TIMEOUT` / `HYGRESS_SNAPSHOT_TIMEOUT` | 30s / 60s | 启动窗口（launcher 已放宽 300s） |
 | `HYGRESS_TOPOLOGY_B` | 关 | **仅拓扑 B（external 集群）需要置 true**：GPUStack external 模式启动即探测 `higress` IngressClass，缺失会直接 raise（"cluster does not support Higress"）；Hygress 仅在 true 时播种该类（B9.5 起 env 解析对拼写错误告警），或预先在目标集群创建 IngressClass。**拓扑 A（embedded）从不探测 IngressClass，必须保持关闭**（零 apiserver 写入，AM-1） |
 | `HYGRESS_POLICY_PATH` | `/etc/hygress/policy.yaml` | 延伸能力配置文件路径（限流/配额/路由策略/护栏；mtime 热重载轮询 ≤30s + `/reload` 即时） |
 | `HYGRESS_QUOTA_K` | 4 | token 配额预留估算分母（`est = ceil(body_bytes / K)`） |
 | `HYGRESS_GUARDRAIL_URL` | 无 | LLM 护栏判定服务 URL（未设置 ⇒ LLM 护栏未配置 → 直通） |
 | `HYGRESS_EXT_AUTH_FAIL_MODE` | `closed` | `/token-auth` 不可达/5xx 时：`closed`（默认，403 `ext_auth_unavailable`，对齐 GPUStack/Higress `failure_mode_allow=false` 基线）；`open`=旧版 fail-open |
-| `HYGRESS_EXT_AUTH_TIMEOUT_MS` | —（**悬空 knob**） | **代码当前不读取**：forward-auth 请求超时硬编码 30s（`hygress-egress` `forward_auth.rs` `DEFAULT_TIMEOUT_SECS`）；本 env（含 `HIGRESS_EXT_AUTH_TIMEOUT_MS` 拼写）均未接线，勿依赖 |
+| `HIGRESS_EXT_AUTH_TIMEOUT_MS` | 30000 | forward-auth 整体请求超时（毫秒；>0 生效，非法值回落 30s 默认）。**已接线**：egress `forward_auth::Client::new` 读一次（ORA3-M6/B9.5），启动摘要 `ext_auth_timeout_ms` 回显。**注意拼写是 `HIGRESS_` 前缀**；`HYGRESS_EXT_AUTH_TIMEOUT_MS`（HYGRESS_ 前缀）不被读取——勿依赖错误拼写 |
 | `KUBECONFIG`（或 launcher `HYGRESS_KUBECONFIG`） | `${EMBEDDED_KUBECONFIG_PATH}` 兜底文件 | 控制面 kubeconfig（launcher 已双名镜像导出） |
 | `GATEWAY_TLS_PORT` | 443（取 `GATEWAY_HTTPS_PORT` 兼容） | 数据面 TLS 端口（launcher 已双名镜像导出） |
 

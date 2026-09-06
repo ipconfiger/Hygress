@@ -40,6 +40,9 @@ fn snapshot_desc(name: &str, help: &str) -> Desc {
 }
 
 impl ConfigSnapshotCollector {
+    /// Build a collector that reads the control-plane snapshot counters
+    /// (`snapshot_reject_total` / `snapshot_skipped_total`) off `shared` at
+    /// scrape time.
     pub fn new(shared: Arc<hygress_core::SharedConfig>) -> Self {
         Self {
             shared,
@@ -412,6 +415,8 @@ impl Metrics {
         }
     }
 
+    /// Record one completed request under `hygress_requests_total`, labeled by
+    /// HTTP `status` and `kind` (`model_route` / `mirror` / `short_circuit`).
     pub fn record_request(&self, status: u16, kind: &str) {
         self.cached_request_counter(status, kind).inc();
     }
@@ -452,11 +457,15 @@ impl Metrics {
         self.record_request_duration(KIND_SHORT_CIRCUIT, secs);
     }
 
+    /// Observe an end-to-end request latency under
+    /// `hygress_request_duration_seconds`, labeled by `kind` (`secs`).
     pub fn record_request_duration(&self, kind: &str, secs: f64) {
         self.cached_histogram(&self.inner.duration_cache, &self.inner.request_duration, kind)
             .observe(secs);
     }
 
+    /// Add `n` tokens under `hygress_tokens_total`, labeled by `direction`
+    /// (`prompt` / `completion` / `cached`).
     pub fn record_tokens(&self, direction: &str, n: u64) {
         let mut cache = self
             .inner
@@ -474,6 +483,8 @@ impl Metrics {
         counter.inc_by(n);
     }
 
+    /// Observe a time-to-first-chunk under `hygress_ttft_seconds`, labeled by
+    /// `kind` (`secs`).
     pub fn record_ttft(&self, kind: &str, secs: f64) {
         self.cached_histogram(&self.inner.ttft_cache, &self.inner.ttft, kind)
             .observe(secs);
@@ -495,14 +506,18 @@ impl Metrics {
         h
     }
 
+    /// Count one failover retry hop across candidates
+    /// (`hygress_retries_total`).
     pub fn record_retry(&self) {
         self.inner.retries_total.inc();
     }
 
+    /// Count one upstream attempt failure (`hygress_upstream_errors_total`).
     pub fn record_upstream_error(&self) {
         self.inner.upstream_errors_total.inc();
     }
 
+    /// Count one armed fallback redirect hop (`hygress_fallback_total`).
     pub fn record_fallback(&self) {
         self.inner.fallback_total.inc();
     }
@@ -593,14 +608,20 @@ impl Metrics {
             .inc();
     }
 
+    /// Count one ext-auth decision under `hygress_auth_decisions_total`,
+    /// labeled by `result` (`allowed` / `denied` /
+    /// `auth_service_unavailable_{allowed,denied}` — the last two split the
+    /// R-12 fail-closed vs fail-open reactions to an unavailable auth service).
     pub fn record_auth(&self, result: &str) {
         self.inner.auth_decisions.with_label_values(&[result]).inc();
     }
 
+    /// Increment the in-flight-requests gauge (`hygress_active_requests`).
     pub fn active_requests_inc(&self) {
         self.inner.active_requests.inc();
     }
 
+    /// Decrement the in-flight-requests gauge (`hygress_active_requests`).
     pub fn active_requests_dec(&self) {
         self.inner.active_requests.dec();
     }

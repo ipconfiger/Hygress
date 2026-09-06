@@ -14,8 +14,19 @@ use http::HeaderMap;
 use hygress_egress::forward_auth::{Client, ForwardAuthRequest};
 
 fn client() -> reqwest::Client {
+    install_ring_provider();
     // No global timeout; per-request timeouts are set on the egress Client.
     reqwest::Client::new()
+}
+
+/// M4: rustls-no-provider build — install the ring provider once (the gateway
+/// binary does it in `main`; this integration-test crate does it here).
+fn install_ring_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

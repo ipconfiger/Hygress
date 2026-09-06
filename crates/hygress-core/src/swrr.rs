@@ -41,6 +41,7 @@ pub struct SwrrCandidate {
 }
 
 impl SwrrCandidate {
+    /// Create a candidate with the given stable `id` and `weight`.
     pub fn new(id: impl Into<String>, weight: i32) -> Self {
         Self {
             id: id.into(),

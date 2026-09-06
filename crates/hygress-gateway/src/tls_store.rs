@@ -56,8 +56,10 @@ use hygress_core::prelude::TlsConfig;
 /// Errors raised while parsing PEM or assembling the SNI server config.
 #[derive(Debug, Error)]
 pub enum TlsError {
+    /// A PEM parse failure (no certificates / no key / malformed block).
     #[error("PEM parse failed: {0}")]
     Pem(String),
+    /// A crypto-provider / protocol-version failure.
     #[error("crypto/protocol-version error: {0}")]
     Provider(String),
 }
@@ -140,6 +142,7 @@ pub struct SniMap {
 }
 
 impl SniMap {
+    /// `true` when the table holds neither a named cert nor a default.
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty() && self.default.is_none()
     }
@@ -162,6 +165,9 @@ impl SniMap {
 // SniStore — the shared, ArcSwap-backed handle
 // ---------------------------------------------------------------------------
 
+/// The shared, hot-reloadable SNI store: an [`ArcSwap`] over the resolved
+/// [`SniMap`], so a [`Self::store_config`] swap is atomically visible to the
+/// next read. Cheap to `Arc`-clone into per-worker / per-request state.
 #[derive(Clone)]
 pub struct SniStore {
     inner: Arc<ArcSwap<SniMap>>,

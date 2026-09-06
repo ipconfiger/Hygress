@@ -42,11 +42,29 @@
 //! `usage_sink::GpustackSink`, `provider::ProviderClient`,
 //! `guardrail::{GuardrailClient, GuardVerdict}`.
 
+#![warn(missing_docs)]
+
 pub mod forward_auth;
 pub mod guardrail;
 pub mod provider;
 pub mod token;
 pub mod usage_sink;
+
+
+/// Test-only helper to install the ring crypto provider once (M4: this build
+/// compiles reqwest with `rustls-no-provider`; the gateway binary installs the
+/// provider in `main`, unit tests install it here before building clients).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Once;
+
+    pub(crate) fn install_ring_provider() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+}
 
 use thiserror::Error as ThisError;
 

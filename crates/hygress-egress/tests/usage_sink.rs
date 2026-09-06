@@ -59,9 +59,19 @@ const PINNED_FIELDS: [&str; 17] = [
 
 async fn start_sink(server: &common::TestServer, token: &str) -> GpustackSink {
     let endpoint = format!("{}/v2/usage/gateway-metrics", server.base_url());
+    install_ring_provider();
     // `None` drop hook: these tests only pin the wire/retry behavior (ORA3-M4 on_drop is covered
     // by the sink's unit tests, which hold a counting closure).
     GpustackSink::new(&endpoint, reqwest::Client::new(), token.to_string(), None)
+}
+
+/// M4: rustls-no-provider build — install the ring provider once.
+fn install_ring_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 #[tokio::test]

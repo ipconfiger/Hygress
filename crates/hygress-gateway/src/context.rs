@@ -59,6 +59,7 @@ pub mod hdr {
 /// a `:path` entry so `Transformer::inbound()` can back up / restore it.
 #[derive(Clone, Debug)]
 pub struct InboundRequest {
+    /// HTTP method verb (e.g. `POST` for an LLM chat request).
     pub method: String,
     /// Original `:path` (no query).
     pub path: String,
@@ -72,10 +73,13 @@ pub struct InboundRequest {
     pub content_type: String,
     /// Client source IP (`X-Real-IP` if present, else the peer address).
     pub client_ip: String,
+    /// The request `Host` header value.
     pub host: String,
 }
 
 impl InboundRequest {
+    /// The original request target — `path` plus `?query` when a query is
+    /// present (used for route matching / mirror path capture).
     pub fn path_and_query(&self) -> String {
         if self.query.is_empty() {
             self.path.clone()
@@ -96,10 +100,16 @@ pub use hygress_core::prelude::ModelRouterConfig;
 pub enum ModelResolution {
     /// PATH-DRIVEN alias HIT: model = `aliasNameMapping[id]`; the body `model`
     /// field is rewritten to that value (if the body is JSON/multipart).
-    PathAlias { model: String },
+    PathAlias {
+        /// The resolved model (`aliasNameMapping[id]`).
+        model: String,
+    },
     /// BODY-DRIVEN: model read from the request body (JSON / multipart) or
     /// auto-routing.
-    Body { model: String },
+    Body {
+        /// The model read from the request body.
+        model: String,
+    },
     /// Neither `prefix` nor `enableOnPathSuffix` matched (or the body yielded no
     /// model): pass through — no header write, no body rewrite.
     Passthrough,
@@ -168,6 +178,7 @@ pub struct CandidateTarget {
 /// set-instance/route-name, model-mapper rewrite, and the auth write-back).
 #[derive(Clone, Debug)]
 pub struct OutboundRequest {
+    /// HTTP method verb forwarded upstream.
     pub method: String,
     /// The (possibly rewritten) path + query to send upstream.
     pub path: String,
@@ -409,10 +420,14 @@ pub struct RateLimitEntry {
 /// cache of its own (and therefore has no address-reuse / ABA hazard).
 #[derive(Clone, Debug)]
 pub struct SharedConfigHandle {
+    /// The `Arc`-wrapped core config (data + compiled route table + derived
+    /// model-router config).
     pub inner: Arc<hygress_core::SharedConfig>,
 }
 
 impl SharedConfigHandle {
+    /// Wrap a core [`hygress_core::SharedConfig`] in an `Arc` so the handle is
+    /// cheap to clone and share across request tasks.
     pub fn new(inner: hygress_core::SharedConfig) -> Self {
         Self {
             inner: Arc::new(inner),

@@ -43,6 +43,7 @@ pub struct PathPred {
 }
 
 impl PathPred {
+    /// Create a case-sensitive path predicate matching `regex`.
     pub fn new(regex: impl Into<String>) -> Self {
         Self {
             regex: regex.into(),
@@ -63,10 +64,13 @@ impl PathPred {
 /// group, empty when the group is absent from the match.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathRewriter {
+    /// The rewrite-target template (e.g. `/$1$3`): `$1`..`$9` reference
+    /// capture groups, `$$` renders a literal `$`.
     pub target: String,
 }
 
 impl PathRewriter {
+    /// Create a rewriter for the given `target` template.
     pub fn new(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),
@@ -137,6 +141,8 @@ pub struct FallbackLink {
 }
 
 impl FallbackLink {
+    /// Create a fallback link to `target_key` with defaults: the main ingress
+    /// name is the bare target key, max 10 redirects, `use_original_*` true.
     pub fn new(target_key: impl Into<String>) -> Self {
         let target_key = target_key.into();
         Self {
@@ -225,6 +231,8 @@ pub struct RuleSource {
 }
 
 impl RuleSource {
+    /// Create a source from a k8s object `uid` and `resource_version`; the
+    /// origin ingress name starts empty.
     pub fn new(uid: impl Into<String>, resource_version: u64) -> Self {
         Self {
             uid: uid.into(),
@@ -253,6 +261,7 @@ pub struct RouteRule {
     /// [`RouteRule::requires_auth`]).
     #[serde(default)]
     pub ingress_name: String,
+    /// Route kind (Main / Fallback / Mirror).
     pub kind: RouteKind,
     /// Path regex predicates from the Ingress paths.
     #[serde(default)]
@@ -269,6 +278,7 @@ pub struct RouteRule {
     /// 4xx/5xx fallback link.
     #[serde(default)]
     pub fallback: Option<FallbackLink>,
+    /// ext-auth scoping for this route (never enabled for mirror routes).
     pub auth_scope: AuthScope,
     /// Per-destination (`name.type`) → outbound body model name.
     #[serde(default)]

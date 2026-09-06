@@ -274,12 +274,16 @@ fn sha256_short(bytes: &str) -> String {
 /// [`AdminState::route`].
 #[derive(Clone, Debug)]
 pub struct AdminResp {
+    /// The HTTP status code of the response.
     pub status: u16,
+    /// The `Content-Type` header value of the body.
     pub content_type: &'static str,
+    /// The serialized response body (JSON for the structured endpoints).
     pub body: String,
 }
 
 impl AdminResp {
+    /// Build a response from raw status / content-type / body.
     pub fn new(status: u16, content_type: &'static str, body: impl Into<String>) -> Self {
         Self {
             status,
@@ -287,6 +291,8 @@ impl AdminResp {
             body: body.into(),
         }
     }
+    /// Build a JSON error response: `{"reason": <reason>, "message": <message>}`
+    /// with `application/json; charset=utf-8` content-type.
     pub fn json(status: u16, reason: &str, message: &str) -> Self {
         Self::new(
             status,
@@ -302,6 +308,7 @@ pub struct AdminService {
 }
 
 impl AdminService {
+    /// Wrap the shared admin state (token + metrics + reload channels).
     pub fn new(state: Arc<AdminState>) -> Self {
         Self { state }
     }

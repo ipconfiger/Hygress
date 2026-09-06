@@ -32,7 +32,10 @@ use crate::error::GatewayError;
 /// the body `model` field; `None` for pass-through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelResolve {
+    /// The classification of the resolution (path-alias / body / passthrough).
     pub resolution: ModelResolution,
+    /// The value to overwrite `x-higress-llm-model` with; `None` for
+    /// pass-through.
     pub model: Option<String>,
 }
 

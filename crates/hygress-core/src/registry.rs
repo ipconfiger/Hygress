@@ -135,16 +135,25 @@ impl Registry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedTarget {
     /// Direct connect to `address` (`host:port`).
-    Direct { address: String },
+    Direct {
+        /// Upstream `host:port` to connect to directly.
+        address: String,
+    },
     /// Connect through the named outbound proxy; `address` is the upstream
     /// origin host:port.
     Proxied {
+        /// Upstream origin `host:port`.
         address: String,
+        /// Name of the outbound proxy to connect through.
         proxy_name: String,
+        /// The named outbound proxy definition.
         proxy: OutboundProxy,
     },
     /// WebSocket relay (L2+); `address` is the relay endpoint.
-    Tunnel { address: String },
+    Tunnel {
+        /// Relay endpoint (`host:port`).
+        address: String,
+    },
 }
 
 /// Precomputed registry resolution for one `name.type` (design §6.3 / M8),
@@ -232,6 +241,7 @@ pub struct OutboundProxy {
     pub server_address: String,
     /// Proxy server port.
     pub server_port: u16,
+    /// Connect timeout in seconds; `None` = not set.
     pub connect_timeout_secs: Option<u32>,
     /// Local listener port (McpBridge `listenerPort`).
     pub listener_port: Option<u16>,
@@ -240,6 +250,8 @@ pub struct OutboundProxy {
 }
 
 impl OutboundProxy {
+    /// Create a proxy with a name, server address and port; the optional
+    /// fields (`connect_timeout_secs`, `listener_port`, `kind`) start unset.
     pub fn new(
         name: impl Into<String>,
         server_address: impl Into<String>,

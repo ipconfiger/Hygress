@@ -28,7 +28,10 @@ pub enum GatewayError {
     /// are consumed in `request_filter`; keeping them on this enum means no
     /// parallel per-variant `status`/`reason` maps drift apart).
     #[error("request body read failed: {detail}")]
-    BodyReadAborted { detail: String },
+    BodyReadAborted {
+        /// Description of the read failure (framing error / premature close).
+        detail: String,
+    },
 
     /// No route matched and no mirror catch-all exists (404).
     #[error("no route and no mirror for path '{0}'")]

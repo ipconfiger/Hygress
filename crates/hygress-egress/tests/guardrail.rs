@@ -18,8 +18,18 @@ use hygress_egress::guardrail::GuardrailClient;
 use hygress_egress::Error;
 
 fn http() -> reqwest::Client {
+    install_ring_provider();
     // No global timeout; per-request timeouts are set on the egress client.
     reqwest::Client::new()
+}
+
+/// M4: rustls-no-provider build — install the ring provider once.
+fn install_ring_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn client(base: &str, timeout: Duration, max_conc: usize, cache_ttl: Duration) -> GuardrailClient {

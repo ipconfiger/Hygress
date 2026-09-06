@@ -29,16 +29,15 @@ arc-swap = "1"
 dashmap = "6"
 async-trait = "0.1"
 http = "1"
-reqwest = { version = "0.13", features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "rustls-no-provider", "stream"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
-rand = "0.8"
 prometheus = "0.14"
 kube = { version = "4.2", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 futures = "0.3"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"

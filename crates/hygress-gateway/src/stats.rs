@@ -24,10 +24,12 @@ use crate::metrics::Metrics;
 /// Shared state for the 15020 stats service (a read-only view of [`Metrics`]).
 #[derive(Clone)]
 pub struct StatsState {
+    /// The prometheus registry the shallow-compat endpoints read from.
     pub metrics: Arc<Metrics>,
 }
 
 impl StatsState {
+    /// Build the stats state over the shared metrics registry.
     pub fn new(metrics: Arc<Metrics>) -> Self {
         Self { metrics }
     }
@@ -53,12 +55,16 @@ impl StatsState {
 /// One stats response (status + content-type + body).
 #[derive(Clone, Debug)]
 pub struct StatsResp {
+    /// The HTTP status code of the response.
     pub status: u16,
+    /// The `Content-Type` header value of the body.
     pub content_type: &'static str,
+    /// The serialized response body (prometheus text or JSON).
     pub body: String,
 }
 
 impl StatsResp {
+    /// Build a response from raw status / content-type / body.
     pub fn new(status: u16, content_type: &'static str, body: impl Into<String>) -> Self {
         Self {
             status,
@@ -74,6 +80,7 @@ pub struct StatsService {
 }
 
 impl StatsService {
+    /// Wrap the shared 15020 stats state.
     pub fn new(state: Arc<StatsState>) -> Self {
         Self { state }
     }

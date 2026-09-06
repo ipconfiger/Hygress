@@ -127,11 +127,17 @@ fn warn_unknown_keys(value: &Value, known: &[&str], what: &str) {
 /// The kind of a k8s object being translated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObjectKind {
+    /// A Higress `McpBridge` CRD object (`networking.higress.io/v1`).
     McpBridge,
+    /// A Higress `WasmPlugin` CRD object (`extensions.higress.io/v1alpha1`).
     WasmPlugin,
+    /// An Istio `EnvoyFilter` CRD object (`networking.istio.io/v1alpha3`).
     EnvoyFilter,
+    /// A `networking.k8s.io/v1` `Ingress` object (the GPUStack routes).
     Ingress,
+    /// A `core/v1` `Secret` object (the data-plane TLS secrets).
     Secret,
+    /// A `core/v1` `ConfigMap` object (the gateway `higress-config` timing map).
     ConfigMap,
 }
 
@@ -140,10 +146,15 @@ pub enum ObjectKind {
 /// pure translation in [`build_config_data`].
 #[derive(Clone, Debug)]
 pub struct Object {
+    /// The k8s kind of the object (selects the translation below).
     pub kind: ObjectKind,
+    /// `metadata.name` of the object.
     pub name: String,
+    /// `metadata.namespace` of the object.
     pub namespace: String,
+    /// `metadata.uid` of the object (provenance; may be empty when absent).
     pub uid: String,
+    /// `metadata.resourceVersion`, parsed as a `u64` (provenance; 0 when absent).
     pub resource_version: u64,
     /// The full object as it appears on the wire (e.g. `{apiVersion, kind, metadata, spec}`).
     pub value: Value,

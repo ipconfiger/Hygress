@@ -323,7 +323,7 @@ mod tests {
 
     /// The 17-field wire form the sink must send is exactly the core type's serde output.
     #[test]
-    fn payload_is_the_pinned_17_fields() {
+    fn payload_is_the_pinned_17_fields() { crate::test_support::install_ring_provider(); 
         let json = serde_json::to_value(sample_metric()).unwrap();
         let keys: std::collections::BTreeSet<&str> = json
             .as_object()
@@ -359,7 +359,7 @@ mod tests {
     /// `push` is fire-and-forget: it never blocks and returns `Ok` even with the sink's flusher
     /// consuming — and the `Operation` vocabulary (server-side, not on the wire) does not leak in.
     #[tokio::test]
-    async fn push_returns_ok_and_is_nonblocking() {
+    async fn push_returns_ok_and_is_nonblocking() { crate::test_support::install_ring_provider(); 
         // We cannot spin up a server in a unit test without the integration harness; here we only
         // verify the enqueue path returns Ok and does not hang. The real POST is covered in tests/.
         let http = reqwest::Client::builder()
@@ -379,7 +379,7 @@ mod tests {
 
     /// Guard: the four server-side-only fields are NOT serialized into the payload.
     #[test]
-    fn server_only_fields_are_absent() {
+    fn server_only_fields_are_absent() { crate::test_support::install_ring_provider(); 
         let json = serde_json::to_value(sample_metric()).unwrap();
         for forbidden in ["operation", "cluster_id", "provider_name", "provider_type"] {
             assert!(
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_401_is_not_retried_drops_after_one_attempt() {
+    async fn http_401_is_not_retried_drops_after_one_attempt() { crate::test_support::install_ring_provider(); 
         // A 401 (bad/missing token) is deterministic: retrying cannot turn it into a success,
         // so the metric must be dropped after exactly ONE attempt (no backoff, no retries).
         let server = StubStatusServer::spawn(401).await;
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_404_is_not_retried_drops_after_one_attempt() {
+    async fn http_404_is_not_retried_drops_after_one_attempt() { crate::test_support::install_ring_provider(); 
         // Same rule for any other 4xx: a wrong endpoint (404) will never start succeeding.
         let server = StubStatusServer::spawn(404).await;
         GpustackSink::post_with_retry(
@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_503_is_retried_up_to_max_attempts_then_dropped() {
+    async fn http_503_is_retried_up_to_max_attempts_then_dropped() { crate::test_support::install_ring_provider(); 
         // A transient server error IS retried: all 3 bounded attempts are made, then the metric is
         // dropped (never spins).
         let server = StubStatusServer::spawn(503).await;
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_429_is_retried_then_dropped_after_max_attempts() {
+    async fn http_429_is_retried_then_dropped_after_max_attempts() { crate::test_support::install_ring_provider(); 
         // 429 (rate-limited) is transient: it must be retried (all 3 attempts) like a 5xx.
         let server = StubStatusServer::spawn(429).await;
         GpustackSink::post_with_retry(
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_full_push_drop_invokes_on_drop() {
+    async fn queue_full_push_drop_invokes_on_drop() { crate::test_support::install_ring_provider(); 
         // A full bounded (1024) queue drops the metric — `on_drop` must fire so the gateway can
         // count the loss instead of it being log-only.
         let addr = spawn_tarpit().await; // flusher's first POST hangs → the queue really fills
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_push_failure_invokes_on_drop_once() {
+    async fn final_push_failure_invokes_on_drop_once() { crate::test_support::install_ring_provider(); 
         // After the bounded retry budget is exhausted the metric is dropped inside the flusher —
         // `on_drop` must fire exactly once for that row.
         let server = StubStatusServer::spawn(503).await;
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_retryable_push_failure_invokes_on_drop_once() {
+    async fn non_retryable_push_failure_invokes_on_drop_once() { crate::test_support::install_ring_provider(); 
         // A deterministic 4xx is dropped after the first attempt — that drop is observable too.
         let server = StubStatusServer::spawn(401).await;
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_last_sink_handle_drains_queued_rows_to_backend() {
+    async fn dropping_last_sink_handle_drains_queued_rows_to_backend() { crate::test_support::install_ring_provider(); 
         // ORA3-M4 graceful-close drain: rows accepted into the bounded queue are NOT abandoned
         // when the last sender (the sink itself) is dropped. `rx.recv()` only returns `None` once
         // the channel is closed AND its buffer is empty, so the flusher keeps flushing every

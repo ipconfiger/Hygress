@@ -43,7 +43,12 @@ pub enum Body {
     /// A JSON request body (the usual OpenAI/Anthropic inference form).
     Json(Value),
     /// A basic multipart form body (the model-router multipart form) and its boundary.
-    Multipart { bytes: Vec<u8>, boundary: String },
+    Multipart {
+        /// The raw multipart body bytes.
+        bytes: Vec<u8>,
+        /// The multipart boundary string (also used for the outbound `Content-Type`).
+        boundary: String,
+    },
 }
 
 /// Parameters for building one upstream request (design §6.1 ⑨⑩).

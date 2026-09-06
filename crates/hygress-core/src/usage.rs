@@ -95,15 +95,23 @@ pub struct ModelUsageMetrics {
     /// `metric.model == route_name[model_route_id]`), taken verbatim from
     /// [`FlushFields::model`] at [`UsageSnapshot::flush`].
     pub model: String,
+    /// Input (prompt) token count.
     pub input_token: u64,
+    /// Output (completion) token count.
     pub output_token: u64,
+    /// Total token count (upstream-reported total or recomputed input+output).
     pub total_token: u64,
+    /// Prompt-cache hit tokens (subset of the input tokens).
     pub input_cached_token: u64,
+    /// Number of requests aggregated into this record (1 per flush).
     pub request_count: u64,
     /// `true` iff the canonical usage chunk was observed before the response
     /// ended. When `false` the server falls back to byte/chunk estimation.
     pub completed: bool,
+    /// Number of output chunks counted (SSE `data:` payloads with content; a
+    /// non-streaming JSON body counts as 1).
     pub output_chunk_count: u64,
+    /// Request content size in bytes.
     pub request_content_bytes: u64,
     /// Unix millis (request entry); `None` = absent on the wire.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,11 +147,17 @@ pub struct ModelUsageMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
+    /// Text completion (wire value `completion`).
     Completion,
+    /// Chat completion (wire value `chat_completion`).
     ChatCompletion,
+    /// Embeddings (wire value `embedding`).
     Embedding,
+    /// Rerank (wire value `rerank`).
     Rerank,
+    /// Image generation (wire value `image_generation`).
     ImageGeneration,
+    /// Audio speech synthesis (wire value `audio_speech`).
     AudioSpeech,
     /// Server string is `audit_transcription` (not `audio_transcription`).
     AuditTranscription,
@@ -197,7 +211,9 @@ pub enum UsageSchema {
 /// Normalized usage fields extracted from one `usage` object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
+    /// Input (prompt) tokens, when reported by the upstream.
     pub input_tokens: Option<u64>,
+    /// Output (completion) tokens, when reported by the upstream.
     pub output_tokens: Option<u64>,
     /// Upstream-reported total (the `total_tokens` / `total_token` field).
     /// Preferred over `input + output` in [`UsageSnapshot::flush`] when it
@@ -282,24 +298,31 @@ pub struct FlushFields {
     /// The routed/effective model name (may be a LoRA route name); copied
     /// verbatim into [`ModelUsageMetrics::model`] at flush.
     pub model: String,
+    /// User id; `None` = absent.
     pub user_id: Option<u64>,
+    /// Model id; `None` = absent.
     pub model_id: Option<i64>,
+    /// Model route id; `None` = absent.
     pub model_route_id: Option<i64>,
     /// Internal classification only (NOT sent on the wire; see struct docs).
     pub cluster_id: Option<i64>,
+    /// Provider id; `None` = absent.
     pub provider_id: Option<i64>,
     /// Internal classification only (NOT sent on the wire; see struct docs).
     pub provider_name: Option<String>,
     /// Internal classification only (NOT sent on the wire; see struct docs).
     pub provider_type: Option<String>,
+    /// Access key used for the request; `None` = absent.
     pub access_key: Option<String>,
     /// Internal classification only (NOT sent on the wire; see struct docs).
     pub operation: Option<String>,
+    /// Tenant organization id (from `X-Organization-Id`); `None` = absent.
     pub organization_id: Option<String>,
     /// Unix millis at request entry.
     pub started_at_ms: Option<u64>,
     /// Unix millis at report dispatch.
     pub completed_at_ms: Option<u64>,
+    /// Request content size in bytes.
     pub request_content_bytes: u64,
     /// Override the chunk count computed by the snapshot (e.g. when the
     /// caller counted content bytes itself).
@@ -371,6 +394,7 @@ fn usage_from_payload(value: &Value) -> Option<&Value> {
 }
 
 impl UsageSnapshot {
+    /// A fresh accumulator that parses response chunks according to `schema`.
     pub fn new(schema: UsageSchema) -> Self {
         Self {
             schema,
@@ -473,6 +497,7 @@ impl UsageSnapshot {
         )
     }
 
+    /// Number of output chunks counted so far.
     pub fn output_chunks(&self) -> u64 {
         self.output_chunk_count
     }

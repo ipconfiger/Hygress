@@ -230,7 +230,7 @@ mod tests {
     // ----- base URL joining -----
 
     #[test]
-    fn base_url_trims_trailing_slash() {
+    fn base_url_trims_trailing_slash() { crate::test_support::install_ring_provider(); 
         let c = GuardrailClient::new(
             "http://127.0.0.1:8080",
             reqwest::Client::new(),
@@ -263,7 +263,7 @@ mod tests {
     // ----- cache-key normalization -----
 
     #[test]
-    fn normalize_collapses_and_trims_whitespace() {
+    fn normalize_collapses_and_trims_whitespace() { crate::test_support::install_ring_provider(); 
         assert_eq!(normalize("  hello   world "), "hello world");
         assert_eq!(normalize("a\t\tb\n\nc  d"), "a b c d");
         assert_eq!(normalize("   "), "");
@@ -274,7 +274,7 @@ mod tests {
     // ----- GuardVerdict lenient serde -----
 
     #[test]
-    fn verdict_parses_canonical_shape() {
+    fn verdict_parses_canonical_shape() { crate::test_support::install_ring_provider(); 
         let v: GuardVerdict =
             serde_json::from_str(r#"{"blocked": true, "reason": "injection detected"}"#).unwrap();
         assert!(v.blocked);
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_defaults_missing_fields() {
+    fn verdict_defaults_missing_fields() { crate::test_support::install_ring_provider(); 
         // `{}` → the "not blocked" default verdict (both fields default).
         let v: GuardVerdict = serde_json::from_str(r#"{}"#).unwrap();
         assert!(!v.blocked);
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_accepts_alias_field_names() {
+    fn verdict_accepts_alias_field_names() { crate::test_support::install_ring_provider(); 
         // Common per-service alternative names are accepted.
         let v: GuardVerdict = serde_json::from_str(r#"{"is_blocked": true, "message": "pi"}"#)
             .unwrap();
@@ -310,7 +310,7 @@ mod tests {
     // ----- error formatting -----
 
     #[test]
-    fn guardrail_call_error_displays_cause() {
+    fn guardrail_call_error_displays_cause() { crate::test_support::install_ring_provider(); 
         let e = Error::GuardrailCall("HTTP 503 from guardrail endpoint".to_string());
         assert_eq!(
             e.to_string(),

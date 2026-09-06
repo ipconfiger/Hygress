@@ -22,10 +22,13 @@ use crate::bytes::{first_form_value_span, replace_bytes};
 /// the config level).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMapping {
+    /// The ordered `(service, model)` rules; the first entry for a service
+    /// wins on lookup.
     pub rules: Vec<(String, String)>,
 }
 
 impl ModelMapping {
+    /// An empty mapping.
     pub fn new() -> Self {
         Self::default()
     }

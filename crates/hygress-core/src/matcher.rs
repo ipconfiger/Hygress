@@ -53,6 +53,7 @@ pub enum MatchKind {
 pub struct RouteMatch {
     /// Index into [`RouteTable::routes`].
     pub index: usize,
+    /// How the route was matched ([`MatchKind`]).
     pub matched_by: MatchKind,
     /// The predicate (within the matched route) that established the match;
     /// `None` if the route has no path predicates.

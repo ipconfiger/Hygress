@@ -90,6 +90,7 @@ pub struct ForwardAuthRequest {
 }
 
 impl ForwardAuthRequest {
+    /// Build a request from the inbound (already-transformed) request header set.
     pub fn new(headers: HeaderMap) -> Self {
         Self { headers }
     }
@@ -328,7 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_auth_url_joins_path_with_trailing_slash_trimmed() {
+    fn token_auth_url_joins_path_with_trailing_slash_trimmed() { crate::test_support::install_ring_provider(); 
         let http = reqwest::Client::new();
         assert_eq!(
             Client::new("http://127.0.0.1:8080", http.clone()).token_auth_url(),
@@ -341,13 +342,13 @@ mod tests {
     }
 
     #[test]
-    fn header_string_roundtrip() {
+    fn header_string_roundtrip() { crate::test_support::install_ring_provider(); 
         let v = HeaderValue::from_static("dummy=dummy");
         assert_eq!(to_header_string(&v), Some("dummy=dummy".to_string()));
     }
 
     #[test]
-    fn non_utf8_header_value_is_dropped_not_misdecoded() {
+    fn non_utf8_header_value_is_dropped_not_misdecoded() { crate::test_support::install_ring_provider(); 
         // MINOR-14: a write-back header with non-UTF-8 bytes cannot be re-emitted as a model
         // string — the parser returns None (the drop is logged, never silent), and it must NOT
         // produce replacement-character garbage that would corrupt the credential.
@@ -370,7 +371,7 @@ mod tests {
     /// `Client::new` must actually read the env var: a valid ms value wins at construction, and an
     /// unset var keeps the 30 s default.
     #[test]
-    fn client_reads_higress_ext_auth_timeout_ms_at_construction() {
+    fn client_reads_higress_ext_auth_timeout_ms_at_construction() { crate::test_support::install_ring_provider(); 
         let http = reqwest::Client::new();
         std::env::set_var(EXT_AUTH_TIMEOUT_MS_ENV, "1500");
         let client = Client::new("http://127.0.0.1:8080", http.clone());
@@ -391,7 +392,7 @@ mod tests {
     /// Invalid values (garbage / empty / whitespace / negative / zero) must keep the default rather
     /// than silently producing an instant or unlimited request timeout.
     #[test]
-    fn invalid_timeout_env_value_keeps_the_default() {
+    fn invalid_timeout_env_value_keeps_the_default() { crate::test_support::install_ring_provider(); 
         let default = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
         for bad in ["", "abc", "1.5s", "-1", "0", "   "] {
             assert_eq!(
@@ -417,7 +418,7 @@ mod allowlist_tests {
     /// `/token-auth`, regardless of the GPUStack `allowed_headers` config — this is what lets
     /// AUTHED models authenticate via the client API key. Pin that Hygress mirrors it.
     #[test]
-    fn authorization_is_forwarded() {
+    fn authorization_is_forwarded() { crate::test_support::install_ring_provider(); 
         assert!(
             ALLOWLIST.contains(&"authorization"),
             "client Authorization must be forwarded to /token-auth (wasm ext-auth behavior)"

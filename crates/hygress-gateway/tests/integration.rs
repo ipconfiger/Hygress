@@ -65,6 +65,16 @@ impl Rec {
     }
 }
 
+/// M4: rustls-no-provider build — install the ring provider once before any
+/// TLS-capable client is constructed (the gateway binary does it in `main`).
+fn install_ring_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 struct ServerState {
     recorded: Mutex<Vec<Rec>>,
     status: AtomicU16,
@@ -83,6 +93,7 @@ struct TestServer {
 
 impl TestServer {
     async fn spawn() -> Self {
+        install_ring_provider();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind 127.0.0.1:0");

@@ -81,10 +81,13 @@ impl PolicyConfig {
 /// Global (default) policy section.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlobalPolicy {
+    /// Per-IP / per-consumer token-bucket rate limits (design §4.1).
     #[serde(default)]
     pub limits: Option<LimitsSpec>,
+    /// Token-quota limits (fixed window, design §4.2).
     #[serde(default)]
     pub quota: Option<QuotaSpec>,
+    /// Guardrail policy (static rules / LLM verdict, design §4.4).
     #[serde(default)]
     pub guardrail: Option<GuardrailSpec>,
 }

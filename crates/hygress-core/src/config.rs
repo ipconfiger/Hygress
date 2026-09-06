@@ -426,10 +426,12 @@ pub struct SanitizeResult {
 /// One validation finding (deterministically ordered by message).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationError {
+    /// A human-readable description of the validation finding.
     pub message: String,
 }
 
 impl ValidationError {
+    /// Create a validation error from a message string.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -520,9 +522,12 @@ pub struct GatewayFeatureConfig {
 /// TLS certificate table (`Secret gpustack-tls-<host>` / `-default`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsConfig {
+    /// The TLS certificate entries (one per `gpustack-tls-<host>` secret plus
+    /// the `gpustack-tls-default` fallback).
     pub hosts: Vec<TlsHost>,
 }
 
+/// One TLS certificate entry: SNI host plus PEM certificate/key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsHost {
     /// SNI host (or the host string of the `gpustack-tls-<host>` secret).
@@ -541,10 +546,13 @@ pub struct TlsHost {
 /// `ensure_gateway_timeout` rewrites upstream to env-driven default 3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimingConfig {
+    /// Downstream idle timeout in seconds (seed default 1800).
     #[serde(default = "default_downstream_idle")]
     pub downstream_idle_timeout_secs: u64,
+    /// Upstream idle timeout in seconds (seed default 10).
     #[serde(default = "default_upstream_idle")]
     pub upstream_idle_timeout_secs: u64,
+    /// Max request-header size in KB; `None` when not configured.
     pub max_request_headers_kb: Option<u64>,
 }
 

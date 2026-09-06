@@ -30,6 +30,7 @@ pub enum RetryCond {
 /// Result of parsing the retry annotations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedRetry {
+    /// The parsed retry policy (conditions plus tries).
     pub policy: RetryPolicy,
     /// Tokens that were present but not recognized (skipped).
     pub unknown: Vec<String>,

@@ -68,9 +68,14 @@ const GPUSTACK_CONTRACT_PIN: &str =
 /// policy). The egress/adapter-wired [`crate::context::GatewayState`] is layered on top of
 /// this under the `integrations` feature (default).
 pub struct DataState {
+    /// The parsed environment configuration (`GATEWAY_*` / `GPUSTACK_*` /
+    /// `HYGRESS_*`).
     pub config: GatewayConfig,
+    /// The hot-reload control-plane snapshot centre (thin `Arc` clone handle).
     pub shared: SharedConfigHandle,
+    /// The prometheus registry handle (admin `/metrics` + 15020 scrape it).
     pub metrics: Arc<Metrics>,
+    /// The SNI certificate store (fed from `ConfigData.tls` on each snapshot).
     pub tls: SniStore,
     /// The policy handle (design §2.1 / D-7): `ArcSwap<PolicyConfig>` + mtime
     /// poll + admin `/reload`. Built from `config.policy_path`; a missing
@@ -967,6 +972,15 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_serves_admin_and_stats_on_real_listeners() {
+        // M4: rustls-no-provider build — install the ring provider once (the
+        // gateway binary does it in `main`; unit tests do it here).
+        {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            });
+        }
         let metrics = Arc::new(Metrics::new());
         // Seed one sample so the prometheus families render a child series.
         metrics.record_request(200, "model_route");

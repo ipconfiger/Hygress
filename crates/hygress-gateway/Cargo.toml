@@ -43,7 +43,6 @@ arc-swap = { workspace = true }
 dashmap = { workspace = true }
 regex = { workspace = true }
 prometheus = { workspace = true }
-rand = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 hmac = { workspace = true }
@@ -61,7 +60,7 @@ url = "2"
 # upstream providers). A rustls CryptoProvider must be installed at runtime:
 # without one, rustls panics ("Could not automatically determine the process-level
 # CryptoProvider"). We pin the `ring` provider + install it in `main()`.
-rustls = { workspace = true, features = ["ring"] }
+rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 pingora = "0.8"
 pingora-proxy = "0.8"

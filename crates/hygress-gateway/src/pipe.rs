@@ -85,6 +85,8 @@ use crate::response_pipeline::ResponsePipeline;
 /// worker (all state is `Arc` / `Clone`).
 #[derive(Clone)]
 pub struct HygressProxy {
+    /// The shared gateway state (hot-reload config, TLS store, metrics, policy
+    /// and — under `integrations` — the auth / usage / provider clients).
     pub state: std::sync::Arc<GatewayState>,
     /// Long-lived upstream client: connect budget, **no** read timeout (SSE).
     pub http: reqwest::Client,
@@ -1298,14 +1300,12 @@ impl HygressProxy {
     /// - **B4b LLM verdict** (a `HYGRESS_GUARDRAIL_URL` is required — without
     ///   it the LLM stage is *not configured* → pass-through, D-14):
     ///   - `sync`: `Ok(None)` (no verdict) → pass; `Ok(Some(blocked))` → block;
-    ///     `Err` → reject only when **both** knobs agree (`fail_mode` `closed`
-    ///     + `on_error` `reject`) — fail-closed (D-14), else fail-open. A
-    ///     service failure is [`GuardrailHit::Unavailable`] (fail-closed) or a
-    ///     pass-through with `hygress_guardrail_error_total` incremented
-    ///     (fail-open) — never counted as a content block (O6);
-    ///   - `async`: the verdict is collected in a spawned task (recorded via
-    ///     tracing + the error counter) and the request proceeds (not on the
-    ///     path).
+    ///     `Err` = a service failure, resolved by the knobs — fail-closed
+    ///     (`fail_mode: closed` + `on_error: reject`) rejects with
+    ///     [`GuardrailHit::Unavailable`]; anything else passes through. Both
+    ///     record `hygress_guardrail_error_total`, never a content block (O6);
+    ///   - `async`: the verdict is collected in a spawned task (tracing + the
+    ///     error counter) and the request proceeds (not on the path).
     async fn guardrail_in(
         &self,
         state: &GatewayState,

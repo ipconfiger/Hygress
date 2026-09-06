@@ -34,6 +34,8 @@
 //!
 //! TDD: unit tests live alongside modules; tests may use only real data, no mocks.
 
+#![warn(missing_docs)]
+
 pub mod bytes;
 pub mod config;
 pub mod destination;

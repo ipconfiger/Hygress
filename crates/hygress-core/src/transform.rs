@@ -37,6 +37,7 @@ pub struct HeaderMap {
 }
 
 impl HeaderMap {
+    /// An empty header map.
     pub fn new() -> Self {
         Self::default()
     }
@@ -104,6 +105,7 @@ impl HeaderMap {
             .unwrap_or(0)
     }
 
+    /// Whether `name` has at least one value.
     pub fn contains(&self, name: &str) -> bool {
         self.map.contains_key(Self::lookup(name).as_ref())
     }
@@ -364,6 +366,8 @@ impl OutboundHeaders {
         self.get_all(name).len()
     }
 
+    /// Whether `name` has any value after applying the delta: present when an
+    /// overlay entry shadows it, or when it is in the base and not removed.
     pub fn contains(&self, name: &str) -> bool {
         let key = HeaderMap::lookup(name);
         if self.overrides.iter().any(|(n, _)| n == key.as_ref()) {
@@ -542,14 +546,18 @@ pub enum TransformOp {
 /// Which duplicate to keep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetainMode {
+    /// Keep the first value.
     RetainFirst,
+    /// Keep the last value.
     RetainLast,
 }
 
 /// One ordered transformation rule.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransformRule {
+    /// The operation to apply.
     pub op: TransformOp,
+    /// Source header name the rule operates on.
     pub source: String,
     /// Target for [`TransformOp::Rename`] / [`TransformOp::Backup`].
     pub dest: Option<String>,
@@ -613,6 +621,7 @@ pub struct Transformer {
 }
 
 impl Transformer {
+    /// A transformer that executes `rules` strictly in list order.
     pub fn new(rules: Vec<TransformRule>) -> Self {
         Self { rules }
     }
@@ -664,6 +673,7 @@ impl Transformer {
         ])
     }
 
+    /// The configured rules, in execution order.
     pub fn rules(&self) -> &[TransformRule] {
         &self.rules
     }

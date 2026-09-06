@@ -31,6 +31,8 @@
 //! Port discipline (design §11): data plane `GATEWAY_HTTP_PORT`/`tls_port`;
 //! 15020 stats; admin 8081. NEVER bind 9876/15010/15012/8888/15051.
 
+#![warn(missing_docs)]
+
 pub mod admin;
 pub mod body;
 pub mod bootstrap;

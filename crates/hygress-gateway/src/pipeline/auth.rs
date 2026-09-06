@@ -39,6 +39,8 @@ pub enum AuthOutcome {
     /// Proceed (authenticated). `write_back` carries the response headers to
     /// apply to the outbound request.
     Allowed {
+        /// Forward-auth response headers to apply to the outbound request
+        /// (consumer / authorization / cookie / auth-cache values).
         write_back: HeaderMap,
     },
     /// A real (non-fail-open) denial → the pipe responds 401.

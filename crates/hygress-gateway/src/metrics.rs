@@ -107,7 +107,9 @@ struct Inner {
     tokens_total: IntCounterVec,
     ttft: HistogramVec,
     retries_total: IntCounter,
-    upstream_errors_total: IntCounter,
+    /// O12: upstream attempt failures by destination service (retried non-2xx +
+    /// transport attempts that fell through to another candidate).
+    upstream_errors_total: IntCounterVec,
     fallback_total: IntCounter,
     fallback_exhausted_total: IntCounter,
     usage_push_dropped_total: IntCounter,
@@ -207,9 +209,12 @@ impl Metrics {
             "Failover retries across candidates.",
         )
         .expect("retries_total");
-        let upstream_errors_total = IntCounter::new(
-            "hygress_upstream_errors_total",
-            "Upstream attempt failures.",
+        let upstream_errors_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "hygress_upstream_errors_total",
+                "Upstream attempt failures by destination service name (O12).",
+            ),
+            &["destination"],
         )
         .expect("upstream_errors");
         let fallback_total = IntCounter::new("hygress_fallback_total", "Fallback redirects taken.")
@@ -512,9 +517,14 @@ impl Metrics {
         self.inner.retries_total.inc();
     }
 
-    /// Count one upstream attempt failure (`hygress_upstream_errors_total`).
-    pub fn record_upstream_error(&self) {
-        self.inner.upstream_errors_total.inc();
+    /// O12: count one upstream attempt failure (`hygress_upstream_errors_total`)
+    /// attributed to `destination` (the attempted candidate's service name) so
+    /// failures can be localized per upstream instead of only as a global rate.
+    pub fn record_upstream_error(&self, destination: &str) {
+        self.inner
+            .upstream_errors_total
+            .with_label_values(&[destination])
+            .inc();
     }
 
     /// Count one armed fallback redirect hop (`hygress_fallback_total`).

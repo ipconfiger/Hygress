@@ -720,7 +720,18 @@ async fn run(config: &GatewayConfig) -> Result<Server, Box<dyn std::error::Error
             Box::<dyn std::error::Error + Send + Sync>::from(format!("control plane init: {e}"))
         })?;
         let ready = controller.ready();
-        tokio::spawn(controller.run(shutdown_signal()));
+        // O13: the controller loop is spawned and OBSERVED — a terminal error
+        // (e.g. reconcile NotReady after its budget) or panic is logged here
+        // instead of being dropped with the task (previously only the generic
+        // snapshot-timeout text surfaced).
+        let controller_task = tokio::spawn(controller.run(shutdown_signal()));
+        tokio::spawn(async move {
+            match controller_task.await {
+                Ok(Ok(())) => info!("control plane exited cleanly (shutdown)"),
+                Ok(Err(e)) => error!("control plane terminated with an error: {e}"),
+                Err(e) => error!("control plane task failed (panic/join): {e}"),
+            }
+        });
 
         // 5. Await the first snapshot (bind-ready, design §11.2) before binding the data plane.
         //    Bounded: a control-plane connect failure ends `Controller::run` without firing

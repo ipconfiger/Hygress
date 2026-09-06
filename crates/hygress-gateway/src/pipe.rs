@@ -722,7 +722,7 @@ impl ProxyHttp for HygressProxy {
                             && retry_policy.should_retry(Some(status), false, false, non_idempotent)
                         {
                             state.metrics.record_retry();
-                            state.metrics.record_upstream_error();
+                            state.metrics.record_upstream_error(&candidate.service_name);
                             debug!(status, candidate = %candidate.service_name, "non-2xx; trying next candidate");
                             continue;
                         }
@@ -737,7 +737,7 @@ impl ProxyHttp for HygressProxy {
                         break;
                     }
                     Err(e) => {
-                        state.metrics.record_upstream_error();
+                        state.metrics.record_upstream_error(&candidate.service_name);
                         // R-1: report a reqwest timeout as `timed_out` so the
                         // policy's `timeout` condition can trigger (previously
                         // it never fired).

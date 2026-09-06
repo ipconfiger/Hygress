@@ -198,3 +198,8 @@ HeaderValue::from_static→from_str、result_unit_err allow、dial 点 FnMut→�
 | GPUStack 集成 | **9.5** | G1-G7 + AM-2 关闭；无 wire 回归；外部引擎约束非代码缺口 |
 
 **ora-6 结论：五维全部 ≥9.5（9.5 / 9.5 / 9.6 / 9.5 / 9.5），无 BLOCK、无 MAJOR，缺口收敛 —— 多轮 oracle 审核-修复循环收口（端条件达成）。**
+
+### 版本固化：v0.1.0（tag `v0.1.0` @ `d564b21`）
+- 收敛口径：ora-6 五维 = 9.5 / 9.5 / 9.6 / 9.5 / 9.5（≥9.5 无 BLOCK，缺口收敛）。
+- 门禁：661 tests（含 39 e2e、12 alloc_guard）/ clippy 双模式 0 / cargo doc -D warnings 0 / alloc_guard release 12/12。
+- 发布记录：docs/RELEASE-v0.1.0.md（演进区间、真机镜像 b101..b105 + 回滚链、残余清单）。

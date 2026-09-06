@@ -8,11 +8,14 @@
   升级延伸能力已实现并通过真机 e2e
 - 数据面：Pingora terminate-mode（单二进制，无 Wasm 运行时 / 无 Envoy）
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
-- 质量：587 个测试全绿（B1-B3 审计修复批 + B7 ora-2 终审修复批后实测；此前 538/492 为批次快照）· clippy 0 警告（all-targets 双模式）· 零 mock/stub ·
-  经多轮 oracle 高精度交叉审核（Gate-1/Gate-2 9/10；升级设计两轮无阻塞；升级实现二轮 BLOCK 闭环；ora-2 五维第二方终审 ≈7.9/10 无 BLOCK，修复闭环）
+- 版本：**v0.1.0（冻结版，tag `v0.1.0` @ `d564b21`）**——发布记录与回滚口径见 `docs/RELEASE-v0.1.0.md`
+- 质量：**661 个测试全绿**（`cargo test --workspace --all-features`；含 39 项真实 e2e 与 12 项 alloc_guard 分配预算）·
+  clippy 0 警告（all-targets 双模式）· `cargo doc -D warnings` 0（四 crate `#![warn(missing_docs)]` 强制）· 零 mock/stub ·
+  经多轮 oracle 高精度交叉审核：**ora-6 收敛复核五维 = 成熟度 9.5 / 质量 9.5 / 性能 9.6 / 可运维 9.5 / GPUStack 集成 9.5**（无 BLOCK、缺口收敛）
+- 性能收尾：SSE 热路径 memchr（P6）；入站头 absent-aware COW remove + 限流/断体短路后惰性物化（P4）；AM-2 注入 memo 消除 per-candidate 体扫；ring-only TLS（无 aws-lc 依赖链）
 - 延伸能力：token 配额 · 限流 · 路由策略 · 安全护栏（`hygress.policy.yaml` 驱动 + 热重载：文件轮询 ≤30s，或 admin `/reload` 即时；
   真机验证：限流 429/配额 429/护栏 403 实际生效）
-- 主要文档：`docs/design.md`（设计 v1.5）· `docs/research/plugin-contract-pin.md`（字节级外部契约）
+- 主要文档：`docs/design.md`（设计）· `docs/operations.md`（指标目录/告警/runbook）· `docs/research/plugin-contract-pin.md`（字节级外部契约）
   · `docs/research/gpustack-validation/REPORT.md`（真机验证证据）· `docs/dev-process.md`（开发全过程）
   · `docs/extensions-audit.md` + `docs/extensions-design.md`（延伸能力审核与设计/实现记录）
 

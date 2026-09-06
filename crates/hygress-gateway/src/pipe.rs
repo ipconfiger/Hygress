@@ -589,10 +589,11 @@ impl ProxyHttp for HygressProxy {
                                 state.metrics.record_guardrail_blocked("in");
                                 r.clone()
                             }
-                            GuardrailHit::Unavailable(r) => {
-                                state.metrics.record_guardrail_error();
-                                r.clone()
-                            }
+                            // ora-6: NO extra record here — `guardrail_in`'s
+                            // classify-Err branch already counted this failure
+                            // once (hygress_guardrail_error_total), so a
+                            // fail-closed rejection must not double-count.
+                            GuardrailHit::Unavailable(r) => r.clone(),
                         };
                         self.report_incomplete_usage(&prepared, &prepared.selected_service, None)
                             .await;

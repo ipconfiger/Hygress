@@ -4,7 +4,7 @@
 //!
 //! [`ModelUsageMetrics`] serializes to the **exact 17-field** JSON the plugin
 //! POSTs to `POST /v2/usage/gateway-metrics` (plugin-contract-pin.md §2.8 /
-//! §5.1): 11 always-present fields + 6 `Option` fields that serialize
+//! §5.1): 9 always-present scalar fields + 8 `Option` fields that serialize
 //! `omitempty`-absent when `None` (never `null`). The four server-side-only
 //! fields (`operation`, `cluster_id`, `provider_name`, `provider_type`) are
 //! **NOT** on the wire — the server owns/assigns them — so they are not

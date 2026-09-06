@@ -66,7 +66,7 @@ scrape_configs:
 | `tokens_total` | `direction=prompt\|completion\|cached` | 观测到的 token 量 | 用量趋势；与 `usage_pushed_total` 对照（cached 计入 prompt 侧命中） |
 | `active_requests` | — | 在飞请求 gauge | 容量/背压；配合 duration 算并发 |
 | `retries_total` | — | 候选间故障转移重试 | 单后端抖动时上升；持续增长查该上游 |
-| `upstream_errors_total` | — | 上游尝试失败数 | 与重试/fallback 对照定位坏上游 |
+| `upstream_errors_total` | `destination` | 上游尝试失败数（按候选 service 名；重试的 4xx/5xx + 传输失败落点） | 与重试/fallback 对照定位坏上游 |
 | `fallback_total` | — | 执行的 fallback 重定向数 | fallback 链被频繁使用 = 主用模型异常 |
 | `fallback_exhausted_total` | — | 预算耗尽 / 链到末端仍无成功跳 | **P1 告警候选**：用户请求最终失败 |
 | `auth_decisions_total` | `result` | `allowed` / `denied` / `auth_service_unavailable_denied`（closed）/ `auth_service_unavailable_allowed`（open） | 后者正则告警 = `/token-auth` 不可达且 fail-closed ⇒ 全网 403 |

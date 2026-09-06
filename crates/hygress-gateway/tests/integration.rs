@@ -1012,6 +1012,40 @@ async fn model_router_settings_from_snapshot_arm_routing() {
     assert!(body.contains("\"model\":\"org1/llama-3-8b\""), "alias body rewrite: {body}");
     // Neither request fell through to the mirror.
     assert_eq!(mirror.count(), 0);
+
+    // (c) ora-6 follow-up (quality O1): a NON-ZERO prepare-time model-splice
+    //     delta with `stream:true` — the alias rewrite changes the body
+    //     length, so the AM-2 injection must account for the shifted closing
+    //     brace (memo path or byte-exact rescan) and stay byte-correct.
+    model_upstream.set_response(
+        200,
+        vec![("content-type".into(), "application/json".into())],
+        br#"{"id":"alias-stream"}"#.to_vec(),
+    );
+    let resp = client
+        .post(format!("{gw}/model/proxy/7/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"client-alias","messages":[],"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "alias stream must reach the model route");
+    let reqs = model_upstream.wait_for(3).await;
+    let body = String::from_utf8_lossy(&reqs[2].body);
+    let trimmed = body.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "injected body must stay valid JSON: {body}"
+    );
+    assert_eq!(
+        body.matches("\"stream_options\":{\"include_usage\":true}").count(),
+        1,
+        "delta!=0 stream request must be injected exactly once: {body}"
+    );
+    assert!(
+        !body.contains("\"include_usage\":false"),
+        "no false include_usage injected: {body}"
+    );
 }
 
 #[tokio::test]

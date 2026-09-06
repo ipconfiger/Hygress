@@ -73,7 +73,7 @@ pub fn load_policy(path: impl AsRef<Path>) -> Result<PolicyConfig, String> {
         // An empty file is the all-pass default (not a parse error).
         return Ok(PolicyConfig::default());
     }
-    serde_yaml::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
+    serde_yaml_ng::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
 /// The live policy holder: an `ArcSwap<PolicyRuntime>` (lock-free per-request

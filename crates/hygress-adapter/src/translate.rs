@@ -969,10 +969,10 @@ pub fn configmap_to_timing(obj: &Object) -> Option<TimingConfig> {
     // ---- preferred source: the `higress` YAML document (the real GPUStack shape) ----
     let (yml_down, yml_up, yml_max): (Option<u64>, Option<u64>, Option<u64>) =
         match data.get("higress").and_then(|v| v.as_str()) {
-            Some(document) => match serde_yaml::from_str::<serde_yaml::Value>(document) {
+            Some(document) => match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(document) {
                 Ok(m) => {
                     // (R-10/C1 for the flat map is emitted above; the YAML
-                    // document is serde_yaml::Value — its extra sections
+                    // document is serde_yaml_ng::Value — its extra sections
                     // (mesh/tracing/gzip/…) are covered by the timing
                     // not-enforced warning at bind.)
                     (

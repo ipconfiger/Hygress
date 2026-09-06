@@ -1132,6 +1132,28 @@ mod tests {
     }
 
     #[test]
+    fn overlay_insert_after_remove_over_base_name_replaces() {
+        // ora-6 follow-up (quality O2): `insert` after `remove` over a
+        // BASE-present name must cancel the suppression and REPLACE with the
+        // single new value (no re-inherited base values) — same map
+        // remove-then-insert semantics.
+        let mut reference = base_headers();
+        reference.remove("authorization");
+        reference.insert("authorization", "Bearer swapped");
+        let mut overlay = OutboundHeaders::new(base_headers());
+        overlay.remove("authorization");
+        overlay.insert("authorization", "Bearer swapped");
+
+        assert_eq!(overlay.materialize(), reference);
+        assert_eq!(
+            overlay.get_all("authorization"),
+            reference.get_all("authorization")
+        );
+        assert_eq!(overlay.count("authorization"), 1);
+        assert_eq!(overlay.get("authorization"), Some("Bearer swapped"));
+    }
+
+    #[test]
     fn outbound_overlay_transformer_apply_matches_header_map() {
         // The outbound keep rule set over the overlay (the build_outbound path)
         // dedupes the base-carried duplicate route-name exactly as over a map.

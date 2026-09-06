@@ -111,8 +111,17 @@ impl HeaderMap {
     }
 
     /// Remove all values of `name`.
+    ///
+    /// P4: an ABSENT name is a no-op and skips the `make_mut` deep copy — the
+    /// inbound ① strip removes client-unforgeable headers that are absent on
+    /// virtually every request, so a miss must keep the map shared (only a
+    /// real mutation pays the one COW copy).
     pub fn remove(&mut self, name: &str) {
-        self.make_mut().remove(Self::lookup(name).as_ref());
+        let key = Self::lookup(name);
+        if !self.map.contains_key(key.as_ref()) {
+            return;
+        }
+        self.make_mut().remove(key.as_ref());
     }
 
     /// All header names present (lowercase form).

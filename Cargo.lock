@@ -1181,6 +1181,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "dashmap",
+ "memchr",
  "regex",
  "serde",
  "serde_json",

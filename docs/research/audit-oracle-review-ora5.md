@@ -64,3 +64,7 @@
 
 ## 6. 待收敛复核（ora-6）
 各维度对修复后 HEAD 做收敛复核：基线 MINOR 是否全部关闭/记录、无新 MAJOR、评分 ≥9.5。
+
+## 7. 后续收紧（ora-6 之后的性能收尾）
+- **P6 完成**：`hygress_core::bytes::find_subseq` 改由 `memchr` memmem(SIMD) 实现；usage.rs 每 chunk SSE `\n` 拆行热路径改用 `memchr::memchr`（4 处）。语义不变（memmem 首个命中 = 原 naive 语义；空 needle 角规则保留），全部既有 find_subseq/multipart/usage 测试通过。
+- **P4 完成（可消除部分）**：core `HeaderMap::remove` 对**不存在的名字**跳过 `make_mut` 深拷贝（入站 ① 剥离的 `x-gpustack-auth-token`/`x-gpustack-model-instance` 在几乎全部请求上缺席 → 不再触发拷贝）。alloc_guard `am8` 计量：clone+2 次 absent remove = **0 bytes / 0 allocs**（修复前每次 remove 都付 ~1193B/26）；present remove 仍恰好一次 COW 深拷贝（1193B/26，语义保留）。配套更新 prepare ① 注释（首个真实变更才付一次拷贝；纯 mirror/直通零拷贝）。仍属架构延后：入站 read-time 全量物化 + 借用式惰性包装（需 pingora Session borrow 贯穿）维持记录在案（µs 级量化，perf-tail-plan Phase 2）。

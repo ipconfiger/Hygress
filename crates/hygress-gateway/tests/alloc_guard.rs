@@ -662,3 +662,47 @@ fn am6_dial_overlay_drain_and_materialize() {
         "AM6b exclusive-map drain allocated {bytes_x} bytes (AM-6 measured 672 / 1 alloc; ceiling < 2 KiB)"
     );
 }
+
+#[test]
+fn am8_p4_absent_remove_does_not_deep_copy() {
+    let _g = TEST_LOCK.lock().unwrap();
+    // A realistic inbound-size map (clone + two absent strip removes, P4).
+    let mut h = HeaderMap::new();
+    for (i, n) in [
+        "host",
+        "content-type",
+        "authorization",
+        "x-higress-llm-model",
+        "cookie",
+        "x-mse-consumer",
+        "x-forwarded-for",
+        "accept",
+    ]
+    .iter()
+    .enumerate()
+    {
+        h.insert(n, format!("value-{i}"));
+    }
+    let shared = h.clone();
+    let (b_absent, c_absent) = measure_counted(|| {
+        let mut m = shared.clone(); // O(1) Arc bump, no copy
+        m.remove("x-gpustack-auth-token"); // ① absent name -> NO deep copy (P4)
+        m.remove("x-gpustack-model-instance"); // ① absent name -> NO deep copy
+    });
+    eprintln!("AM8 measured absent-removes (clone + 2 misses): {b_absent} bytes / {c_absent} allocs");
+    assert!(
+        c_absent <= 4 && b_absent < 4 * KIB as u64,
+        "absent strip removes must not deep-copy the shared map: {b_absent}B / {c_absent} allocs"
+    );
+
+    // A PRESENT remove must still pay exactly ONE COW deep copy (semantics kept).
+    let (b_present, c_present) = measure_counted(|| {
+        let mut m = shared.clone();
+        m.remove("authorization");
+    });
+    eprintln!("AM8 measured present-remove: {b_present} bytes / {c_present} allocs");
+    assert!(
+        c_present > c_absent && b_present > b_absent,
+        "a present remove must trigger the one deep copy: {b_present}B / {c_present} allocs"
+    );
+}

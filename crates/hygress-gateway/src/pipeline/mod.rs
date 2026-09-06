@@ -105,12 +105,16 @@ fn prepare_inner(
     let started_at_ms = now_millis();
 
     // ① strip untrusted inbound (unforgeable-by-client) headers — before anything else.
-    // AM-6: the whole mutation phase below is exactly ONE `make_mut` deep copy.
-    // `clone` is an O(1) Arc bump; the FIRST mutating call (the remove below)
-    // deep-copies while `inbound.headers` still shares the Arc; every later
-    // mutation (`remove` / `insert` / the transformer-in rules) runs in place on
-    // the now-exclusively-owned map — nothing re-shares `base_headers` between
-    // mutations, so no second copy can trigger.
+    // AM-6/P4: the whole mutation phase below is AT MOST ONE `make_mut` deep
+    // copy. `clone` is an O(1) Arc bump; the strips below are now ABSENT-aware
+    // (core `HeaderMap::remove` skips `make_mut` for a name that is not present
+    // — `x-gpustack-auth-token` / `x-gpustack-model-instance` are absent on
+    // virtually every client request), so the map stays shared until the FIRST
+    // REAL mutation (the model-header insert for a model route, a transformer
+    // rule hit, …); that mutation deep-copies once and every later mutation
+    // runs in place on the now-exclusively-owned map — no second copy. A
+    // request with no actual mutation (plain mirror / passthrough) never pays
+    // the copy at all.
     let mut base_headers = inbound.headers.clone();
     base_headers.remove(crate::context::hdr::GPUSTACK_AUTH_TOKEN);
     base_headers.remove(crate::context::hdr::MODEL_INSTANCE);

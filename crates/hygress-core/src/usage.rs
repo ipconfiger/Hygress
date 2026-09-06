@@ -559,7 +559,9 @@ impl UsageSnapshot {
         let mut found = false;
         let mut pos = 0;
         while pos < buf.len() {
-            let Some(nl) = find_subseq(&buf, b"\n", pos) else {
+            // P6: single-byte `\n` search via `memchr` (SIMD) — the highest-
+            // frequency SSE loop is no longer a byte-by-byte scan.
+            let Some(nl) = memchr::memchr(b'\n', &buf[pos..]).map(|i| i + pos) else {
                 break;
             };
             let line = &buf[pos..nl];
@@ -593,7 +595,7 @@ impl UsageSnapshot {
         // An oversized unterminated line was dropped in an earlier feed: discard the rest of that
         // line (everything up to its first `\n`), then resume normal line processing.
         if self.skip_until_newline {
-            match find_subseq(chunk, b"\n", 0) {
+            match memchr::memchr(b'\n', chunk) {
                 Some(nl) => {
                     self.skip_until_newline = false;
                     start = nl + 1;
@@ -605,7 +607,7 @@ impl UsageSnapshot {
         // If a partial (newline-less) tail line is pending, the first line of this chunk completes
         // it — one bounded splice into the persistent tail.
         if !self.tail.is_empty() {
-            match find_subseq(chunk, b"\n", start) {
+            match memchr::memchr(b'\n', &chunk[start..]).map(|i| i + start) {
                 Some(nl) if self.tail.len().saturating_add(nl - start) > MAX_TAIL_BYTES => {
                     // The reassembled line would exceed the cap: drop it (single-line guard) and
                     // continue right after its `\n` — it is never counted.
@@ -645,7 +647,7 @@ impl UsageSnapshot {
         // place (the line slice borrows `chunk`, never `self` — no aliasing).
         let mut pos = start;
         while pos < chunk.len() {
-            let Some(nl) = find_subseq(chunk, b"\n", pos) else {
+            let Some(nl) = memchr::memchr(b'\n', &chunk[pos..]).map(|i| i + pos) else {
                 break;
             };
             let line = &chunk[pos..nl];

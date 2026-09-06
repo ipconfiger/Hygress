@@ -10,7 +10,9 @@
 //!
 //! Pure: operates on `&[u8]` / `&mut Vec<u8>` only; no I/O, no `bytes` dep.
 
-/// Naive byte-subsequence search (small control-plane bodies; no `memchr` dep).
+/// Byte-subsequence search backed by `memchr`'s SIMD `memmem` (P6 — the
+/// per-chunk SSE newline / `"usage"` prefilter / multipart-header hot path
+/// previously ran a naive byte loop).
 ///
 /// Returns the first index `i >= from` with `hay[i..i + needle.len()] ==
 /// needle`, or `None`. An empty needle matches at `from` when `from` is in
@@ -24,15 +26,7 @@ pub fn find_subseq(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if hay.len() < from + needle.len() {
         return None;
     }
-    let last = hay.len() - needle.len();
-    let mut i = from.min(last);
-    while i <= last {
-        if &hay[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    memchr::memmem::find(&hay[from..], needle).map(|i| i + from)
 }
 
 /// Replace `hay[start..end]` with `new` (growing or shrinking the vec in

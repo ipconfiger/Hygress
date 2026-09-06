@@ -2,7 +2,8 @@
 
 **tag**：`v0.1.0`（annotated）  **代码 HEAD**：`d564b21`
 **包版本**：全部四 crate `0.1.0`（`CARGO_PKG_VERSION`；启动日志 `version=`、指标 `hygress_build_info{version}` 同步）
-**性质**：多轮 oracle 审核-修复循环收敛后的冻结点（ora-6 五维 ≥9.5，见 docs/research/audit-oracle-review-ora5.md + audit-fix-checklist.md）。
+**性质**：多轮 oracle 审核-修复循环收敛后的冻结点
+**变更明细**：`CHANGELOG.md` [v0.1.0] 段（Added/Changed/Fixed/Performance/Removed/Security/Documentation）（ora-6 五维 ≥9.5，见 docs/research/audit-oracle-review-ora5.md + audit-fix-checklist.md）。
 
 ## 1. 收敛结论（ora-6，独立收敛复核）
 | 维度 | 收敛分 | 判词 |

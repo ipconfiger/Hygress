@@ -8,7 +8,7 @@
   升级延伸能力已实现并通过真机 e2e
 - 数据面：Pingora terminate-mode（单二进制，无 Wasm 运行时 / 无 Envoy）
 - 代码：4 个 Rust crate（hygress-core / hygress-adapter / hygress-egress / hygress-gateway）
-- 版本：**v0.1.0（冻结版，tag `v0.1.0` @ `d564b21`）**——发布记录与回滚口径见 `docs/RELEASE-v0.1.0.md`
+- 版本：**v0.1.0（冻结版，tag `v0.1.0`）**——发布记录与回滚口径见 `docs/RELEASE-v0.1.0.md`，变更明细见 `CHANGELOG.md`
 - 质量：**661 个测试全绿**（`cargo test --workspace --all-features`；含 39 项真实 e2e 与 12 项 alloc_guard 分配预算）·
   clippy 0 警告（all-targets 双模式）· `cargo doc -D warnings` 0（四 crate `#![warn(missing_docs)]` 强制）· 零 mock/stub ·
   经多轮 oracle 高精度交叉审核：**ora-6 收敛复核五维 = 成熟度 9.5 / 质量 9.5 / 性能 9.6 / 可运维 9.5 / GPUStack 集成 9.5**（无 BLOCK、缺口收敛）

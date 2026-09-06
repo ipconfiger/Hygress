@@ -68,3 +68,7 @@
 ## 7. 后续收紧（ora-6 之后的性能收尾）
 - **P6 完成**：`hygress_core::bytes::find_subseq` 改由 `memchr` memmem(SIMD) 实现；usage.rs 每 chunk SSE `\n` 拆行热路径改用 `memchr::memchr`（4 处）。语义不变（memmem 首个命中 = 原 naive 语义；空 needle 角规则保留），全部既有 find_subseq/multipart/usage 测试通过。
 - **P4 完成（可消除部分）**：core `HeaderMap::remove` 对**不存在的名字**跳过 `make_mut` 深拷贝（入站 ① 剥离的 `x-gpustack-auth-token`/`x-gpustack-model-instance` 在几乎全部请求上缺席 → 不再触发拷贝）。alloc_guard `am8` 计量：clone+2 次 absent remove = **0 bytes / 0 allocs**（修复前每次 remove 都付 ~1193B/26）；present remove 仍恰好一次 COW 深拷贝（1193B/26，语义保留）。配套更新 prepare ① 注释（首个真实变更才付一次拷贝；纯 mirror/直通零拷贝）。仍属架构延后：入站 read-time 全量物化 + 借用式惰性包装（需 pingora Session borrow 贯穿）维持记录在案（µs 级量化，perf-tail-plan Phase 2）。
+- **P4 追加（惰性入站头）**：`read_headers` 只提取标量；整表 core `HeaderMap` 物化拆到独立
+  `materialize_headers`，在限流 429 / 413 / body 断流等提前终结之后、dispatch 前执行——提前终结的请求
+  不再付逐头小写/分配拷贝（早先每请求都物化）。存活请求的物化仍为每请求一次（结构性必需：fallback 回放需
+  原样表，auth/⑧ 均读 base），逐 hop 的 COW 仅发生在真实变更时。门禁 661/661 + 39 e2e 全绿。

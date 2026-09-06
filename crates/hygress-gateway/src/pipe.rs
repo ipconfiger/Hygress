@@ -312,11 +312,15 @@ impl ProxyHttp for HygressProxy {
             }
         };
         let method = head.method;
+        // P4: materialize the full inbound header map only NOW — after the
+        // rate-limit / body-abort short-circuits above — so requests that
+        // terminated early never paid the per-header copy.
+        let request_headers = Self::materialize_headers(session, &head.path);
         let inbound = InboundRequest {
             method: method.clone(),
             path: head.path,
             query: head.query,
-            headers: head.headers,
+            headers: request_headers,
             body,
             content_type: head.content_type,
             client_ip: head.client_ip,
@@ -877,8 +881,11 @@ impl ProxyHttp for HygressProxy {
 }
 
 /// The inbound **header phase** result (phase 1 of the two-phase read; design
-/// §4.1). `:path` is mirrored into `headers` so the transformer-in can
-/// backstop it for the fallback restore.
+/// §4.1). P4: only the scalar fields are extracted eagerly; the full core
+/// `HeaderMap` (with `:path` mirrored so transformer-in can backstop / restore
+/// it for the fallback) is materialized by
+/// [`HygressProxy::materialize_headers`] only for requests that survive the
+/// pre-prepare short-circuits.
 struct InboundHead {
     method: String,
     /// Original `:path` (no query).
@@ -892,7 +899,6 @@ struct InboundHead {
     /// The `Content-Length` header when present and a valid integer (B1 — the
     /// body reader pre-reserves this exact size, capped at `max_body`).
     content_length: Option<u64>,
-    headers: HeaderMap,
 }
 
 // -------------------------------------------------------------------------
@@ -965,15 +971,22 @@ impl HygressProxy {
     /// Splitting the read into headers-then-body (design §4.1 / M1 refactor)
     /// lets `rate_limit_pre` short-circuit **before** the body is read — an
     /// early 429 does not drain a potentially large request body.
+    ///
+    /// P4 (lazy inbound): only the scalar fields are read here — the full core
+    /// `HeaderMap` is materialized separately (see
+    /// [`Self::materialize_headers`]) AFTER the rate-limit / body-abort
+    /// short-circuits, so a request that terminates early (429 rate-limited,
+    /// 413 oversized, body read aborted) never pays the per-header
+    /// lowercasing/allocation copy.
     fn read_headers(session: &Session) -> InboundHead {
         let req = session.req_header();
         // Q4: the derived `InboundHead` fields below (`host` / `content-type` /
         // `client_ip` / `content-length`) are read via `to_str().ok()` → `""`
         // on a non-UTF-8 value, silently. Intentional: they only feed local
         // logic (routing, content-type gates, rate-limit keys), and the same
-        // headers are ALSO copied verbatim through `utf8_header_value` further
-        // down, which owns the drop-with-warn for anything forwarded. Nothing
-        // is silently lossy on the wire.
+        // headers are ALSO copied verbatim through `utf8_header_value` in
+        // [`Self::materialize_headers`], which owns the drop-with-warn for
+        // anything forwarded. Nothing is silently lossy on the wire.
         let host = req
             .headers
             .get("host")
@@ -1012,6 +1025,25 @@ impl HygressProxy {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
+        InboundHead {
+            method,
+            path,
+            query,
+            host,
+            content_type,
+            client_ip,
+            content_length,
+        }
+    }
+
+    /// P4 (lazy inbound): build the full core [`HeaderMap`] from the session's
+    /// request headers. Called exactly once per request that survives the
+    /// pre-prepare short-circuits (rate limit / body abort / too large), so
+    /// early-terminated requests never materialize the map. The single header-
+    /// copy helper + single non-UTF-8 policy live here (ORA3-M12) — identical
+    /// bytes to the former eager path.
+    fn materialize_headers(session: &Session, path: &str) -> HeaderMap {
+        let req = session.req_header();
         let mut headers = HeaderMap::new();
         // ORA3-M12: copy every inbound header through the ONE header-copy
         // helper and the ONE non-UTF-8 policy (`utf8_header_value` drops with a
@@ -1027,17 +1059,8 @@ impl HygressProxy {
             |name, value| headers.append(name, value),
         );
         // Mirror `:path` so transformer-in can backstop / restore it (stage ③⑭).
-        headers.insert(hdr::PATH, path.clone());
-        InboundHead {
-            method,
-            path,
-            query,
-            host,
-            content_type,
-            client_ip,
-            content_length,
-            headers,
-        }
+        headers.insert(hdr::PATH, path.to_string());
+        headers
     }
 
     /// Inbound phase 2: read the **full** body (POST/PUT/PATCH only) up to the
